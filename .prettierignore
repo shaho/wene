@@ -1,0 +1,10 @@
+node_modules
+.next
+dist
+drizzle
+pnpm-lock.yaml
+apps/web/next-env.d.ts
+karakeep
+graphify-out
+server/target
+.claude/worktrees
