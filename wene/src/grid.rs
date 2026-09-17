@@ -21,12 +21,15 @@ pub const CELL: f64 = 160.0;
 pub const PAD: f64 = 8.0;
 const MIN_CELL: f64 = 60.0;
 const MAX_CELL: f64 = 400.0;
+/// Height of the filename strip under a cell when labels are on.
+const LABEL_H: f64 = 16.0;
 /// Thumbnail memory budget. Evicted cells re-request on next draw.
 const THUMB_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct GridIvars {
     pub files: RefCell<Vec<FileInfo>>,
     cell: Cell<f64>,
+    labels: Cell<bool>,
     thumbs: RefCell<LruCache<PathBuf, Retained<NSImage>>>,
     requested: RefCell<HashSet<PathBuf>>,
     /// Multi-selection: indices into `files`.
@@ -77,10 +80,11 @@ define_class!(
                 return;
             }
             let cols = self.columns(self.bounds().size.width);
-            let first_row = ((dirty.origin.y - PAD) / self.pitch()).floor().max(0.0) as usize;
+            let first_row = ((dirty.origin.y - PAD) / self.row_pitch()).floor().max(0.0) as usize;
             let last_row =
-                ((dirty.origin.y + dirty.size.height) / self.pitch()).ceil() as usize;
+                ((dirty.origin.y + dirty.size.height) / self.row_pitch()).ceil() as usize;
             let selected = self.ivars().selected.borrow().clone();
+            let labels = self.ivars().labels.get();
 
             'rows: for row in first_row..=last_row {
                 for col in 0..cols {
@@ -129,6 +133,18 @@ define_class!(
                             }
                         }
                     }
+                    if labels {
+                        let name = files[index]
+                            .path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let rect = CGRect::new(
+                            CGPoint::new(cell.origin.x, cell.origin.y + cell.size.height + 1.0),
+                            CGSize::new(cell.size.width, LABEL_H - 2.0),
+                        );
+                        draw_label(&name, rect, selected.contains(&index));
+                    }
                 }
             }
             // Rubber band on top.
@@ -161,6 +177,7 @@ define_class!(
                 }
                 self.ivars().band.set(Some((point, point)));
                 self.setNeedsDisplay(true);
+                self.notify_selection();
                 return;
             };
 
@@ -184,6 +201,7 @@ define_class!(
             }
             self.ivars().focus.set(Some(index));
             self.setNeedsDisplay(true);
+            self.notify_selection();
             if event.clickCount() >= 2 {
                 self.activate();
             }
@@ -197,6 +215,7 @@ define_class!(
             self.select_band(band_rect(origin, point));
             self.autoscroll(event);
             self.setNeedsDisplay(true);
+            self.notify_selection();
         }
 
         #[unsafe(method(mouseUp:))]
@@ -246,9 +265,45 @@ define_class!(
             self.ivars().anchor.set(Some(next));
             self.setNeedsDisplay(true);
             self.scrollRectToVisible(self.cell_rect(next, cols as usize));
+            self.notify_selection();
         }
     }
 );
+
+/// Filename under a cell: small system font, centered, middle
+/// truncation like Finder.
+fn draw_label(name: &str, rect: CGRect, selected: bool) {
+    use objc2_app_kit::{
+        NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSLineBreakMode,
+        NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSStringDrawing, NSTextAlignment,
+    };
+    use objc2_foundation::{NSDictionary, NSString};
+
+    let style = NSMutableParagraphStyle::new();
+    style.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+    style.setAlignment(NSTextAlignment::Center);
+    let font = NSFont::systemFontOfSize(11.0);
+    let color = if selected {
+        NSColor::labelColor()
+    } else {
+        NSColor::secondaryLabelColor()
+    };
+    let attrs = unsafe {
+        NSDictionary::from_slices(
+            &[
+                NSFontAttributeName,
+                NSForegroundColorAttributeName,
+                NSParagraphStyleAttributeName,
+            ],
+            &[
+                font.as_ref() as &objc2::runtime::AnyObject,
+                color.as_ref(),
+                style.as_ref(),
+            ],
+        )
+    };
+    unsafe { NSString::from_str(name).drawInRect_withAttributes(rect, Some(&attrs)) };
+}
 
 fn band_rect(a: CGPoint, b: CGPoint) -> CGRect {
     CGRect::new(
@@ -262,6 +317,7 @@ impl GridView {
         let this = Self::alloc(mtm).set_ivars(GridIvars {
             files: RefCell::new(Vec::new()),
             cell: Cell::new(CELL),
+            labels: Cell::new(false),
             thumbs: RefCell::new(LruCache::new(THUMB_CACHE_BYTES)),
             requested: RefCell::new(HashSet::new()),
             selected: RefCell::new(BTreeSet::new()),
@@ -273,19 +329,21 @@ impl GridView {
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
-    /// Cell index under a view point, if any.
+    /// Cell index under a view point, if any. The label strip counts
+    /// as part of its cell.
     fn index_at(&self, point: CGPoint) -> Option<usize> {
         let cols = self.columns(self.bounds().size.width);
         let col = ((point.x - PAD) / self.pitch()).floor();
-        let row = ((point.y - PAD) / self.pitch()).floor();
+        let row = ((point.y - PAD) / self.row_pitch()).floor();
         if col < 0.0 || row < 0.0 || col >= cols as f64 {
             return None;
         }
         // Only count hits inside the cell, not the padding gutter.
         let cell = self.ivars().cell.get();
+        let hit_h = cell + if self.ivars().labels.get() { LABEL_H } else { 0.0 };
         let in_x = point.x - PAD - col * self.pitch();
-        let in_y = point.y - PAD - row * self.pitch();
-        if in_x > cell || in_y > cell {
+        let in_y = point.y - PAD - row * self.row_pitch();
+        if in_x > cell || in_y > hit_h {
             return None;
         }
         let index = row as usize * cols + col as usize;
@@ -310,8 +368,25 @@ impl GridView {
         }
     }
 
+    /// Horizontal spacing between cells.
     fn pitch(&self) -> f64 {
         self.ivars().cell.get() + PAD
+    }
+
+    /// Vertical spacing: adds the label strip when labels are on.
+    fn row_pitch(&self) -> f64 {
+        self.pitch() + if self.ivars().labels.get() { LABEL_H } else { 0.0 }
+    }
+
+    pub fn labels_visible(&self) -> bool {
+        self.ivars().labels.get()
+    }
+
+    pub fn set_labels(&self, visible: bool) {
+        self.ivars().labels.set(visible);
+        let width = self.frame().size.width;
+        self.setFrameSize(CGSize::new(width, 0.0));
+        self.setNeedsDisplay(true);
     }
 
     /// Grow or shrink cells by a factor, clamped, relayout.
@@ -367,23 +442,44 @@ impl GridView {
         let count = self.ivars().files.borrow().len();
         let cols = self.columns(width);
         let rows = count.div_ceil(cols).max(1);
-        rows as f64 * self.pitch() + PAD
+        rows as f64 * self.row_pitch() + PAD
     }
 
     fn cell_rect(&self, index: usize, cols: usize) -> CGRect {
         let row = index / cols;
         let col = index % cols;
         CGRect::new(
-            CGPoint::new(PAD + col as f64 * self.pitch(), PAD + row as f64 * self.pitch()),
+            CGPoint::new(
+                PAD + col as f64 * self.pitch(),
+                PAD + row as f64 * self.row_pitch(),
+            ),
             CGSize::new(self.ivars().cell.get(), self.ivars().cell.get()),
         )
     }
 
+    /// Total file count plus the selected files' info, for the
+    /// status bar.
+    pub fn selection_info(&self) -> (usize, Vec<FileInfo>) {
+        let files = self.ivars().files.borrow();
+        let selected = self.ivars().selected.borrow();
+        let infos = selected.iter().map(|&i| files[i].clone()).collect();
+        (files.len(), infos)
+    }
+
+    fn notify_selection(&self) {
+        if let Some(delegate) = self.ivars().delegate.get() {
+            delegate.selection_changed();
+        }
+    }
+
+    /// Start a slideshow; ⌥ held = in a window instead of fullscreen.
     fn activate(&self) {
         if let Some(delegate) = self.ivars().delegate.get() {
             let (files, start) = self.slideshow_request();
+            let windowed = NSEvent::modifierFlags_class()
+                .contains(objc2_app_kit::NSEventModifierFlags::Option);
             if !files.is_empty() {
-                delegate.start_slideshow_files(files, start);
+                delegate.start_slideshow_files(files, start, windowed);
             }
         }
     }
@@ -440,6 +536,7 @@ impl GridView {
         let width = self.frame().size.width;
         self.setFrameSize(CGSize::new(width, 0.0));
         self.setNeedsDisplay(true);
+        self.notify_selection();
     }
 
     /// Watcher removals: drop rows, remap selection and focus.
@@ -474,15 +571,19 @@ impl GridView {
         let width = self.frame().size.width;
         self.setFrameSize(CGSize::new(width, 0.0));
         self.setNeedsDisplay(true);
+        self.notify_selection();
     }
 
     /// Test hook: set the selection directly.
     pub fn e2e_set_selected(&self, indices: &[usize]) {
-        let mut selected = self.ivars().selected.borrow_mut();
-        selected.clear();
-        selected.extend(indices.iter().copied());
+        {
+            let mut selected = self.ivars().selected.borrow_mut();
+            selected.clear();
+            selected.extend(indices.iter().copied());
+        }
         self.ivars().focus.set(indices.first().copied());
         self.ivars().anchor.set(indices.first().copied());
+        self.notify_selection();
     }
 
     /// A file changed on disk: forget its thumbnail so the next draw
@@ -514,5 +615,6 @@ impl GridView {
         let width = self.frame().size.width;
         self.setFrameSize(CGSize::new(width, 0.0));
         self.setNeedsDisplay(true);
+        self.notify_selection();
     }
 }

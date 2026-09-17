@@ -43,6 +43,24 @@ fn check(state: &RefCell<E2eState>, ok: bool, what: &str) {
     }
 }
 
+/// Fire an item of the Slideshow menu through NSMenu's own action
+/// dispatch, the same target/responder resolution as a user click.
+fn perform_slideshow_menu_item(index: isize) -> bool {
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return false;
+    };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let Some(menubar) = app.mainMenu() else { return false };
+    for item in menubar.itemArray() {
+        let Some(submenu) = item.submenu() else { continue };
+        if submenu.title().to_string() == "Slideshow" {
+            submenu.performActionForItemAtIndex(index);
+            return true;
+        }
+    }
+    false
+}
+
 fn snapshot(view: &NSView, path: &str) -> bool {
     let bounds = view.bounds();
     let Some(rep) = view.bitmapImageRepForCachingDisplayInRect(bounds) else {
@@ -68,7 +86,7 @@ pub fn run_step(delegate: &AppDelegate) {
     match step {
         0 => {
             check(state, delegate.e2e_file_count() >= 3, "scan found 3+ files");
-            delegate.start_slideshow(0);
+            delegate.start_slideshow(0, false);
         }
         1 => {
             check(state, delegate.e2e_show_active(), "slideshow window active");
@@ -177,7 +195,7 @@ pub fn run_step(delegate: &AppDelegate) {
         }
         14 => {
             // Rotation + per-file state memory.
-            delegate.start_slideshow(0);
+            delegate.start_slideshow(0, false);
         }
         15 => {
             if let Some(view) = delegate.e2e_slide_view() {
@@ -205,6 +223,93 @@ pub fn run_step(delegate: &AppDelegate) {
                 );
             }
             delegate.end_slideshow();
+        }
+        18 => {
+            check(state, !delegate.e2e_show_active(), "fullscreen show closed");
+            // Windowed slideshow.
+            delegate.start_slideshow(0, true);
+        }
+        19 => {
+            check(state, delegate.e2e_show_active(), "windowed slideshow active");
+            check(
+                state,
+                delegate.e2e_show_is_windowed() == Some(true),
+                "window has a title bar",
+            );
+            check(state, delegate.e2e_slide_has_image(), "windowed slide shown");
+            delegate.end_slideshow();
+        }
+        20 => {
+            check(state, !delegate.e2e_show_active(), "windowed show closed");
+            // Real menu dispatch: fire the Slideshow menu items the
+            // way a click does (no synthetic OS events).
+            check(
+                state,
+                perform_slideshow_menu_item(1),
+                "menu item 'Start slideshow in window' fired",
+            );
+        }
+        21 => {
+            check(state, delegate.e2e_show_active(), "menu started windowed show");
+            check(
+                state,
+                delegate.e2e_show_is_windowed() == Some(true),
+                "menu picked windowed mode",
+            );
+            delegate.end_slideshow();
+        }
+        22 => {
+            check(
+                state,
+                perform_slideshow_menu_item(0),
+                "menu item 'Start slideshow' fired",
+            );
+        }
+        23 => {
+            check(state, delegate.e2e_show_active(), "menu started fullscreen show");
+            check(
+                state,
+                delegate.e2e_show_is_windowed() == Some(false),
+                "menu picked fullscreen mode",
+            );
+            delegate.end_slideshow();
+        }
+        24 => {
+            check(state, !delegate.e2e_show_active(), "menu-started show closed");
+        }
+        25 => {
+            // Status bar: count, then selection info.
+            delegate.e2e_select(&[]);
+            check(
+                state,
+                delegate.e2e_status_text().contains("4 images"),
+                "status shows the image count",
+            );
+            delegate.e2e_select(&[1, 3]);
+            check(
+                state,
+                delegate.e2e_status_text().contains("2 of 4 selected"),
+                "status shows the selection",
+            );
+            delegate.e2e_select(&[1]);
+            let text = delegate.e2e_status_text();
+            check(
+                state,
+                text.contains("×") && text.contains("B"),
+                "single selection shows dimensions and size",
+            );
+            delegate.e2e_select(&[]);
+        }
+        26 => {
+            // Filename labels grow the rows.
+            let before = delegate.e2e_grid_height();
+            delegate.e2e_toggle_labels();
+            check(
+                state,
+                delegate.e2e_grid_height() > before,
+                "labels add row height",
+            );
+            delegate.e2e_toggle_labels();
         }
         _ => {
             let failures = state.borrow().failures.clone();

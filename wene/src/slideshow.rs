@@ -1,5 +1,5 @@
-//! Fullscreen slideshow: borderless key window + slide view with
-//! fit-to-window display, zoom ladder, and drag panning.
+//! Slideshow: fullscreen (borderless) or windowed key window + slide
+//! view with fit-to-window display, zoom ladder, and drag panning.
 
 use std::cell::{Cell, OnceCell, RefCell};
 
@@ -35,12 +35,39 @@ define_class!(
 
 impl SlideshowWindow {
     pub fn fullscreen(mtm: MainThreadMarker, screen_frame: NSRect) -> Retained<Self> {
+        Self::build(mtm, screen_frame, NSWindowStyleMask::Borderless)
+    }
+
+    /// Windowed mode: centered at 75% of the screen, normal chrome.
+    pub fn windowed(mtm: MainThreadMarker, screen_frame: NSRect) -> Retained<Self> {
+        let size = CGSize::new(
+            screen_frame.size.width * 0.75,
+            screen_frame.size.height * 0.75,
+        );
+        let frame = NSRect::new(
+            CGPoint::new(
+                screen_frame.origin.x + (screen_frame.size.width - size.width) / 2.0,
+                screen_frame.origin.y + (screen_frame.size.height - size.height) / 2.0,
+            ),
+            size,
+        );
+        Self::build(
+            mtm,
+            frame,
+            NSWindowStyleMask::Titled
+                | NSWindowStyleMask::Closable
+                | NSWindowStyleMask::Miniaturizable
+                | NSWindowStyleMask::Resizable,
+        )
+    }
+
+    fn build(mtm: MainThreadMarker, frame: NSRect, style: NSWindowStyleMask) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(());
         let window: Retained<Self> = unsafe {
             msg_send![
                 super(this),
-                initWithContentRect: screen_frame,
-                styleMask: NSWindowStyleMask::Borderless,
+                initWithContentRect: frame,
+                styleMask: style,
                 backing: NSBackingStoreType::Buffered,
                 defer: false
             ]
@@ -83,6 +110,13 @@ define_class!(
         #[unsafe(method(acceptsFirstResponder))]
         fn accepts_first_responder(&self) -> bool {
             true
+        }
+
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, size: CGSize) {
+            // Windowed mode resizes: refit the slide.
+            let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+            self.setNeedsDisplay(true);
         }
 
         #[unsafe(method(drawRect:))]

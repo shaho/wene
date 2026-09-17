@@ -20,7 +20,7 @@ use objc2::{
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
     NSColor, NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView, NSTextField,
-    NSWindow, NSWindowStyleMask,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
 use objc2_core_graphics::CGImage;
@@ -64,8 +64,10 @@ pub struct DelegateIvars {
     loop_enabled: Cell<bool>,
     shuffle_enabled: Cell<bool>,
     overlay_visible: Cell<bool>,
+    status: OnceCell<Retained<NSTextField>>,
     loop_item: OnceCell<Retained<NSMenuItem>>,
     shuffle_item: OnceCell<Retained<NSMenuItem>>,
+    labels_item: OnceCell<Retained<NSMenuItem>>,
     auto_menu: OnceCell<Retained<NSMenu>>,
     sort_menu: OnceCell<Retained<NSMenu>>,
     sort_order: Cell<SortOrder>,
@@ -83,6 +85,23 @@ define_class!(
     pub struct AppDelegate;
 
     unsafe impl NSObjectProtocol for AppDelegate {}
+
+    unsafe impl NSWindowDelegate for AppDelegate {
+        // Only slideshow windows set us as their delegate. Covers the
+        // close button in windowed mode; end_slideshow routes through
+        // here too via close().
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _notification: &NSNotification) {
+            if let Some(show) = self.ivars().show.borrow_mut().take() {
+                if let Some(timer) = show.timer {
+                    timer.invalidate();
+                }
+            }
+            if let Some(window) = self.ivars().window.get() {
+                window.makeKeyAndOrderFront(None);
+            }
+        }
+    }
 
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(applicationDidFinishLaunching:))]
@@ -106,6 +125,16 @@ define_class!(
         #[unsafe(method(openDocument:))]
         fn open_document(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.open_folder();
+        }
+
+        #[unsafe(method(startSlideshow:))]
+        fn start_slideshow_menu(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.start_from_grid(false);
+        }
+
+        #[unsafe(method(startSlideshowWindowed:))]
+        fn start_slideshow_windowed_menu(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.start_from_grid(true);
         }
 
         #[unsafe(method(toggleLoop:))]
@@ -169,6 +198,16 @@ define_class!(
             self.apply_sort();
         }
 
+        #[unsafe(method(toggleLabels:))]
+        fn toggle_labels(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let Some(grid) = self.ivars().grid.get() else { return };
+            let visible = !grid.labels_visible();
+            grid.set_labels(visible);
+            if let Some(item) = self.ivars().labels_item.get() {
+                item.setState(if visible { 1 } else { 0 });
+            }
+        }
+
         #[unsafe(method(biggerThumbs:))]
         fn bigger_thumbs(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             if let Some(grid) = self.ivars().grid.get() {
@@ -214,8 +253,10 @@ impl AppDelegate {
             loop_enabled: Cell::new(false),
             shuffle_enabled: Cell::new(false),
             overlay_visible: Cell::new(false),
+            status: OnceCell::new(),
             loop_item: OnceCell::new(),
             shuffle_item: OnceCell::new(),
+            labels_item: OnceCell::new(),
             auto_menu: OnceCell::new(),
             sort_menu: OnceCell::new(),
             sort_order: Cell::new(SortOrder::Name),
@@ -290,17 +331,57 @@ impl AppDelegate {
         self.ivars().sort_order.get() == SortOrder::Name && !self.ivars().sort_desc.get()
     }
 
+    // ---- status bar ----
+
+    /// The grid calls this after any selection or file-list change.
+    pub fn selection_changed(&self) {
+        self.update_status();
+    }
+
+    /// Count plus name, dimensions, and size of the selection, like
+    /// the original app's status bar.
+    fn update_status(&self) {
+        let Some(status) = self.ivars().status.get() else { return };
+        let Some(grid) = self.ivars().grid.get() else { return };
+        let (total, selected) = grid.selection_info();
+        let text = match selected.as_slice() {
+            [] => format!("{total} images"),
+            [info] => {
+                let name = info
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let dims = decoder::image_dimensions(&info.path)
+                    .map(|(w, h)| format!(" — {w}×{h}"))
+                    .unwrap_or_default();
+                format!("{name}{dims} — {} · {total} images", format_bytes(info.size))
+            }
+            many => {
+                let bytes: u64 = many.iter().map(|f| f.size).sum();
+                format!("{} of {total} selected — {}", many.len(), format_bytes(bytes))
+            }
+        };
+        status.setStringValue(&NSString::from_str(&text));
+    }
+
     // ---- slideshow ----
 
     /// Start with everything in the grid (e2e and default path).
-    pub fn start_slideshow(&self, index: usize) {
+    pub fn start_slideshow(&self, index: usize, windowed: bool) {
         let files = self.ivars().grid.get().unwrap().paths();
-        self.start_slideshow_files(files, index);
+        self.start_slideshow_files(files, index, windowed);
+    }
+
+    /// Menu path: use the grid's selection semantics.
+    fn start_from_grid(&self, windowed: bool) {
+        let (files, start) = self.ivars().grid.get().unwrap().slideshow_request();
+        self.start_slideshow_files(files, start, windowed);
     }
 
     /// Start with an explicit file set (the grid's selection
     /// semantics decide what that is).
-    pub fn start_slideshow_files(&self, files: Vec<PathBuf>, index: usize) {
+    pub fn start_slideshow_files(&self, files: Vec<PathBuf>, index: usize, windowed: bool) {
         let mtm = self.mtm();
         if files.is_empty() {
             return;
@@ -308,8 +389,14 @@ impl AppDelegate {
         let screen_frame = NSScreen::mainScreen(mtm)
             .map(|s| s.frame())
             .unwrap_or(NSRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1440.0, 900.0)));
-        let window = SlideshowWindow::fullscreen(mtm, screen_frame);
-        let view = SlideView::new(mtm, screen_frame);
+        let window = if windowed {
+            SlideshowWindow::windowed(mtm, screen_frame)
+        } else {
+            SlideshowWindow::fullscreen(mtm, screen_frame)
+        };
+        let content_frame = window.contentRectForFrameRect(window.frame());
+        let view = SlideView::new(mtm, content_frame);
+        window.setDelegate(Some(ProtocolObject::from_ref(self)));
         let _ = view.ivars().delegate.set(unsafe {
             Retained::retain(self as *const Self as *mut Self).unwrap()
         });
@@ -318,11 +405,15 @@ impl AppDelegate {
         overlay.setTextColor(Some(&NSColor::whiteColor()));
         overlay.setDrawsBackground(true);
         overlay.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.0, 0.55)));
-        // Bottom left: the top edge sits under the menu bar.
+        // Bottom left; width follows the window when it resizes.
         overlay.setFrame(NSRect::new(
             CGPoint::new(20.0, 20.0),
-            CGSize::new(screen_frame.size.width - 40.0, 24.0),
+            CGSize::new(content_frame.size.width - 40.0, 24.0),
         ));
+        overlay.setAutoresizingMask(
+            objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+                | objc2_app_kit::NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
         overlay.setHidden(!self.ivars().overlay_visible.get());
         view.addSubview(&overlay);
 
@@ -352,14 +443,11 @@ impl AppDelegate {
     }
 
     pub fn end_slideshow(&self) {
-        if let Some(show) = self.ivars().show.borrow_mut().take() {
-            if let Some(timer) = show.timer {
-                timer.invalidate();
-            }
-            show.window.close();
-        }
-        if let Some(window) = self.ivars().window.get() {
-            window.makeKeyAndOrderFront(None);
+        // Cleanup happens in windowWillClose: (shared with the close
+        // button in windowed mode).
+        let window = self.ivars().show.borrow().as_ref().map(|s| s.window.clone());
+        if let Some(window) = window {
+            window.close();
         }
     }
 
@@ -502,7 +590,7 @@ impl AppDelegate {
     fn update_overlay(&self) {
         // Build the text and release the borrow BEFORE touching
         // AppKit: setStringValue may re-enter delegate code.
-        let (overlay, text) = {
+        let (overlay, window, name, text) = {
             let show = self.ivars().show.borrow();
             let Some(show) = show.as_ref() else { return };
             let name = show
@@ -540,9 +628,11 @@ impl AppDelegate {
             if let Some(zoom) = state.zoom {
                 text.push_str(&format!("  [{:.0}%]", zoom * 100.0));
             }
-            (show.overlay.clone(), text)
+            (show.overlay.clone(), show.window.clone(), name, text)
         };
         overlay.setStringValue(&NSString::from_str(&text));
+        // Visible as the title bar in windowed mode.
+        window.setTitle(&NSString::from_str(&name));
     }
 
     /// Display the current slide from cache or request it, and
@@ -663,11 +753,33 @@ impl AppDelegate {
 
     pub fn e2e_start_from_selection(&self) {
         let (files, start) = self.ivars().grid.get().unwrap().slideshow_request();
-        self.start_slideshow_files(files, start);
+        self.start_slideshow_files(files, start, false);
+    }
+
+    pub fn e2e_show_is_windowed(&self) -> Option<bool> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.window.styleMask().contains(NSWindowStyleMask::Titled))
     }
 
     pub fn e2e_playlist_len(&self) -> Option<usize> {
         self.ivars().show.borrow().as_ref().map(|s| s.playlist.len())
+    }
+
+    pub fn e2e_status_text(&self) -> String {
+        self.ivars()
+            .status
+            .get()
+            .map(|s| s.stringValue().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_toggle_labels(&self) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.set_labels(!grid.labels_visible());
+        }
     }
 
     // ---- core events ----
@@ -719,6 +831,7 @@ impl AppDelegate {
             }
             Event::ScanDone { total } => {
                 println!("scan done: {total} images");
+                self.update_status();
                 if e2e::enabled() && !self.ivars().e2e.borrow().started {
                     self.ivars().e2e.borrow_mut().started = true;
                     unsafe {
@@ -776,6 +889,21 @@ fn image_cost(image: &Img) -> usize {
     CGImage::width(Some(image)) * CGImage::height(Some(image)) * 4
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn drain_events(mtm: MainThreadMarker) {
     let delegate = DELEGATE.get().unwrap().get(mtm);
     let rx = EVENTS.get().unwrap().lock().unwrap();
@@ -817,6 +945,28 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
 
     let show_item = NSMenuItem::new(mtm);
     let show_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Slideshow"));
+    let start = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Start slideshow"),
+            Some(sel!(startSlideshow:)),
+            ns_string!("y"),
+        )
+    };
+    let start_windowed = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Start slideshow in window"),
+            Some(sel!(startSlideshowWindowed:)),
+            ns_string!("y"),
+        )
+    };
+    start_windowed.setKeyEquivalentModifierMask(
+        objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Option,
+    );
+    show_menu.addItem(&start);
+    show_menu.addItem(&start_windowed);
+    show_menu.addItem(&NSMenuItem::separatorItem(mtm));
     let loop_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -918,6 +1068,17 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
     };
     view_menu.addItem(&bigger);
     view_menu.addItem(&smaller);
+    view_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let labels_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Show filenames"),
+            Some(sel!(toggleLabels:)),
+            ns_string!(""),
+        )
+    };
+    view_menu.addItem(&labels_item);
+    let _ = delegate.ivars().labels_item.set(labels_item);
     view_item.setSubmenu(Some(&view_menu));
     menubar.addItem(&view_item);
     let _ = delegate.ivars().sort_menu.set(view_menu);
@@ -954,13 +1115,41 @@ fn main() {
     };
     window.setTitle(ns_string!("wene"));
 
+    // Content: grid scroll view on top, status bar strip below.
+    const STATUS_H: f64 = 24.0;
+    let content =
+        objc2_app_kit::NSView::initWithFrame(objc2_app_kit::NSView::alloc(mtm), frame);
     let scroll = NSScrollView::new(mtm);
     scroll.setHasVerticalScroller(true);
+    scroll.setFrame(NSRect::new(
+        CGPoint::new(0.0, STATUS_H),
+        CGSize::new(frame.size.width, frame.size.height - STATUS_H),
+    ));
+    scroll.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
     let grid = GridView::new(mtm, frame);
     let _ = grid.ivars().delegate.set(delegate.clone());
     scroll.setDocumentView(Some(&grid));
-    window.setContentView(Some(&scroll));
+
+    let status = NSTextField::labelWithString(ns_string!(""), mtm);
+    status.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(11.0)));
+    status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    status.setFrame(NSRect::new(
+        CGPoint::new(8.0, 4.0),
+        CGSize::new(frame.size.width - 16.0, 16.0),
+    ));
+    status.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+
+    content.addSubview(&scroll);
+    content.addSubview(&status);
+    window.setContentView(Some(&content));
     window.makeFirstResponder(Some(&grid));
+    let _ = delegate.ivars().status.set(status);
 
     let _ = delegate.ivars().window.set(window.clone());
     let _ = delegate.ivars().grid.set(grid);

@@ -7,10 +7,31 @@ use std::path::Path;
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL};
 use objc2_core_graphics::CGImage;
 use objc2_image_io::{
+    kCGImagePropertyPixelHeight, kCGImagePropertyPixelWidth,
     kCGImageSourceCreateThumbnailFromImageAlways, kCGImageSourceCreateThumbnailFromImageIfAbsent,
     kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceThumbnailMaxPixelSize, CGImageSource,
 };
 use wene_core::ImageDecoder;
+
+/// Pixel dimensions from the file header, no decode. Cheap enough
+/// for a synchronous main-thread call on one selected file.
+pub fn image_dimensions(path: &Path) -> Option<(i64, i64)> {
+    let url = CFURL::from_file_path(path)?;
+    unsafe {
+        let src = CGImageSource::with_url(&url, None)?;
+        let props = src.properties_at_index(src.primary_image_index(), None)?;
+        // The header dictionary is untyped; its keys are CFStrings.
+        let props: CFRetained<CFDictionary<CFString, CFType>> =
+            CFRetained::cast_unchecked(props);
+        let dim = |key: &CFString| -> Option<i64> {
+            props
+                .get(key)
+                .and_then(|v| v.downcast::<CFNumber>().ok())
+                .and_then(|n| n.as_i64())
+        };
+        Some((dim(kCGImagePropertyPixelWidth)?, dim(kCGImagePropertyPixelHeight)?))
+    }
+}
 
 pub struct ImageIoDecoder;
 
