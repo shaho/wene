@@ -1,3 +1,5 @@
+![wêne](https://shieldcn.dev/header/gradient.svg?title=w%C3%AAne&subtitle=fast+image+viewer+and+slideshow+app&size=wide&mode=light)
+
 # wêne
 
 wêne is a fast image viewer and slideshow app for macOS, written in Rust. It is
