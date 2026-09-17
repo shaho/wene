@@ -14,6 +14,13 @@ use lexical_sort::natural_lexical_cmp;
 pub trait ImageDecoder: Send + Sync + 'static {
     type Image: Send + 'static;
     fn decode(&self, path: &Path, max_px: i32) -> Option<Self::Image>;
+
+    /// Thumbnail decode. Platforms with a fast path (a preview
+    /// already embedded in the file) override this; the default is a
+    /// full decode.
+    fn decode_thumb(&self, path: &Path, max_px: i32) -> Option<Self::Image> {
+        self.decode(path, max_px)
+    }
 }
 
 pub enum Event<I> {
@@ -347,11 +354,17 @@ fn spawn_decode_worker<I: Send + 'static, D: ImageDecoder<Image = I>>(
             rx.recv()
         };
         let Ok(job) = job else { return };
-        let (path, max_px, is_slide) = match job {
-            Job::Thumb(p) => (p, max_thumb_px, false),
-            Job::Slide(p) => (p, max_slide_px, true),
+        let (path, decoded, is_slide) = match job {
+            Job::Thumb(p) => {
+                let image = decoder.decode_thumb(&p, max_thumb_px);
+                (p, image, false)
+            }
+            Job::Slide(p) => {
+                let image = decoder.decode(&p, max_slide_px);
+                (p, image, true)
+            }
         };
-        let event = match decoder.decode(&path, max_px) {
+        let event = match decoded {
             Some(image) if is_slide => Event::SlideReady { path, image },
             Some(image) => Event::ThumbReady { path, image },
             None => Event::DecodeFailed { path },
@@ -428,5 +441,7 @@ mod tests {
     }
 }
 
+pub mod cache;
 pub mod playlist;
+pub use cache::LruCache;
 pub use playlist::Playlist;

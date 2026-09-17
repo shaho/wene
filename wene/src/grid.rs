@@ -4,10 +4,10 @@
 //! drawn without one.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
-use wene_core::{file_info_cmp, FileInfo, SortOrder};
+use wene_core::{file_info_cmp, FileInfo, LruCache, SortOrder};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -21,11 +21,13 @@ pub const CELL: f64 = 160.0;
 pub const PAD: f64 = 8.0;
 const MIN_CELL: f64 = 60.0;
 const MAX_CELL: f64 = 400.0;
+/// Thumbnail memory budget. Evicted cells re-request on next draw.
+const THUMB_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct GridIvars {
     pub files: RefCell<Vec<FileInfo>>,
     cell: Cell<f64>,
-    thumbs: RefCell<HashMap<PathBuf, Retained<NSImage>>>,
+    thumbs: RefCell<LruCache<PathBuf, Retained<NSImage>>>,
     requested: RefCell<HashSet<PathBuf>>,
     /// Multi-selection: indices into `files`.
     selected: RefCell<BTreeSet<usize>>,
@@ -96,7 +98,7 @@ define_class!(
                         objc2_app_kit::NSRectFill(highlight);
                     }
                     let path = &files[index].path;
-                    let thumb = self.ivars().thumbs.borrow().get(path).cloned();
+                    let thumb = self.ivars().thumbs.borrow_mut().get(path).cloned();
                     match thumb {
                         Some(image) => {
                             let size = image.size();
@@ -260,7 +262,7 @@ impl GridView {
         let this = Self::alloc(mtm).set_ivars(GridIvars {
             files: RefCell::new(Vec::new()),
             cell: Cell::new(CELL),
-            thumbs: RefCell::new(HashMap::new()),
+            thumbs: RefCell::new(LruCache::new(THUMB_CACHE_BYTES)),
             requested: RefCell::new(HashSet::new()),
             selected: RefCell::new(BTreeSet::new()),
             focus: Cell::new(None),
@@ -491,8 +493,13 @@ impl GridView {
         self.setNeedsDisplay(true);
     }
 
-    pub fn set_thumb(&self, path: PathBuf, image: Retained<NSImage>) {
-        self.ivars().thumbs.borrow_mut().insert(path, image);
+    pub fn set_thumb(&self, path: PathBuf, image: Retained<NSImage>, cost: usize) {
+        let evicted = self.ivars().thumbs.borrow_mut().insert(path, image, cost);
+        // Evicted cells must re-request when they scroll back in.
+        let mut requested = self.ivars().requested.borrow_mut();
+        for path in evicted {
+            requested.remove(&path);
+        }
         self.setNeedsDisplay(true);
     }
 

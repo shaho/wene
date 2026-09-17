@@ -27,13 +27,17 @@ use objc2_core_graphics::CGImage;
 use objc2_foundation::{
     ns_string, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString, NSTimer,
 };
-use wene_core::{Engine, Event, Playlist, SortOrder};
+use wene_core::{Engine, Event, LruCache, Playlist, SortOrder};
 
 use decoder::ImageIoDecoder;
 use grid::GridView;
 use slideshow::{SlideState, SlideView, SlideshowWindow};
 
 type Img = CFRetained<CGImage>;
+
+/// Slide memory budget: roughly 15 retina-screen slides, so stepping
+/// back through recent history never re-decodes.
+const SLIDE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 
 static EVENTS: OnceLock<Mutex<Receiver<Event<Img>>>> = OnceLock::new();
 static DELEGATE: OnceLock<MainThreadBound<Retained<AppDelegate>>> = OnceLock::new();
@@ -43,7 +47,7 @@ struct Show {
     view: Retained<SlideView>,
     overlay: Retained<NSTextField>,
     playlist: Playlist,
-    cache: HashMap<PathBuf, Retained<NSImage>>,
+    cache: LruCache<PathBuf, Retained<NSImage>>,
     /// Remembered zoom/rotation/flip/pan per file for this session.
     view_states: HashMap<PathBuf, SlideState>,
     /// Auto-advance seconds; None = off. `timer` is live only while
@@ -335,7 +339,7 @@ impl AppDelegate {
             view,
             overlay,
             playlist,
-            cache: HashMap::new(),
+            cache: LruCache::new(SLIDE_CACHE_BYTES),
             view_states: HashMap::new(),
             interval: None,
             timer: None,
@@ -541,35 +545,34 @@ impl AppDelegate {
         overlay.setStringValue(&NSString::from_str(&text));
     }
 
-    /// Display the current slide from cache or request it, prefetch
-    /// the neighbours, and drop everything else (tiny precache per
-    /// the map: current, next, previous only).
+    /// Display the current slide from cache or request it, and
+    /// prefetch the neighbours. The LRU keeps recent history within
+    /// its byte budget, so stepping back is instant.
     fn show_current(&self) {
         let engine = self.ivars().engine.get().unwrap();
         {
             let mut show = self.ivars().show.borrow_mut();
             let Some(show) = show.as_mut() else { return };
 
-            let mut keep: Vec<PathBuf> = Vec::with_capacity(3);
+            let mut wanted: Vec<PathBuf> = Vec::with_capacity(3);
             for delta in [-1i64, 0, 1] {
                 if let Some(path) = show.playlist.peek(delta) {
-                    if !keep.contains(path) {
-                        keep.push(path.clone());
+                    if !wanted.contains(path) {
+                        wanted.push(path.clone());
                     }
                 }
             }
-            show.cache.retain(|path, _| keep.contains(path));
 
-            if let Some(current) = show.playlist.current() {
-                if let Some(image) = show.cache.get(current) {
+            if let Some(current) = show.playlist.current().cloned() {
+                if let Some(image) = show.cache.get(&current) {
                     show.view.show_image(image.clone());
-                    if let Some(state) = show.view_states.get(current) {
+                    if let Some(state) = show.view_states.get(&current) {
                         show.view.apply_state(*state);
                     }
                 }
             }
-            for path in keep {
-                if !show.cache.contains_key(&path) {
+            for path in wanted {
+                if !show.cache.contains(&path) {
                     engine.request_slide(path);
                 }
             }
@@ -730,17 +733,19 @@ impl AppDelegate {
                 }
             }
             Event::ThumbReady { path, image } => {
+                let cost = image_cost(&image);
                 let image = ns_image(&image);
-                self.ivars().grid.get().unwrap().set_thumb(path, image);
+                self.ivars().grid.get().unwrap().set_thumb(path, image, cost);
             }
             Event::SlideReady { path, image } => {
                 let is_current = {
+                    let cost = image_cost(&image);
                     let image = ns_image(&image);
                     let mut show = self.ivars().show.borrow_mut();
                     let Some(show) = show.as_mut() else { return };
                     let is_current = show.playlist.current() == Some(&path);
                     let state = show.view_states.get(&path).copied();
-                    show.cache.insert(path, image.clone());
+                    show.cache.insert(path, image.clone(), cost);
                     if is_current {
                         show.view.show_image(image);
                         if let Some(state) = state {
@@ -764,6 +769,11 @@ impl AppDelegate {
 
 fn ns_image(image: &Img) -> Retained<NSImage> {
     NSImage::initWithCGImage_size(NSImage::alloc(), image, CGSize::new(0.0, 0.0))
+}
+
+/// Estimated decoded footprint for the LRU budgets: pixels × 4 bytes.
+fn image_cost(image: &Img) -> usize {
+    CGImage::width(Some(image)) * CGImage::height(Some(image)) * 4
 }
 
 fn drain_events(mtm: MainThreadMarker) {
