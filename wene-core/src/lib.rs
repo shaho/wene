@@ -245,3 +245,6 @@ mod tests {
         assert!(!is_image(Path::new("/a/x.txt")));
     }
 }
+
+pub mod playlist;
+pub use playlist::Playlist;

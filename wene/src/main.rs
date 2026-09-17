@@ -1,10 +1,11 @@
 //! macOS shell: app delegate, menu, browse window, event pump.
 
 mod decoder;
+mod e2e;
 mod grid;
 mod slideshow;
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -18,12 +19,15 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView, NSWindow, NSWindowStyleMask,
+    NSColor, NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView, NSTextField,
+    NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
 use objc2_core_graphics::CGImage;
-use objc2_foundation::{ns_string, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString};
-use wene_core::{Engine, Event};
+use objc2_foundation::{
+    ns_string, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString, NSTimer,
+};
+use wene_core::{Engine, Event, Playlist};
 
 use decoder::ImageIoDecoder;
 use grid::GridView;
@@ -37,9 +41,13 @@ static DELEGATE: OnceLock<MainThreadBound<Retained<AppDelegate>>> = OnceLock::ne
 struct Show {
     window: Retained<SlideshowWindow>,
     view: Retained<SlideView>,
-    files: Vec<PathBuf>,
-    index: usize,
+    overlay: Retained<NSTextField>,
+    playlist: Playlist,
     cache: HashMap<PathBuf, Retained<NSImage>>,
+    /// Auto-advance seconds; None = off. `timer` is live only while
+    /// advancing (paused = interval set, timer gone).
+    interval: Option<f64>,
+    timer: Option<Retained<NSTimer>>,
 }
 
 pub struct DelegateIvars {
@@ -47,6 +55,15 @@ pub struct DelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
     grid: OnceCell<Retained<GridView>>,
     show: RefCell<Option<Show>>,
+    loop_enabled: Cell<bool>,
+    shuffle_enabled: Cell<bool>,
+    overlay_visible: Cell<bool>,
+    loop_item: OnceCell<Retained<NSMenuItem>>,
+    shuffle_item: OnceCell<Retained<NSMenuItem>>,
+    auto_menu: OnceCell<Retained<NSMenu>>,
+    /// Pace applied to new slideshows; menu picks update it.
+    default_interval: Cell<Option<f64>>,
+    e2e: RefCell<e2e::E2eState>,
 }
 
 define_class!(
@@ -81,6 +98,62 @@ define_class!(
         fn open_document(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.open_folder();
         }
+
+        #[unsafe(method(toggleLoop:))]
+        fn toggle_loop(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let enabled = !self.ivars().loop_enabled.get();
+            self.ivars().loop_enabled.set(enabled);
+            if let Some(item) = self.ivars().loop_item.get() {
+                item.setState(if enabled { 1 } else { 0 });
+            }
+            if let Some(show) = self.ivars().show.borrow_mut().as_mut() {
+                show.playlist.looping = enabled;
+            }
+            self.update_overlay();
+        }
+
+        #[unsafe(method(toggleShuffle:))]
+        fn toggle_shuffle(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let enabled = !self.ivars().shuffle_enabled.get();
+            self.ivars().shuffle_enabled.set(enabled);
+            if let Some(item) = self.ivars().shuffle_item.get() {
+                item.setState(if enabled { 1 } else { 0 });
+            }
+            if let Some(show) = self.ivars().show.borrow_mut().as_mut() {
+                show.playlist.set_shuffled(enabled);
+            }
+            self.update_overlay();
+        }
+
+        #[unsafe(method(setAutoAdvanceMenu:))]
+        fn set_auto_advance_menu(&self, sender: Option<&objc2::runtime::AnyObject>) {
+            // Item tag = tenths of a second; 0 = off.
+            let tag = sender
+                .and_then(|s| s.downcast_ref::<NSMenuItem>())
+                .map(|item| item.tag())
+                .unwrap_or(0);
+            let seconds = (tag > 0).then(|| tag as f64 / 10.0);
+            self.set_auto_advance(seconds);
+        }
+
+        #[unsafe(method(e2eStep:))]
+        fn e2e_step(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            e2e::run_step(self);
+        }
+
+        #[unsafe(method(advanceSlide:))]
+        fn advance_slide(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            let stepped = match self.ivars().show.borrow_mut().as_mut() {
+                Some(show) => show.playlist.step(1),
+                None => return,
+            };
+            if stepped {
+                self.show_current();
+            } else {
+                // Reached the end without loop: stop advancing.
+                self.set_auto_advance(None);
+            }
+        }
     }
 );
 
@@ -91,6 +164,14 @@ impl AppDelegate {
             window: OnceCell::new(),
             grid: OnceCell::new(),
             show: RefCell::new(None),
+            loop_enabled: Cell::new(false),
+            shuffle_enabled: Cell::new(false),
+            overlay_visible: Cell::new(false),
+            loop_item: OnceCell::new(),
+            shuffle_item: OnceCell::new(),
+            auto_menu: OnceCell::new(),
+            default_interval: Cell::new(None),
+            e2e: RefCell::new(e2e::E2eState::default()),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -150,22 +231,48 @@ impl AppDelegate {
         let _ = view.ivars().delegate.set(unsafe {
             Retained::retain(self as *const Self as *mut Self).unwrap()
         });
+
+        let overlay = NSTextField::labelWithString(ns_string!(""), mtm);
+        overlay.setTextColor(Some(&NSColor::whiteColor()));
+        overlay.setDrawsBackground(true);
+        overlay.setBackgroundColor(Some(&NSColor::colorWithWhite_alpha(0.0, 0.55)));
+        // Bottom left: the top edge sits under the menu bar.
+        overlay.setFrame(NSRect::new(
+            CGPoint::new(20.0, 20.0),
+            CGSize::new(screen_frame.size.width - 40.0, 24.0),
+        ));
+        overlay.setHidden(!self.ivars().overlay_visible.get());
+        view.addSubview(&overlay);
+
         window.setContentView(Some(&view));
         window.makeKeyAndOrderFront(None);
         window.makeFirstResponder(Some(&view));
 
+        let mut playlist = Playlist::new(files, index);
+        playlist.looping = self.ivars().loop_enabled.get();
+        playlist.set_shuffled(self.ivars().shuffle_enabled.get());
+
         *self.ivars().show.borrow_mut() = Some(Show {
             window,
             view,
-            files,
-            index: index.min(usize::MAX),
+            overlay,
+            playlist,
             cache: HashMap::new(),
+            interval: None,
+            timer: None,
         });
+        // Apply the remembered pace (menu pick or last key).
+        if let Some(seconds) = self.ivars().default_interval.get() {
+            self.set_auto_advance(Some(seconds));
+        }
         self.show_current();
     }
 
     pub fn end_slideshow(&self) {
         if let Some(show) = self.ivars().show.borrow_mut().take() {
+            if let Some(timer) = show.timer {
+                timer.invalidate();
+            }
             show.window.close();
         }
         if let Some(window) = self.ivars().window.get() {
@@ -174,31 +281,156 @@ impl AppDelegate {
     }
 
     pub fn step_slideshow(&self, delta: i64) {
-        {
-            let mut show = self.ivars().show.borrow_mut();
-            let Some(show) = show.as_mut() else { return };
-            let len = show.files.len() as i64;
-            let next = show.index as i64 + delta;
-            if next < 0 || next >= len {
-                return; // no loop mode in the demo
-            }
-            show.index = next as usize;
+        let stepped = match self.ivars().show.borrow_mut().as_mut() {
+            Some(show) => show.playlist.step(delta),
+            None => return,
+        };
+        if stepped {
+            self.show_current();
         }
-        self.show_current();
+    }
+
+    /// Option-arrow: step the original sorted order while shuffled.
+    pub fn step_slideshow_original(&self, delta: i64) {
+        let stepped = match self.ivars().show.borrow_mut().as_mut() {
+            Some(show) => show.playlist.step_original(delta),
+            None => return,
+        };
+        if stepped {
+            self.show_current();
+        }
     }
 
     pub fn jump_slideshow_start(&self) {
         if let Some(show) = self.ivars().show.borrow_mut().as_mut() {
-            show.index = 0;
+            show.playlist.jump_first();
         }
         self.show_current();
     }
 
     pub fn jump_slideshow_end(&self) {
         if let Some(show) = self.ivars().show.borrow_mut().as_mut() {
-            show.index = show.files.len().saturating_sub(1);
+            show.playlist.jump_last();
         }
         self.show_current();
+    }
+
+    /// Space: toggle pause while auto-advancing, plain next otherwise.
+    pub fn space_pressed(&self) {
+        let interval = self
+            .ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.interval);
+        match interval {
+            None => self.step_slideshow(1),
+            Some(seconds) => {
+                let paused = self.ivars().show.borrow().as_ref().is_some_and(|s| s.timer.is_none());
+                if paused {
+                    self.schedule_timer(seconds);
+                } else if let Some(show) = self.ivars().show.borrow_mut().as_mut() {
+                    if let Some(timer) = show.timer.take() {
+                        timer.invalidate();
+                    }
+                }
+                self.update_overlay();
+            }
+        }
+    }
+
+    /// Keys 1-9, ! (0.5 s), @ (1.5 s) or the menu set the pace;
+    /// 0 / Off stops. Also becomes the default for the next show.
+    pub fn set_auto_advance(&self, seconds: Option<f64>) {
+        self.ivars().default_interval.set(seconds);
+        self.update_auto_menu(seconds);
+        {
+            let mut show = self.ivars().show.borrow_mut();
+            let Some(show) = show.as_mut() else { return };
+            if let Some(timer) = show.timer.take() {
+                timer.invalidate();
+            }
+            show.interval = seconds;
+        }
+        if let Some(seconds) = seconds {
+            self.schedule_timer(seconds);
+        }
+        self.update_overlay();
+    }
+
+    fn schedule_timer(&self, seconds: f64) {
+        let timer = unsafe {
+            NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                seconds,
+                self,
+                sel!(advanceSlide:),
+                None,
+                true,
+            )
+        };
+        // Add in common modes explicitly so the timer keeps firing
+        // during event tracking too.
+        unsafe {
+            objc2_foundation::NSRunLoop::mainRunLoop()
+                .addTimer_forMode(&timer, objc2_foundation::NSRunLoopCommonModes)
+        };
+        if let Some(show) = self.ivars().show.borrow_mut().as_mut() {
+            show.timer = Some(timer);
+        }
+    }
+
+    /// Sync the Auto-advance menu checkmarks to `seconds`.
+    fn update_auto_menu(&self, seconds: Option<f64>) {
+        let Some(menu) = self.ivars().auto_menu.get() else { return };
+        let selected_tag = seconds.map(|s| (s * 10.0) as isize).unwrap_or(0);
+        for item in menu.itemArray() {
+            item.setState(if item.tag() == selected_tag { 1 } else { 0 });
+        }
+    }
+
+    pub fn toggle_overlay(&self) {
+        let visible = !self.ivars().overlay_visible.get();
+        self.ivars().overlay_visible.set(visible);
+        if let Some(show) = self.ivars().show.borrow().as_ref() {
+            show.overlay.setHidden(!visible);
+        }
+        self.update_overlay();
+    }
+
+    fn update_overlay(&self) {
+        // Build the text and release the borrow BEFORE touching
+        // AppKit: setStringValue may re-enter delegate code.
+        let (overlay, text) = {
+            let show = self.ivars().show.borrow();
+            let Some(show) = show.as_ref() else { return };
+            let name = show
+                .playlist
+                .current()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut text = format!(
+                "{}/{}  {}",
+                show.playlist.current_index() + 1,
+                show.playlist.len(),
+                name
+            );
+            if show.playlist.shuffled() {
+                text.push_str("  [shuffle]");
+            }
+            if show.playlist.looping {
+                text.push_str("  [loop]");
+            }
+            if let Some(seconds) = show.interval {
+                if show.timer.is_some() {
+                    text.push_str(&format!("  [{seconds}s]"));
+                } else {
+                    text.push_str("  [paused]");
+                }
+            }
+            (show.overlay.clone(), text)
+        };
+        overlay.setStringValue(&NSString::from_str(&text));
     }
 
     /// Display the current slide from cache or request it, prefetch
@@ -206,27 +438,78 @@ impl AppDelegate {
     /// the map: current, next, previous only).
     fn show_current(&self) {
         let engine = self.ivars().engine.get().unwrap();
-        let mut show = self.ivars().show.borrow_mut();
-        let Some(show) = show.as_mut() else { return };
+        {
+            let mut show = self.ivars().show.borrow_mut();
+            let Some(show) = show.as_mut() else { return };
 
-        let keep: Vec<PathBuf> = [-1i64, 0, 1]
-            .iter()
-            .filter_map(|d| {
-                let i = show.index as i64 + d;
-                (i >= 0 && (i as usize) < show.files.len()).then(|| show.files[i as usize].clone())
-            })
-            .collect();
-        show.cache.retain(|path, _| keep.contains(path));
+            let mut keep: Vec<PathBuf> = Vec::with_capacity(3);
+            for delta in [-1i64, 0, 1] {
+                if let Some(path) = show.playlist.peek(delta) {
+                    if !keep.contains(path) {
+                        keep.push(path.clone());
+                    }
+                }
+            }
+            show.cache.retain(|path, _| keep.contains(path));
 
-        let current = show.files[show.index].clone();
-        if let Some(image) = show.cache.get(&current) {
-            show.view.show_image(image.clone());
-        }
-        for path in keep {
-            if !show.cache.contains_key(&path) {
-                engine.request_slide(path);
+            if let Some(current) = show.playlist.current() {
+                if let Some(image) = show.cache.get(current) {
+                    show.view.show_image(image.clone());
+                }
+            }
+            for path in keep {
+                if !show.cache.contains_key(&path) {
+                    engine.request_slide(path);
+                }
             }
         }
+        self.update_overlay();
+    }
+
+    // ---- e2e accessors (state peeks for the harness) ----
+
+    pub fn e2e_state(&self) -> &RefCell<e2e::E2eState> {
+        &self.ivars().e2e
+    }
+
+    pub fn e2e_file_count(&self) -> usize {
+        self.ivars()
+            .grid
+            .get()
+            .map(|g| g.ivars().files.borrow().len())
+            .unwrap_or(0)
+    }
+
+    pub fn e2e_show_active(&self) -> bool {
+        self.ivars().show.borrow().is_some()
+    }
+
+    pub fn e2e_current_index(&self) -> Option<usize> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.playlist.current_index())
+    }
+
+    pub fn e2e_slide_has_image(&self) -> bool {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.view.has_image())
+    }
+
+    pub fn e2e_slide_view(&self) -> Option<Retained<SlideView>> {
+        self.ivars().show.borrow().as_ref().map(|s| s.view.clone())
+    }
+
+    pub fn e2e_overlay_text(&self) -> Option<String> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.overlay.stringValue().to_string())
     }
 
     // ---- core events ----
@@ -238,6 +521,18 @@ impl AppDelegate {
             }
             Event::ScanDone { total } => {
                 println!("scan done: {total} images");
+                if e2e::enabled() && !self.ivars().e2e.borrow().started {
+                    self.ivars().e2e.borrow_mut().started = true;
+                    unsafe {
+                        NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                            0.9,
+                            self,
+                            sel!(e2eStep:),
+                            None,
+                            true,
+                        )
+                    };
+                }
             }
             Event::ThumbReady { path, image } => {
                 let image = ns_image(&image);
@@ -247,7 +542,7 @@ impl AppDelegate {
                 let image = ns_image(&image);
                 let mut show = self.ivars().show.borrow_mut();
                 let Some(show) = show.as_mut() else { return };
-                let is_current = show.files.get(show.index) == Some(&path);
+                let is_current = show.playlist.current() == Some(&path);
                 show.cache.insert(path, image.clone());
                 if is_current {
                     show.view.show_image(image);
@@ -272,7 +567,7 @@ fn drain_events(mtm: MainThreadMarker) {
     }
 }
 
-fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
+fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate) {
     let menubar = NSMenu::new(mtm);
 
     let app_item = NSMenuItem::new(mtm);
@@ -303,6 +598,66 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication) {
     file_item.setSubmenu(Some(&file_menu));
     menubar.addItem(&file_item);
 
+    let show_item = NSMenuItem::new(mtm);
+    let show_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Slideshow"));
+    let loop_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Loop"),
+            Some(sel!(toggleLoop:)),
+            ns_string!("l"),
+        )
+    };
+    let shuffle_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Shuffle"),
+            Some(sel!(toggleShuffle:)),
+            ns_string!("r"),
+        )
+    };
+    shuffle_item.setKeyEquivalentModifierMask(
+        objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Option,
+    );
+    show_menu.addItem(&loop_item);
+    show_menu.addItem(&shuffle_item);
+
+    show_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let auto_item = NSMenuItem::new(mtm);
+    let auto_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Auto-advance"));
+    // Tag = tenths of a second; 0 = off.
+    for (title, tag) in [
+        ("Off", 0isize),
+        ("Every second", 10),
+        ("Every 3 seconds", 30),
+        ("Every 5 seconds", 50),
+        ("Every 10 seconds", 100),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(sel!(setAutoAdvanceMenu:)),
+                ns_string!(""),
+            )
+        };
+        item.setTag(tag);
+        if tag == 0 {
+            item.setState(1);
+        }
+        auto_menu.addItem(&item);
+    }
+    auto_item.setSubmenu(Some(&auto_menu));
+    auto_item.setTitle(ns_string!("Auto-advance"));
+    show_menu.addItem(&auto_item);
+
+    show_item.setSubmenu(Some(&show_menu));
+    menubar.addItem(&show_item);
+
+    let _ = delegate.ivars().loop_item.set(loop_item);
+    let _ = delegate.ivars().shuffle_item.set(shuffle_item);
+    let _ = delegate.ivars().auto_menu.set(auto_menu);
+
     app.setMainMenu(Some(&menubar));
 }
 
@@ -310,10 +665,10 @@ fn main() {
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-    build_menu(mtm, &app);
 
     let delegate = AppDelegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    build_menu(mtm, &app, &delegate);
 
     // Browse window: scroll view + grid.
     let frame = NSRect::new(CGPoint::new(200.0, 200.0), CGSize::new(1000.0, 700.0));

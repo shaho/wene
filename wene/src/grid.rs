@@ -141,12 +141,34 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            let is_return = event.keyCode() == 36;
-            if is_return && self.ivars().selection.get().is_some() {
-                self.activate();
-            } else {
-                let _: () = unsafe { msg_send![super(self), keyDown: event] };
+            let count = self.ivars().files.borrow().len();
+            let cols = self.columns(self.bounds().size.width) as i64;
+            let delta: i64 = match event.keyCode() {
+                36 => {
+                    // return
+                    if self.ivars().selection.get().is_some() {
+                        self.activate();
+                    }
+                    return;
+                }
+                123 => -1,    // left
+                124 => 1,     // right
+                126 => -cols, // up
+                125 => cols,  // down
+                _ => {
+                    let _: () = unsafe { msg_send![super(self), keyDown: event] };
+                    return;
+                }
+            };
+            if count == 0 {
+                return;
             }
+            let next = match self.ivars().selection.get() {
+                Some(sel) => (sel as i64 + delta).clamp(0, count as i64 - 1) as usize,
+                None => 0,
+            };
+            self.select(Some(next));
+            self.scrollRectToVisible(self.cell_rect(next, cols as usize));
         }
     }
 );

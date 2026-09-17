@@ -111,11 +111,16 @@ define_class!(
                 return;
             };
             let key_code = event.keyCode();
+            let option = event
+                .modifierFlags()
+                .contains(objc2_app_kit::NSEventModifierFlags::Option);
             let chars = event.charactersIgnoringModifiers()
                 .map(|s| s.to_string())
                 .unwrap_or_default();
             match key_code {
-                53 => return delegate.end_slideshow(),          // esc
+                53 => return delegate.end_slideshow(), // esc
+                123 | 126 if option => return delegate.step_slideshow_original(-1),
+                124 | 125 if option => return delegate.step_slideshow_original(1),
                 123 | 126 => return delegate.step_slideshow(-1), // left, up
                 124 | 125 => return delegate.step_slideshow(1),  // right, down
                 115 => return delegate.jump_slideshow_start(),   // home
@@ -124,7 +129,14 @@ define_class!(
             }
             match chars.as_str() {
                 "q" => delegate.end_slideshow(),
-                " " => delegate.step_slideshow(1),
+                " " => delegate.space_pressed(),
+                "i" => delegate.toggle_overlay(),
+                "0" => delegate.set_auto_advance(None),
+                "!" => delegate.set_auto_advance(Some(0.5)),
+                "@" => delegate.set_auto_advance(Some(1.5)),
+                d @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") => {
+                    delegate.set_auto_advance(Some(d.parse::<f64>().unwrap()));
+                }
                 "+" => self.zoom_step(1),
                 "-" => self.zoom_step(-1),
                 "=" => self.set_zoom(Some(1.0)),
@@ -185,6 +197,10 @@ impl SlideView {
         };
         self.ivars().zoom.set(Some(next));
         self.setNeedsDisplay(true);
+    }
+
+    pub fn has_image(&self) -> bool {
+        self.ivars().image.borrow().is_some()
     }
 
     /// New slide: reset zoom and pan (per-file zoom memory is a
