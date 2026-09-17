@@ -1,0 +1,7 @@
+[package]
+name = "wene-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lexical-sort = "0.3"
