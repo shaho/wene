@@ -384,6 +384,20 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.e2e_toggle_browser();
             check(state, !delegate.e2e_browser_hidden(), "browser pane shows again");
         }
+        34 => {
+            // Preferences window and the default slideshow mode.
+            delegate.show_prefs();
+            check(state, delegate.e2e_prefs_visible(), "prefs window opens");
+            delegate.e2e_set_default_windowed(true);
+            check(
+                state,
+                delegate.default_windowed(),
+                "default slideshow mode switches to windowed",
+            );
+            delegate.e2e_set_default_windowed(false);
+            delegate.e2e_close_prefs();
+            check(state, !delegate.e2e_prefs_visible(), "prefs window closes");
+        }
         27 => {
             // Date sort orders: the fixture has no EXIF dates, so
             // both fall back to the modified date without breaking

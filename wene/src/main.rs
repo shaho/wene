@@ -27,6 +27,7 @@ use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{
     ns_string, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString, NSTimer,
+    NSUserDefaults,
 };
 use wene_core::{Engine, Event, LruCache, Playlist, SortOrder};
 
@@ -73,6 +74,9 @@ pub struct DelegateIvars {
     /// The folder the grid currently shows, to skip no-op rescans.
     current_root: RefCell<Option<PathBuf>>,
     browser_item: OnceCell<Retained<NSMenuItem>>,
+    prefs_window: OnceCell<Retained<NSWindow>>,
+    /// Default slideshow mode from prefs; ⌥ at start inverts it.
+    default_windowed: Cell<bool>,
     show: RefCell<Option<Show>>,
     loop_enabled: Cell<bool>,
     shuffle_enabled: Cell<bool>,
@@ -170,10 +174,12 @@ define_class!(
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
+            self.load_prefs();
             // A folder argument skips the open panel (useful for
-            // scripted runs); otherwise ask.
+            // scripted runs); then the startup-folder pref; then ask.
             let arg = std::env::args().nth(1).map(PathBuf::from);
-            match arg.filter(|p| p.is_dir()) {
+            let startup = startup_folder_pref().map(PathBuf::from);
+            match arg.or(startup).filter(|p| p.is_dir()) {
                 Some(root) => self.scan_root(root, true),
                 None => self.open_folder(),
             }
@@ -212,6 +218,7 @@ define_class!(
                 show.playlist.looping = enabled;
             }
             self.update_overlay();
+            self.save_prefs();
         }
 
         #[unsafe(method(toggleShuffle:))]
@@ -225,6 +232,7 @@ define_class!(
                 show.playlist.set_shuffled(enabled);
             }
             self.update_overlay();
+            self.save_prefs();
         }
 
         #[unsafe(method(setAutoAdvanceMenu:))]
@@ -267,6 +275,58 @@ define_class!(
             self.apply_sort();
         }
 
+        #[unsafe(method(showPrefs:))]
+        fn show_prefs_action(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.show_prefs();
+        }
+
+        #[unsafe(method(prefsToggleWindowed:))]
+        fn prefs_toggle_windowed(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.ivars()
+                .default_windowed
+                .set(!self.ivars().default_windowed.get());
+            self.save_prefs();
+        }
+
+        #[unsafe(method(prefsAutoAdvance:))]
+        fn prefs_auto_advance(&self, sender: Option<&objc2::runtime::AnyObject>) {
+            let tag = sender
+                .and_then(|s| s.downcast_ref::<objc2_app_kit::NSPopUpButton>())
+                .map(|p| p.selectedTag())
+                .unwrap_or(0);
+            self.set_auto_advance((tag > 0).then(|| tag as f64 / 10.0));
+        }
+
+        #[unsafe(method(prefsChooseStartup:))]
+        fn prefs_choose_startup(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let mtm = self.mtm();
+            let panel = NSOpenPanel::openPanel(mtm);
+            panel.setCanChooseDirectories(true);
+            panel.setCanChooseFiles(false);
+            if panel.runModal() != objc2_app_kit::NSModalResponseOK {
+                return;
+            }
+            let Some(path) = panel.URL().and_then(|u| u.path()) else { return };
+            if !e2e::enabled() {
+                unsafe {
+                    NSUserDefaults::standardUserDefaults()
+                        .setObject_forKey(Some(&path), ns_string!("startupFolder"));
+                }
+            }
+            self.sync_prefs_controls();
+        }
+
+        #[unsafe(method(prefsClearStartup:))]
+        fn prefs_clear_startup(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if !e2e::enabled() {
+                unsafe {
+                    NSUserDefaults::standardUserDefaults()
+                        .setObject_forKey(None, ns_string!("startupFolder"));
+                }
+            }
+            self.sync_prefs_controls();
+        }
+
         #[unsafe(method(browserClicked:))]
         fn browser_clicked(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             let Some(browser) = self.ivars().browser.get() else { return };
@@ -296,6 +356,7 @@ define_class!(
                 item.setState(if visible { 1 } else { 0 });
             }
             self.layout_content();
+            self.save_prefs();
         }
 
         #[unsafe(method(toggleLabels:))]
@@ -306,6 +367,7 @@ define_class!(
             if let Some(item) = self.ivars().labels_item.get() {
                 item.setState(if visible { 1 } else { 0 });
             }
+            self.save_prefs();
         }
 
         #[unsafe(method(biggerThumbs:))]
@@ -354,6 +416,8 @@ impl AppDelegate {
             browser_cols: RefCell::new(Vec::new()),
             current_root: RefCell::new(None),
             browser_item: OnceCell::new(),
+            prefs_window: OnceCell::new(),
+            default_windowed: Cell::new(false),
             show: RefCell::new(None),
             loop_enabled: Cell::new(false),
             shuffle_enabled: Cell::new(false),
@@ -470,6 +534,143 @@ impl AppDelegate {
 
     fn sort_is_default(&self) -> bool {
         self.ivars().sort_order.get() == SortOrder::Name && !self.ivars().sort_desc.get()
+    }
+
+    // ---- preferences ----
+
+    /// Apply saved settings at launch. Skipped in e2e runs so the
+    /// harness starts from a known state.
+    fn load_prefs(&self) {
+        if e2e::enabled() {
+            return;
+        }
+        let d = NSUserDefaults::standardUserDefaults();
+        if d.boolForKey(ns_string!("slideshowLoop")) {
+            self.ivars().loop_enabled.set(true);
+            if let Some(item) = self.ivars().loop_item.get() {
+                item.setState(1);
+            }
+        }
+        if d.boolForKey(ns_string!("slideshowShuffle")) {
+            self.ivars().shuffle_enabled.set(true);
+            if let Some(item) = self.ivars().shuffle_item.get() {
+                item.setState(1);
+            }
+        }
+        self.ivars()
+            .default_windowed
+            .set(d.boolForKey(ns_string!("slideshowWindowed")));
+        let tenths = d.integerForKey(ns_string!("autoAdvanceTenths"));
+        let seconds = (tenths > 0).then(|| tenths as f64 / 10.0);
+        self.ivars().default_interval.set(seconds);
+        self.update_auto_menu(seconds);
+        if d.boolForKey(ns_string!("showFilenames")) {
+            if let Some(grid) = self.ivars().grid.get() {
+                grid.set_labels(true);
+            }
+            if let Some(item) = self.ivars().labels_item.get() {
+                item.setState(1);
+            }
+        }
+        // Browser defaults to visible: only an explicit false hides.
+        let browser_off = d.objectForKey(ns_string!("showBrowser")).is_some()
+            && !d.boolForKey(ns_string!("showBrowser"));
+        if browser_off {
+            if let Some(browser) = self.ivars().browser.get() {
+                browser.setHidden(true);
+            }
+            if let Some(item) = self.ivars().browser_item.get() {
+                item.setState(0);
+            }
+            self.layout_content();
+        }
+    }
+
+    /// Persist everything the prefs window and the menus control.
+    fn save_prefs(&self) {
+        if e2e::enabled() {
+            return;
+        }
+        let d = NSUserDefaults::standardUserDefaults();
+        d.setBool_forKey(self.ivars().loop_enabled.get(), ns_string!("slideshowLoop"));
+        d.setBool_forKey(
+            self.ivars().shuffle_enabled.get(),
+            ns_string!("slideshowShuffle"),
+        );
+        d.setBool_forKey(
+            self.ivars().default_windowed.get(),
+            ns_string!("slideshowWindowed"),
+        );
+        let tenths = self
+            .ivars()
+            .default_interval
+            .get()
+            .map(|s| (s * 10.0) as isize)
+            .unwrap_or(0);
+        d.setInteger_forKey(tenths, ns_string!("autoAdvanceTenths"));
+        if let Some(grid) = self.ivars().grid.get() {
+            d.setBool_forKey(grid.labels_visible(), ns_string!("showFilenames"));
+        }
+        if let Some(browser) = self.ivars().browser.get() {
+            d.setBool_forKey(!browser.isHidden(), ns_string!("showBrowser"));
+        }
+    }
+
+    pub fn default_windowed(&self) -> bool {
+        self.ivars().default_windowed.get()
+    }
+
+    pub fn show_prefs(&self) {
+        let mtm = self.mtm();
+        if self.ivars().prefs_window.get().is_none() {
+            let window = build_prefs_window(mtm, self);
+            let _ = self.ivars().prefs_window.set(window);
+        }
+        self.sync_prefs_controls();
+        if let Some(window) = self.ivars().prefs_window.get() {
+            window.makeKeyAndOrderFront(None);
+        }
+    }
+
+    /// Push current state into the prefs controls (looked up by tag).
+    fn sync_prefs_controls(&self) {
+        let Some(window) = self.ivars().prefs_window.get() else { return };
+        let Some(content) = window.contentView() else { return };
+        let set_check = |tag: isize, on: bool| {
+            if let Some(view) = content.viewWithTag(tag) {
+                if let Some(button) = view.downcast_ref::<objc2_app_kit::NSButton>() {
+                    button.setState(if on { 1 } else { 0 });
+                }
+            }
+        };
+        set_check(1, self.ivars().default_windowed.get());
+        set_check(2, self.ivars().loop_enabled.get());
+        set_check(3, self.ivars().shuffle_enabled.get());
+        set_check(
+            4,
+            self.ivars().grid.get().is_some_and(|g| g.labels_visible()),
+        );
+        set_check(
+            5,
+            self.ivars().browser.get().is_some_and(|b| !b.isHidden()),
+        );
+        if let Some(view) = content.viewWithTag(6) {
+            if let Some(popup) = view.downcast_ref::<objc2_app_kit::NSPopUpButton>() {
+                let tenths = self
+                    .ivars()
+                    .default_interval
+                    .get()
+                    .map(|s| (s * 10.0) as isize)
+                    .unwrap_or(0);
+                popup.selectItemWithTag(tenths);
+            }
+        }
+        if let Some(view) = content.viewWithTag(7) {
+            if let Some(field) = view.downcast_ref::<NSTextField>() {
+                let text = startup_folder_pref().unwrap_or_else(|| "Ask at launch".into());
+                field.setStringValue(&NSString::from_str(&text));
+            }
+        }
     }
 
     // ---- status bar ----
@@ -668,6 +869,7 @@ impl AppDelegate {
             self.schedule_timer(seconds);
         }
         self.update_overlay();
+        self.save_prefs();
     }
 
     fn schedule_timer(&self, seconds: f64) {
@@ -954,6 +1156,23 @@ impl AppDelegate {
         }
     }
 
+    pub fn e2e_prefs_visible(&self) -> bool {
+        self.ivars()
+            .prefs_window
+            .get()
+            .is_some_and(|w| w.isVisible())
+    }
+
+    pub fn e2e_set_default_windowed(&self, windowed: bool) {
+        self.ivars().default_windowed.set(windowed);
+    }
+
+    pub fn e2e_close_prefs(&self) {
+        if let Some(window) = self.ivars().prefs_window.get() {
+            window.close();
+        }
+    }
+
     pub fn e2e_slide_animating(&self) -> bool {
         self.ivars()
             .show
@@ -1095,6 +1314,117 @@ fn image_cost(image: &Img) -> usize {
     CGImage::width(Some(image)) * CGImage::height(Some(image)) * 4
 }
 
+fn startup_folder_pref() -> Option<String> {
+    if e2e::enabled() {
+        return None;
+    }
+    NSUserDefaults::standardUserDefaults()
+        .stringForKey(ns_string!("startupFolder"))
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The preferences window: one plain pane, controls looked up by tag
+/// (1-5 checkboxes, 6 auto-advance popup, 7 startup folder field).
+fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained<NSWindow> {
+    let frame = NSRect::new(CGPoint::new(360.0, 360.0), CGSize::new(430.0, 292.0));
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            frame,
+            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    window.setTitle(ns_string!("Preferences"));
+    unsafe { window.setReleasedWhenClosed(false) };
+    let content = objc2_app_kit::NSView::initWithFrame(
+        objc2_app_kit::NSView::alloc(mtm),
+        NSRect::new(CGPoint::new(0.0, 0.0), frame.size),
+    );
+
+    let label = |text: &str, x: f64, y: f64| {
+        let l = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+        l.setFrame(NSRect::new(CGPoint::new(x, y), CGSize::new(150.0, 18.0)));
+        content.addSubview(&l);
+    };
+    let checkbox = |title: &str, action: objc2::runtime::Sel, tag: isize, y: f64| {
+        let b = unsafe {
+            objc2_app_kit::NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str(title),
+                Some(delegate),
+                Some(action),
+                mtm,
+            )
+        };
+        b.setFrame(NSRect::new(CGPoint::new(20.0, y), CGSize::new(380.0, 20.0)));
+        b.setTag(tag);
+        content.addSubview(&b);
+    };
+
+    // Startup folder row (top).
+    label("Startup folder:", 20.0, 252.0);
+    let field = NSTextField::labelWithString(ns_string!(""), mtm);
+    field.setFrame(NSRect::new(CGPoint::new(20.0, 228.0), CGSize::new(250.0, 18.0)));
+    field.setTag(7);
+    field.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(11.0)));
+    field.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    content.addSubview(&field);
+    for (title, action, x) in [
+        ("Choose…", sel!(prefsChooseStartup:), 280.0),
+        ("Clear", sel!(prefsClearStartup:), 358.0),
+    ] {
+        let b = unsafe {
+            objc2_app_kit::NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(title),
+                Some(delegate),
+                Some(action),
+                mtm,
+            )
+        };
+        b.setFrame(NSRect::new(CGPoint::new(x, 222.0), CGSize::new(72.0, 28.0)));
+        content.addSubview(&b);
+    }
+
+    checkbox(
+        "Start slideshows in a window",
+        sel!(prefsToggleWindowed:),
+        1,
+        188.0,
+    );
+    checkbox("Loop slideshows", sel!(toggleLoop:), 2, 160.0);
+    checkbox("Shuffle slideshows", sel!(toggleShuffle:), 3, 132.0);
+
+    label("Auto-advance:", 20.0, 100.0);
+    let popup = objc2_app_kit::NSPopUpButton::new(mtm);
+    popup.setFrame(NSRect::new(CGPoint::new(150.0, 92.0), CGSize::new(180.0, 26.0)));
+    popup.setTag(6);
+    for (title, tag) in [
+        ("Off", 0isize),
+        ("Every second", 10),
+        ("Every 3 seconds", 30),
+        ("Every 5 seconds", 50),
+        ("Every 10 seconds", 100),
+    ] {
+        popup.addItemWithTitle(&NSString::from_str(title));
+        if let Some(item) = popup.lastItem() {
+            item.setTag(tag);
+        }
+    }
+    unsafe {
+        popup.setTarget(Some(delegate));
+        popup.setAction(Some(sel!(prefsAutoAdvance:)));
+    }
+    content.addSubview(&popup);
+
+    checkbox("Show filenames", sel!(toggleLabels:), 4, 56.0);
+    checkbox("Show browser", sel!(toggleBrowser:), 5, 28.0);
+
+    window.setContentView(Some(&content));
+    window
+}
+
 /// Direct subfolders of `path` for one browser column: visible
 /// directories, natural name order.
 fn dir_children(path: &std::path::Path) -> Vec<String> {
@@ -1139,6 +1469,16 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
 
     let app_item = NSMenuItem::new(mtm);
     let app_menu = NSMenu::new(mtm);
+    let prefs = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Preferences…"),
+            Some(sel!(showPrefs:)),
+            ns_string!(","),
+        )
+    };
+    app_menu.addItem(&prefs);
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     let quit = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),

@@ -472,12 +472,13 @@ impl GridView {
         }
     }
 
-    /// Start a slideshow; ⌥ held = in a window instead of fullscreen.
+    /// Start a slideshow in the preferred mode; ⌥ held inverts it.
     fn activate(&self) {
         if let Some(delegate) = self.ivars().delegate.get() {
             let (files, start) = self.slideshow_request();
-            let windowed = NSEvent::modifierFlags_class()
+            let option = NSEvent::modifierFlags_class()
                 .contains(objc2_app_kit::NSEventModifierFlags::Option);
+            let windowed = delegate.default_windowed() != option;
             if !files.is_empty() {
                 delegate.start_slideshow_files(files, start, windowed);
             }
