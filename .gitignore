@@ -78,10 +78,10 @@ claude.md
 agents.md
 .scratch
 context.md
-# research/
+research/
 graphify-out/
-# docs/
-# reports/
-# prototypes/
+docs/
+reports/
+prototypes/
 /server/target/
 
