@@ -92,6 +92,10 @@ pub struct SlideState {
 
 pub struct SlideViewIvars {
     image: RefCell<Option<Retained<NSImage>>>,
+    /// Animated slide: every frame with its delay in seconds.
+    frames: RefCell<Vec<(Retained<NSImage>, f64)>>,
+    frame_index: Cell<usize>,
+    anim_timer: RefCell<Option<Retained<objc2_foundation::NSTimer>>>,
     zoom: Cell<Option<f64>>,
     rotation: Cell<i32>,
     flipped: Cell<bool>,
@@ -171,6 +175,22 @@ define_class!(
             self.notify_state_change();
         }
 
+        #[unsafe(method(advanceFrame:))]
+        fn advance_frame(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            let (image, delay) = {
+                let frames = self.ivars().frames.borrow();
+                if frames.len() < 2 {
+                    return;
+                }
+                let next = (self.ivars().frame_index.get() + 1) % frames.len();
+                self.ivars().frame_index.set(next);
+                frames[next].clone()
+            };
+            *self.ivars().image.borrow_mut() = Some(image);
+            self.setNeedsDisplay(true);
+            self.schedule_frame(delay);
+        }
+
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             let Some(delegate) = self.ivars().delegate.get() else {
@@ -227,6 +247,9 @@ impl SlideView {
     pub fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(SlideViewIvars {
             image: RefCell::new(None),
+            frames: RefCell::new(Vec::new()),
+            frame_index: Cell::new(0),
+            anim_timer: RefCell::new(None),
             zoom: Cell::new(None),
             rotation: Cell::new(0),
             flipped: Cell::new(false),
@@ -321,7 +344,52 @@ impl SlideView {
     /// New slide: reset to defaults. The delegate re-applies any
     /// remembered per-file state afterwards.
     pub fn show_image(&self, image: Retained<NSImage>) {
+        self.stop_animation();
         *self.ivars().image.borrow_mut() = Some(image);
         self.apply_state(SlideState::default());
+    }
+
+    /// New animated slide: frame 0 shows at once, the rest play on
+    /// their own delays. Zoom/rotate/flip apply to whatever frame is
+    /// current, same draw path as a still image.
+    pub fn show_frames(&self, frames: Vec<(Retained<NSImage>, f64)>) {
+        self.stop_animation();
+        let Some((first, delay)) = frames.first().cloned() else { return };
+        *self.ivars().image.borrow_mut() = Some(first);
+        *self.ivars().frames.borrow_mut() = frames;
+        self.ivars().frame_index.set(0);
+        self.apply_state(SlideState::default());
+        self.schedule_frame(delay);
+    }
+
+    /// The timer retains the view; invalidating it is what lets a
+    /// closed slideshow's view die.
+    pub fn stop_animation(&self) {
+        if let Some(timer) = self.ivars().anim_timer.borrow_mut().take() {
+            timer.invalidate();
+        }
+        self.ivars().frames.borrow_mut().clear();
+        self.ivars().frame_index.set(0);
+    }
+
+    fn schedule_frame(&self, delay: f64) {
+        let timer = unsafe {
+            objc2_foundation::NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                delay,
+                self,
+                objc2::sel!(advanceFrame:),
+                None,
+                false,
+            )
+        };
+        unsafe {
+            objc2_foundation::NSRunLoop::mainRunLoop()
+                .addTimer_forMode(&timer, objc2_foundation::NSRunLoopCommonModes)
+        };
+        *self.ivars().anim_timer.borrow_mut() = Some(timer);
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.ivars().frames.borrow().len() >= 2 && self.ivars().anim_timer.borrow().is_some()
     }
 }

@@ -32,6 +32,13 @@ pub trait ImageDecoder: Send + Sync + 'static {
     fn file_dates(&self, _path: &Path) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
         (None, None)
     }
+
+    /// All frames of an animated image with per-frame delays in
+    /// seconds. None means "not animated": the slide falls back to a
+    /// normal decode.
+    fn decode_frames(&self, _path: &Path) -> Option<Vec<(Self::Image, f64)>> {
+        None
+    }
 }
 
 pub enum Event<I> {
@@ -46,6 +53,8 @@ pub enum Event<I> {
     ScanDone { total: usize },
     ThumbReady { path: PathBuf, image: I },
     SlideReady { path: PathBuf, image: I },
+    /// An animated slide: every frame plus its delay in seconds.
+    SlideFramesReady { path: PathBuf, frames: Vec<(I, f64)> },
     DecodeFailed { path: PathBuf },
 }
 
@@ -398,20 +407,18 @@ fn spawn_decode_worker<I: Send + 'static, D: ImageDecoder<Image = I>>(
             rx.recv()
         };
         let Ok(job) = job else { return };
-        let (path, decoded, is_slide) = match job {
-            Job::Thumb(p) => {
-                let image = decoder.decode_thumb(&p, max_thumb_px);
-                (p, image, false)
-            }
-            Job::Slide(p) => {
-                let image = decoder.decode(&p, max_slide_px);
-                (p, image, true)
-            }
-        };
-        let event = match decoded {
-            Some(image) if is_slide => Event::SlideReady { path, image },
-            Some(image) => Event::ThumbReady { path, image },
-            None => Event::DecodeFailed { path },
+        let event = match job {
+            Job::Thumb(path) => match decoder.decode_thumb(&path, max_thumb_px) {
+                Some(image) => Event::ThumbReady { path, image },
+                None => Event::DecodeFailed { path },
+            },
+            Job::Slide(path) => match decoder.decode_frames(&path) {
+                Some(frames) => Event::SlideFramesReady { path, frames },
+                None => match decoder.decode(&path, max_slide_px) {
+                    Some(image) => Event::SlideReady { path, image },
+                    None => Event::DecodeFailed { path },
+                },
+            },
         };
         if events_tx.send(event).is_err() {
             return;

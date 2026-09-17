@@ -9,7 +9,9 @@ use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFStr
 use objc2_core_graphics::CGImage;
 use objc2_image_io::{
     kCGImagePropertyExifDateTimeOriginal, kCGImagePropertyExifDictionary,
-    kCGImagePropertyPixelHeight, kCGImagePropertyPixelWidth,
+    kCGImagePropertyGIFDelayTime, kCGImagePropertyGIFDictionary,
+    kCGImagePropertyGIFUnclampedDelayTime, kCGImagePropertyPixelHeight,
+    kCGImagePropertyPixelWidth, kCGImagePropertyWebPDelayTime, kCGImagePropertyWebPDictionary,
     kCGImageSourceCreateThumbnailFromImageAlways, kCGImageSourceCreateThumbnailFromImageIfAbsent,
     kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceThumbnailMaxPixelSize, CGImageSource,
 };
@@ -121,5 +123,100 @@ impl ImageDecoder for ImageIoDecoder {
 
     fn file_dates(&self, path: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
         (exif_date(path), date_added(path))
+    }
+
+    /// Animated GIF/WebP: decode every frame with its delay. Files
+    /// whose decoded frames would blow the budget play as a static
+    /// first frame instead.
+    fn decode_frames(&self, path: &Path) -> Option<Vec<(Self::Image, f64)>> {
+        if !is_animated_ext(path) {
+            return None;
+        }
+        let url = CFURL::from_file_path(path)?;
+        unsafe {
+            let src = CGImageSource::with_url(&url, None)?;
+            let count = src.count();
+            if count < 2 {
+                return None;
+            }
+            // Budget: whole animation decoded up front.
+            // ponytail: streaming/looping decode if real GIFs hit it.
+            const FRAME_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+            let (w, h) = image_dimensions(path)?;
+            if (w as usize) * (h as usize) * 4 * count > FRAME_BUDGET_BYTES {
+                return None;
+            }
+            let mut frames = Vec::with_capacity(count);
+            for index in 0..count {
+                let image = src.image_at_index(index, None)?;
+                frames.push((image, frame_delay(&src, index)));
+            }
+            Some(frames)
+        }
+    }
+}
+
+pub fn is_animated_ext(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            e == "gif" || e == "webp"
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn animated_gif_frames_decode() {
+        let path = std::env::temp_dir().join("wene-anim-selfcheck.gif");
+        std::fs::write(&path, crate::e2e::ANIMATED_GIF).unwrap();
+        let frames = ImageIoDecoder.decode_frames(&path).expect("gif is animated");
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|(_, delay)| *delay > 0.0));
+        // Static file: no frames path.
+        assert!(ImageIoDecoder.decode_frames(std::path::Path::new("/x/a.jpg")).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Per-frame delay in seconds. GIF prefers the unclamped value;
+/// zero/absent falls back to the 0.1 s browsers use.
+fn frame_delay(src: &CGImageSource, index: usize) -> f64 {
+    let delay = unsafe {
+        let props = src.properties_at_index(index, None);
+        props.and_then(|props| {
+            let props: CFRetained<CFDictionary<CFString, CFType>> =
+                CFRetained::cast_unchecked(props);
+            let number = |dict: &CFDictionary<CFString, CFType>, key: &CFString| {
+                dict.get(key)
+                    .and_then(|v| v.downcast::<CFNumber>().ok())
+                    .and_then(|n| n.as_f64())
+            };
+            let sub = |key: &'static CFString| {
+                props
+                    .get(key)
+                    .and_then(|v| v.downcast::<CFDictionary>().ok())
+                    .map(|d| {
+                        CFRetained::cast_unchecked::<CFDictionary<CFString, CFType>>(d)
+                    })
+            };
+            if let Some(gif) = sub(kCGImagePropertyGIFDictionary) {
+                number(&gif, kCGImagePropertyGIFUnclampedDelayTime)
+                    .filter(|&d| d > 0.0)
+                    .or_else(|| number(&gif, kCGImagePropertyGIFDelayTime))
+            } else if let Some(webp) = sub(kCGImagePropertyWebPDictionary) {
+                number(&webp, kCGImagePropertyWebPDelayTime)
+            } else {
+                None
+            }
+        })
+    };
+    match delay {
+        Some(d) if d > 0.011 => d,
+        _ => 0.1,
     }
 }

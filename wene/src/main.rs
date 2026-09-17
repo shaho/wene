@@ -96,6 +96,9 @@ define_class!(
                 if let Some(timer) = show.timer {
                     timer.invalidate();
                 }
+                // The frame timer retains the view; stop it so the
+                // view can die with the window.
+                show.view.stop_animation();
             }
             if let Some(window) = self.ivars().window.get() {
                 window.makeKeyAndOrderFront(None);
@@ -668,7 +671,16 @@ impl AppDelegate {
                     }
                 }
             }
+            let current = show.playlist.current().cloned();
             for path in wanted {
+                // Animated slides never enter the cache (frames are
+                // big); decode them only when they become current
+                // instead of on every neighbour prefetch.
+                let animated = decoder::is_animated_ext(&path);
+                let is_current = Some(&path) == current.as_ref();
+                if animated && !is_current {
+                    continue;
+                }
                 if !show.cache.contains(&path) {
                     engine.request_slide(path);
                 }
@@ -783,6 +795,14 @@ impl AppDelegate {
             .unwrap_or_default()
     }
 
+    pub fn e2e_slide_animating(&self) -> bool {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.view.is_animating())
+    }
+
     pub fn e2e_toggle_labels(&self) {
         if let Some(grid) = self.ivars().grid.get() {
             grid.set_labels(!grid.labels_visible());
@@ -877,6 +897,26 @@ impl AppDelegate {
                 if is_current {
                     // Refresh rotation/flip/zoom flags for the slide
                     // that just appeared.
+                    self.update_overlay();
+                }
+            }
+            Event::SlideFramesReady { path, frames } => {
+                let is_current = {
+                    let mut show = self.ivars().show.borrow_mut();
+                    let Some(show) = show.as_mut() else { return };
+                    let is_current = show.playlist.current() == Some(&path);
+                    if is_current {
+                        let frames: Vec<_> =
+                            frames.iter().map(|(img, d)| (ns_image(img), *d)).collect();
+                        let state = show.view_states.get(&path).copied();
+                        show.view.show_frames(frames);
+                        if let Some(state) = state {
+                            show.view.apply_state(state);
+                        }
+                    }
+                    is_current
+                };
+                if is_current {
                     self.update_overlay();
                 }
             }

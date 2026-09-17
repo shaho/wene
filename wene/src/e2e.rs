@@ -28,6 +28,21 @@ impl Default for E2eState {
     }
 }
 
+/// Minimal 1×1 two-frame animated GIF (black frame, white frame,
+/// 0.1 s delays) for the animation tests.
+pub const ANIMATED_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
+    0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, // 1x1, global color table
+    0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, // palette: black, white
+    0x21, 0xF9, 0x04, 0x00, 0x0A, 0x00, 0x00, 0x00, // GCE: 0.1 s
+    0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // frame 1
+    0x02, 0x02, 0x44, 0x01, 0x00, // pixel 0
+    0x21, 0xF9, 0x04, 0x00, 0x0A, 0x00, 0x00, 0x00, // GCE: 0.1 s
+    0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // frame 2
+    0x02, 0x02, 0x4C, 0x01, 0x00, // pixel 1
+    0x3B, // trailer
+];
+
 pub fn enabled() -> bool {
     std::env::var("WENE_E2E").is_ok_and(|v| !v.is_empty() && v != "0")
 }
@@ -310,6 +325,36 @@ pub fn run_step(delegate: &AppDelegate) {
                 "labels add row height",
             );
             delegate.e2e_toggle_labels();
+        }
+        28 => {
+            // Animated GIF: drop one into the folder for the watcher.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let written =
+                std::fs::write(format!("{root}/zzz-anim.gif"), ANIMATED_GIF).is_ok();
+            check(state, written, "animated gif written");
+        }
+        29 => {
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher picked up the gif",
+            );
+            // Name order puts zzz-anim.gif last: index 4.
+            delegate.start_slideshow(4, false);
+        }
+        30 => {
+            check(state, delegate.e2e_show_active(), "gif slideshow active");
+            check(state, delegate.e2e_slide_animating(), "gif frames are playing");
+            delegate.end_slideshow();
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let _ = std::fs::remove_file(format!("{root}/zzz-anim.gif"));
+        }
+        31 => {
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "gif removed after the test",
+            );
         }
         27 => {
             // Date sort orders: the fixture has no EXIF dates, so
