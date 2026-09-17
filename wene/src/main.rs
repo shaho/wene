@@ -31,7 +31,7 @@ use wene_core::{Engine, Event, Playlist, SortOrder};
 
 use decoder::ImageIoDecoder;
 use grid::GridView;
-use slideshow::{SlideView, SlideshowWindow};
+use slideshow::{SlideState, SlideView, SlideshowWindow};
 
 type Img = CFRetained<CGImage>;
 
@@ -44,6 +44,8 @@ struct Show {
     overlay: Retained<NSTextField>,
     playlist: Playlist,
     cache: HashMap<PathBuf, Retained<NSImage>>,
+    /// Remembered zoom/rotation/flip/pan per file for this session.
+    view_states: HashMap<PathBuf, SlideState>,
     /// Auto-advance seconds; None = off. `timer` is live only while
     /// advancing (paused = interval set, timer gone).
     interval: Option<f64>,
@@ -334,6 +336,7 @@ impl AppDelegate {
             overlay,
             playlist,
             cache: HashMap::new(),
+            view_states: HashMap::new(),
             interval: None,
             timer: None,
         });
@@ -464,6 +467,25 @@ impl AppDelegate {
         }
     }
 
+    /// The slide view changed zoom/rotation/flip/pan: remember it
+    /// for the current file and refresh the overlay.
+    pub fn slide_state_changed(&self) {
+        {
+            let mut show = self.ivars().show.borrow_mut();
+            if let Some(show) = show.as_mut() {
+                if let Some(current) = show.playlist.current().cloned() {
+                    let state = show.view.state();
+                    if state == SlideState::default() {
+                        show.view_states.remove(&current);
+                    } else {
+                        show.view_states.insert(current, state);
+                    }
+                }
+            }
+        }
+        self.update_overlay();
+    }
+
     pub fn toggle_overlay(&self) {
         let visible = !self.ivars().overlay_visible.get();
         self.ivars().overlay_visible.set(visible);
@@ -504,6 +526,16 @@ impl AppDelegate {
                     text.push_str("  [paused]");
                 }
             }
+            let state = show.view.state();
+            if state.rotation != 0 {
+                text.push_str(&format!("  [{}°]", state.rotation));
+            }
+            if state.flipped {
+                text.push_str("  [flipped]");
+            }
+            if let Some(zoom) = state.zoom {
+                text.push_str(&format!("  [{:.0}%]", zoom * 100.0));
+            }
             (show.overlay.clone(), text)
         };
         overlay.setStringValue(&NSString::from_str(&text));
@@ -531,6 +563,9 @@ impl AppDelegate {
             if let Some(current) = show.playlist.current() {
                 if let Some(image) = show.cache.get(current) {
                     show.view.show_image(image.clone());
+                    if let Some(state) = show.view_states.get(current) {
+                        show.view.apply_state(*state);
+                    }
                 }
             }
             for path in keep {
@@ -699,13 +734,25 @@ impl AppDelegate {
                 self.ivars().grid.get().unwrap().set_thumb(path, image);
             }
             Event::SlideReady { path, image } => {
-                let image = ns_image(&image);
-                let mut show = self.ivars().show.borrow_mut();
-                let Some(show) = show.as_mut() else { return };
-                let is_current = show.playlist.current() == Some(&path);
-                show.cache.insert(path, image.clone());
+                let is_current = {
+                    let image = ns_image(&image);
+                    let mut show = self.ivars().show.borrow_mut();
+                    let Some(show) = show.as_mut() else { return };
+                    let is_current = show.playlist.current() == Some(&path);
+                    let state = show.view_states.get(&path).copied();
+                    show.cache.insert(path, image.clone());
+                    if is_current {
+                        show.view.show_image(image);
+                        if let Some(state) = state {
+                            show.view.apply_state(state);
+                        }
+                    }
+                    is_current
+                };
                 if is_current {
-                    show.view.show_image(image);
+                    // Refresh rotation/flip/zoom flags for the slide
+                    // that just appeared.
+                    self.update_overlay();
                 }
             }
             Event::DecodeFailed { path } => {

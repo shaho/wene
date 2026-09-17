@@ -175,6 +175,37 @@ pub fn run_step(delegate: &AppDelegate) {
                 "watcher removed the deleted file",
             );
         }
+        14 => {
+            // Rotation + per-file state memory.
+            delegate.start_slideshow(0);
+        }
+        15 => {
+            if let Some(view) = delegate.e2e_slide_view() {
+                view.rotate(90);
+                check(state, view.state().rotation == 90, "rotate key turns 90");
+            }
+            delegate.step_slideshow(1);
+        }
+        16 => {
+            if let Some(view) = delegate.e2e_slide_view() {
+                check(
+                    state,
+                    view.state().rotation == 0,
+                    "next slide starts unrotated",
+                );
+            }
+            delegate.step_slideshow(-1);
+        }
+        17 => {
+            if let Some(view) = delegate.e2e_slide_view() {
+                check(
+                    state,
+                    view.state().rotation == 90,
+                    "rotation remembered per file",
+                );
+            }
+            delegate.end_slideshow();
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {

@@ -6,7 +6,8 @@ use std::cell::{Cell, OnceCell, RefCell};
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSEvent, NSImage, NSView, NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSEvent, NSGraphicsContext, NSImage, NSView, NSWindow,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::NSRect;
@@ -50,10 +51,23 @@ impl SlideshowWindow {
     }
 }
 
+/// Per-file view state, remembered for the session while a
+/// slideshow runs.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct SlideState {
+    /// None = fit to window (never scaling up past 100%).
+    pub zoom: Option<f64>,
+    /// Clockwise quarter turns: 0, 90, 180, 270.
+    pub rotation: i32,
+    pub flipped: bool,
+    pub offset: (f64, f64),
+}
+
 pub struct SlideViewIvars {
     image: RefCell<Option<Retained<NSImage>>>,
-    /// None = fit to window (never scaling up past 100%).
     zoom: Cell<Option<f64>>,
+    rotation: Cell<i32>,
+    flipped: Cell<bool>,
     offset: Cell<(f64, f64)>,
     pub delegate: OnceCell<Retained<AppDelegate>>,
 }
@@ -84,16 +98,34 @@ define_class!(
             let bounds = self.bounds();
             let scale = self.effective_scale(size, bounds.size);
             let (dx, dy) = self.ivars().offset.get();
+            let rotation = self.ivars().rotation.get();
+            let flipped = self.ivars().flipped.get();
             let w = size.width * scale;
             let h = size.height * scale;
-            let rect = CGRect::new(
-                CGPoint::new(
-                    bounds.origin.x + (bounds.size.width - w) / 2.0 + dx,
-                    bounds.origin.y + (bounds.size.height - h) / 2.0 + dy,
-                ),
-                CGSize::new(w, h),
-            );
+
+            // Transform around the view center: pan, rotate, flip,
+            // then draw the image centered on the origin.
+            let Some(ns_ctx) = NSGraphicsContext::currentContext() else { return };
+            let cg = ns_ctx.CGContext();
+            let cg = Some(cg.as_ref());
+            {
+                objc2_core_graphics::CGContext::save_g_state(cg);
+                objc2_core_graphics::CGContext::translate_ctm(
+                    cg,
+                    bounds.origin.x + bounds.size.width / 2.0 + dx,
+                    bounds.origin.y + bounds.size.height / 2.0 + dy,
+                );
+                objc2_core_graphics::CGContext::rotate_ctm(
+                    cg,
+                    -(rotation as f64).to_radians(),
+                );
+                if flipped {
+                    objc2_core_graphics::CGContext::scale_ctm(cg, -1.0, 1.0);
+                }
+            }
+            let rect = CGRect::new(CGPoint::new(-w / 2.0, -h / 2.0), CGSize::new(w, h));
             image.drawInRect(rect);
+            objc2_core_graphics::CGContext::restore_g_state(cg);
         }
 
         #[unsafe(method(mouseDragged:))]
@@ -102,7 +134,7 @@ define_class!(
             let (ex, ey) = (event.deltaX(), event.deltaY());
             // deltaY is flipped relative to the non-flipped view.
             self.ivars().offset.set((dx + ex, dy - ey));
-            self.setNeedsDisplay(true);
+            self.notify_state_change();
         }
 
         #[unsafe(method(keyDown:))]
@@ -130,6 +162,11 @@ define_class!(
             match chars.as_str() {
                 "q" => delegate.end_slideshow(),
                 " " => delegate.space_pressed(),
+                "j" => delegate.step_slideshow(-1), // vim-like previous
+                "l" => delegate.step_slideshow(1),  // vim-like next
+                "r" => self.rotate(90),
+                "R" => self.rotate(-90),
+                "f" => self.flip(),
                 "i" => delegate.toggle_overlay(),
                 "0" => delegate.set_auto_advance(None),
                 "!" => delegate.set_auto_advance(Some(0.5)),
@@ -140,7 +177,10 @@ define_class!(
                 "+" => self.zoom_step(1),
                 "-" => self.zoom_step(-1),
                 "=" => self.set_zoom(Some(1.0)),
-                "*" => self.set_zoom(None),
+                "*" => {
+                    self.apply_state(SlideState::default());
+                    self.notify_state_change();
+                }
                 _ => {
                     let _: () = unsafe { msg_send![super(self), keyDown: event] };
                 }
@@ -154,6 +194,8 @@ impl SlideView {
         let this = Self::alloc(mtm).set_ivars(SlideViewIvars {
             image: RefCell::new(None),
             zoom: Cell::new(None),
+            rotation: Cell::new(0),
+            flipped: Cell::new(false),
             offset: Cell::new((0.0, 0.0)),
             delegate: OnceCell::new(),
         });
@@ -161,12 +203,51 @@ impl SlideView {
     }
 
     fn effective_scale(&self, image: CGSize, bounds: CGSize) -> f64 {
+        // A quarter-turned image fits by its swapped dimensions.
+        let (iw, ih) = if self.ivars().rotation.get() % 180 == 90 {
+            (image.height, image.width)
+        } else {
+            (image.width, image.height)
+        };
         match self.ivars().zoom.get() {
             Some(zoom) => zoom,
-            None => (bounds.width / image.width)
-                .min(bounds.height / image.height)
-                .min(1.0),
+            None => (bounds.width / iw).min(bounds.height / ih).min(1.0),
         }
+    }
+
+    pub fn rotate(&self, delta_degrees: i32) {
+        let next = (self.ivars().rotation.get() + delta_degrees).rem_euclid(360);
+        self.ivars().rotation.set(next);
+        self.notify_state_change();
+    }
+
+    pub fn flip(&self) {
+        self.ivars().flipped.set(!self.ivars().flipped.get());
+        self.notify_state_change();
+    }
+
+    fn notify_state_change(&self) {
+        self.setNeedsDisplay(true);
+        if let Some(delegate) = self.ivars().delegate.get() {
+            delegate.slide_state_changed();
+        }
+    }
+
+    pub fn state(&self) -> SlideState {
+        SlideState {
+            zoom: self.ivars().zoom.get(),
+            rotation: self.ivars().rotation.get(),
+            flipped: self.ivars().flipped.get(),
+            offset: self.ivars().offset.get(),
+        }
+    }
+
+    pub fn apply_state(&self, state: SlideState) {
+        self.ivars().zoom.set(state.zoom);
+        self.ivars().rotation.set(state.rotation);
+        self.ivars().flipped.set(state.flipped);
+        self.ivars().offset.set(state.offset);
+        self.setNeedsDisplay(true);
     }
 
     fn set_zoom(&self, zoom: Option<f64>) {
@@ -174,7 +255,7 @@ impl SlideView {
         if zoom.is_none() {
             self.ivars().offset.set((0.0, 0.0));
         }
-        self.setNeedsDisplay(true);
+        self.notify_state_change();
     }
 
     fn zoom_step(&self, direction: i32) {
@@ -196,19 +277,17 @@ impl SlideView {
                 .unwrap_or(*ZOOM_LADDER.first().unwrap())
         };
         self.ivars().zoom.set(Some(next));
-        self.setNeedsDisplay(true);
+        self.notify_state_change();
     }
 
     pub fn has_image(&self) -> bool {
         self.ivars().image.borrow().is_some()
     }
 
-    /// New slide: reset zoom and pan (per-file zoom memory is a
-    /// next-map feature).
+    /// New slide: reset to defaults. The delegate re-applies any
+    /// remembered per-file state afterwards.
     pub fn show_image(&self, image: Retained<NSImage>) {
         *self.ivars().image.borrow_mut() = Some(image);
-        self.ivars().zoom.set(None);
-        self.ivars().offset.set((0.0, 0.0));
-        self.setNeedsDisplay(true);
+        self.apply_state(SlideState::default());
     }
 }
