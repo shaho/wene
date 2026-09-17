@@ -17,14 +17,51 @@ pub trait ImageDecoder: Send + Sync + 'static {
 }
 
 pub enum Event<I> {
-    /// Files inserted into the sorted list. Each entry is the index
-    /// the file was inserted at (indices are valid when applied in
-    /// order) plus its path.
-    FilesInserted(Vec<(usize, PathBuf)>),
+    /// Files inserted into the sorted-by-name list. Each entry is the
+    /// index the file was inserted at (indices are valid when applied
+    /// in order) plus its info.
+    FilesInserted(Vec<(usize, FileInfo)>),
     ScanDone { total: usize },
     ThumbReady { path: PathBuf, image: I },
     SlideReady { path: PathBuf, image: I },
     DecodeFailed { path: PathBuf },
+}
+
+/// A found image with the metadata the sort orders need, captured
+/// during the scan so re-sorting later does no disk I/O.
+#[derive(Clone, Debug)]
+pub struct FileInfo {
+    pub path: PathBuf,
+    pub modified: std::time::SystemTime,
+    pub size: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortOrder {
+    Name,
+    Modified,
+    Size,
+    Path,
+}
+
+/// Compare two files under an order. Ties always fall back to the
+/// natural name order so every order is stable and total.
+pub fn file_info_cmp(
+    a: &FileInfo,
+    b: &FileInfo,
+    order: SortOrder,
+    descending: bool,
+) -> std::cmp::Ordering {
+    let primary = match order {
+        SortOrder::Name => file_cmp(&a.path, &b.path),
+        SortOrder::Modified => a.modified.cmp(&b.modified),
+        SortOrder::Size => a.size.cmp(&b.size),
+        SortOrder::Path => {
+            natural_lexical_cmp(&a.path.to_string_lossy(), &b.path.to_string_lossy())
+        }
+    };
+    let primary = if descending { primary.reverse() } else { primary };
+    primary.then_with(|| file_cmp(&a.path, &b.path))
 }
 
 const IMAGE_EXTENSIONS: &[&str] = &[
@@ -121,8 +158,8 @@ impl<I: Send + 'static> Engine<I> {
         let events_tx = self.events_tx.clone();
         let wakeup = Arc::clone(&self.wakeup);
         thread::spawn(move || {
-            let mut sorted: Vec<PathBuf> = Vec::new();
-            let mut pending: Vec<PathBuf> = Vec::new();
+            let mut sorted: Vec<FileInfo> = Vec::new();
+            let mut pending: Vec<FileInfo> = Vec::new();
             let mut stack = vec![root];
             while let Some(dir) = stack.pop() {
                 let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -141,7 +178,15 @@ impl<I: Send + 'static> Engine<I> {
                     if path.is_dir() {
                         stack.push(path);
                     } else if is_image(&path) {
-                        pending.push(path);
+                        let meta = entry.metadata().ok();
+                        pending.push(FileInfo {
+                            modified: meta
+                                .as_ref()
+                                .and_then(|m| m.modified().ok())
+                                .unwrap_or(std::time::UNIX_EPOCH),
+                            size: meta.map(|m| m.len()).unwrap_or(0),
+                            path,
+                        });
                         if pending.len() >= SCAN_BATCH {
                             flush(&mut sorted, &mut pending, &events_tx, &wakeup);
                         }
@@ -170,8 +215,8 @@ impl<I: Send + 'static> Engine<I> {
 }
 
 fn flush<I>(
-    sorted: &mut Vec<PathBuf>,
-    pending: &mut Vec<PathBuf>,
+    sorted: &mut Vec<FileInfo>,
+    pending: &mut Vec<FileInfo>,
     events_tx: &Sender<Event<I>>,
     wakeup: &Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -179,12 +224,12 @@ fn flush<I>(
         return;
     }
     let mut inserts = Vec::with_capacity(pending.len());
-    for path in pending.drain(..) {
-        let index = match sorted.binary_search_by(|p| file_cmp(p, &path)) {
+    for info in pending.drain(..) {
+        let index = match sorted.binary_search_by(|p| file_cmp(&p.path, &info.path)) {
             Ok(i) | Err(i) => i,
         };
-        sorted.insert(index, path.clone());
-        inserts.push((index, path));
+        sorted.insert(index, info.clone());
+        inserts.push((index, info));
     }
     if events_tx.send(Event::FilesInserted(inserts)).is_ok() {
         wakeup();
@@ -243,6 +288,46 @@ mod tests {
         assert_eq!(got, ["b.png", "img1.jpg", "img2.jpg", "img10.jpg"]);
         assert!(is_image(Path::new("/a/x.HEIC")));
         assert!(!is_image(Path::new("/a/x.txt")));
+    }
+
+    fn info(name: &str, secs: u64, size: u64) -> FileInfo {
+        FileInfo {
+            path: PathBuf::from(format!("/x/{name}")),
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            size,
+        }
+    }
+
+    #[test]
+    fn sort_orders() {
+        let mut files = vec![
+            info("img10.jpg", 30, 5),
+            info("img2.jpg", 10, 50),
+            info("a.png", 20, 20),
+        ];
+        let names = |files: &Vec<FileInfo>| -> Vec<String> {
+            files
+                .iter()
+                .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        files.sort_by(|a, b| file_info_cmp(a, b, SortOrder::Name, false));
+        assert_eq!(names(&files), ["a.png", "img2.jpg", "img10.jpg"]);
+
+        files.sort_by(|a, b| file_info_cmp(a, b, SortOrder::Name, true));
+        assert_eq!(names(&files), ["img10.jpg", "img2.jpg", "a.png"]);
+
+        files.sort_by(|a, b| file_info_cmp(a, b, SortOrder::Modified, false));
+        assert_eq!(names(&files), ["img2.jpg", "a.png", "img10.jpg"]);
+
+        files.sort_by(|a, b| file_info_cmp(a, b, SortOrder::Size, true));
+        assert_eq!(names(&files), ["img2.jpg", "a.png", "img10.jpg"]);
+
+        // Equal keys fall back to name order: stable and total.
+        let mut same = vec![info("b.jpg", 5, 9), info("a.jpg", 5, 9)];
+        same.sort_by(|a, b| file_info_cmp(a, b, SortOrder::Size, false));
+        assert_eq!(names(&same), ["a.jpg", "b.jpg"]);
     }
 }
 

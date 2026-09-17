@@ -27,7 +27,7 @@ use objc2_core_graphics::CGImage;
 use objc2_foundation::{
     ns_string, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString, NSTimer,
 };
-use wene_core::{Engine, Event, Playlist};
+use wene_core::{Engine, Event, Playlist, SortOrder};
 
 use decoder::ImageIoDecoder;
 use grid::GridView;
@@ -61,6 +61,9 @@ pub struct DelegateIvars {
     loop_item: OnceCell<Retained<NSMenuItem>>,
     shuffle_item: OnceCell<Retained<NSMenuItem>>,
     auto_menu: OnceCell<Retained<NSMenu>>,
+    sort_menu: OnceCell<Retained<NSMenu>>,
+    sort_order: Cell<SortOrder>,
+    sort_desc: Cell<bool>,
     /// Pace applied to new slideshows; menu picks update it.
     default_interval: Cell<Option<f64>>,
     e2e: RefCell<e2e::E2eState>,
@@ -136,6 +139,44 @@ define_class!(
             self.set_auto_advance(seconds);
         }
 
+        #[unsafe(method(setSortMenu:))]
+        fn set_sort_menu(&self, sender: Option<&objc2::runtime::AnyObject>) {
+            let tag = sender
+                .and_then(|s| s.downcast_ref::<NSMenuItem>())
+                .map(|item| item.tag())
+                .unwrap_or(1);
+            let order = match tag {
+                2 => SortOrder::Modified,
+                3 => SortOrder::Size,
+                4 => SortOrder::Path,
+                _ => SortOrder::Name,
+            };
+            // Re-picking the current order reverses it, like the
+            // original app. A new order starts ascending, except
+            // dates, which start newest first.
+            if self.ivars().sort_order.get() == order {
+                self.ivars().sort_desc.set(!self.ivars().sort_desc.get());
+            } else {
+                self.ivars().sort_order.set(order);
+                self.ivars().sort_desc.set(order == SortOrder::Modified);
+            }
+            self.apply_sort();
+        }
+
+        #[unsafe(method(biggerThumbs:))]
+        fn bigger_thumbs(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if let Some(grid) = self.ivars().grid.get() {
+                grid.scale_cells(1.25);
+            }
+        }
+
+        #[unsafe(method(smallerThumbs:))]
+        fn smaller_thumbs(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if let Some(grid) = self.ivars().grid.get() {
+                grid.scale_cells(0.8);
+            }
+        }
+
         #[unsafe(method(e2eStep:))]
         fn e2e_step(&self, _timer: Option<&objc2::runtime::AnyObject>) {
             e2e::run_step(self);
@@ -170,6 +211,9 @@ impl AppDelegate {
             loop_item: OnceCell::new(),
             shuffle_item: OnceCell::new(),
             auto_menu: OnceCell::new(),
+            sort_menu: OnceCell::new(),
+            sort_order: Cell::new(SortOrder::Name),
+            sort_desc: Cell::new(false),
             default_interval: Cell::new(None),
             e2e: RefCell::new(e2e::E2eState::default()),
         });
@@ -215,11 +259,36 @@ impl AppDelegate {
         self.ivars().engine.get().unwrap().request_thumb(path);
     }
 
+    /// Sort the grid by the current order and sync the menu marks
+    /// (`✓` on the order; dash-like off state elsewhere).
+    fn apply_sort(&self) {
+        let order = self.ivars().sort_order.get();
+        let descending = self.ivars().sort_desc.get();
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.resort(order, descending);
+        }
+        if let Some(menu) = self.ivars().sort_menu.get() {
+            let selected_tag = match order {
+                SortOrder::Name => 1,
+                SortOrder::Modified => 2,
+                SortOrder::Size => 3,
+                SortOrder::Path => 4,
+            };
+            for item in menu.itemArray() {
+                item.setState(if item.tag() == selected_tag { 1 } else { 0 });
+            }
+        }
+    }
+
+    fn sort_is_default(&self) -> bool {
+        self.ivars().sort_order.get() == SortOrder::Name && !self.ivars().sort_desc.get()
+    }
+
     // ---- slideshow ----
 
     pub fn start_slideshow(&self, index: usize) {
         let mtm = self.mtm();
-        let files = self.ivars().grid.get().unwrap().ivars().files.borrow().clone();
+        let files = self.ivars().grid.get().unwrap().paths();
         if files.is_empty() {
             return;
         }
@@ -512,12 +581,46 @@ impl AppDelegate {
             .map(|s| s.overlay.stringValue().to_string())
     }
 
+    pub fn e2e_sort(&self, order: SortOrder, descending: bool) {
+        self.ivars().sort_order.set(order);
+        self.ivars().sort_desc.set(descending);
+        self.apply_sort();
+    }
+
+    pub fn e2e_first_file(&self) -> Option<String> {
+        self.ivars().grid.get().and_then(|g| {
+            g.paths()
+                .first()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+    }
+
+    pub fn e2e_grid_height(&self) -> f64 {
+        self.ivars()
+            .grid
+            .get()
+            .map(|g| g.frame().size.height)
+            .unwrap_or(0.0)
+    }
+
+    pub fn e2e_scale_cells(&self, factor: f64) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.scale_cells(factor);
+        }
+    }
+
     // ---- core events ----
 
     fn handle_event(&self, event: Event<Img>) {
         match event {
             Event::FilesInserted(inserts) => {
                 self.ivars().grid.get().unwrap().insert_files(inserts);
+                // Core streams in name order; re-sort the batch into
+                // the active order.
+                if !self.sort_is_default() {
+                    self.apply_sort();
+                }
             }
             Event::ScanDone { total } => {
                 println!("scan done: {total} images");
@@ -653,6 +756,57 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
 
     show_item.setSubmenu(Some(&show_menu));
     menubar.addItem(&show_item);
+
+    let view_item = NSMenuItem::new(mtm);
+    let view_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("View"));
+    // Sort orders: tag matches apply_sort's mapping. Re-picking the
+    // checked one reverses the direction.
+    for (title, tag, key) in [
+        ("Sort by name", 1isize, "1"),
+        ("Sort by date modified", 2, "2"),
+        ("Sort by size", 3, "3"),
+        ("Sort by file path", 4, "4"),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(sel!(setSortMenu:)),
+                &NSString::from_str(key),
+            )
+        };
+        item.setKeyEquivalentModifierMask(
+            objc2_app_kit::NSEventModifierFlags::Command
+                | objc2_app_kit::NSEventModifierFlags::Control,
+        );
+        item.setTag(tag);
+        if tag == 1 {
+            item.setState(1);
+        }
+        view_menu.addItem(&item);
+    }
+    view_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let bigger = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Bigger thumbnails"),
+            Some(sel!(biggerThumbs:)),
+            ns_string!("+"),
+        )
+    };
+    let smaller = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Smaller thumbnails"),
+            Some(sel!(smallerThumbs:)),
+            ns_string!("-"),
+        )
+    };
+    view_menu.addItem(&bigger);
+    view_menu.addItem(&smaller);
+    view_item.setSubmenu(Some(&view_menu));
+    menubar.addItem(&view_item);
+    let _ = delegate.ivars().sort_menu.set(view_menu);
 
     let _ = delegate.ivars().loop_item.set(loop_item);
     let _ = delegate.ivars().shuffle_item.set(shuffle_item);

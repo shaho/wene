@@ -114,8 +114,33 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             delegate.end_slideshow();
         }
-        _ => {
+        8 => {
             check(state, !delegate.e2e_show_active(), "slideshow closed");
+            // Sort round-trip: size-descending puts the biggest file
+            // first, then back to name order.
+            delegate.e2e_sort(wene_core::SortOrder::Size, true);
+            let first = delegate.e2e_first_file();
+            check(
+                state,
+                first.as_deref() == Some("img10.heic"),
+                "size-descending puts biggest first",
+            );
+            delegate.e2e_sort(wene_core::SortOrder::Name, false);
+            let first = delegate.e2e_first_file();
+            check(
+                state,
+                first.as_deref() == Some("apple.heic"),
+                "name order restored",
+            );
+        }
+        9 => {
+            let before = delegate.e2e_grid_height();
+            delegate.e2e_scale_cells(1.5);
+            let after = delegate.e2e_grid_height();
+            check(state, after > before, "bigger cells grow the grid");
+            delegate.e2e_scale_cells(1.0 / 1.5);
+        }
+        _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {
                 println!("e2e: PASS ({} steps)", step + 1);

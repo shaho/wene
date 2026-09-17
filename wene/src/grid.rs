@@ -7,6 +7,8 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use wene_core::{file_info_cmp, FileInfo, SortOrder};
+
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{NSColor, NSEvent, NSImage, NSView};
@@ -17,10 +19,12 @@ use crate::AppDelegate;
 
 pub const CELL: f64 = 160.0;
 pub const PAD: f64 = 8.0;
-const PITCH: f64 = CELL + PAD;
+const MIN_CELL: f64 = 60.0;
+const MAX_CELL: f64 = 400.0;
 
 pub struct GridIvars {
-    pub files: RefCell<Vec<PathBuf>>,
+    pub files: RefCell<Vec<FileInfo>>,
+    cell: Cell<f64>,
     thumbs: RefCell<HashMap<PathBuf, Retained<NSImage>>>,
     requested: RefCell<HashSet<PathBuf>>,
     selection: Cell<Option<usize>>,
@@ -64,9 +68,9 @@ define_class!(
                 return;
             }
             let cols = self.columns(self.bounds().size.width);
-            let first_row = ((dirty.origin.y - PAD) / PITCH).floor().max(0.0) as usize;
+            let first_row = ((dirty.origin.y - PAD) / self.pitch()).floor().max(0.0) as usize;
             let last_row =
-                ((dirty.origin.y + dirty.size.height) / PITCH).ceil() as usize;
+                ((dirty.origin.y + dirty.size.height) / self.pitch()).ceil() as usize;
             let selection = self.ivars().selection.get();
 
             for row in first_row..=last_row {
@@ -84,7 +88,7 @@ define_class!(
                         );
                         objc2_app_kit::NSRectFill(highlight);
                     }
-                    let path = &files[index];
+                    let path = &files[index].path;
                     let thumb = self.ivars().thumbs.borrow().get(path).cloned();
                     match thumb {
                         Some(image) => {
@@ -120,12 +124,17 @@ define_class!(
             }
         }
 
+        #[unsafe(method(magnifyWithEvent:))]
+        fn magnify_with_event(&self, event: &NSEvent) {
+            self.scale_cells(1.0 + event.magnification());
+        }
+
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             let cols = self.columns(self.bounds().size.width);
-            let col = ((point.x - PAD) / PITCH).floor();
-            let row = ((point.y - PAD) / PITCH).floor();
+            let col = ((point.x - PAD) / self.pitch()).floor();
+            let row = ((point.y - PAD) / self.pitch()).floor();
             if col < 0.0 || row < 0.0 || col >= cols as f64 {
                 return;
             }
@@ -177,6 +186,7 @@ impl GridView {
     pub fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(GridIvars {
             files: RefCell::new(Vec::new()),
+            cell: Cell::new(CELL),
             thumbs: RefCell::new(HashMap::new()),
             requested: RefCell::new(HashSet::new()),
             selection: Cell::new(None),
@@ -185,23 +195,61 @@ impl GridView {
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
+    fn pitch(&self) -> f64 {
+        self.ivars().cell.get() + PAD
+    }
+
+    /// Grow or shrink cells by a factor, clamped, relayout.
+    pub fn scale_cells(&self, factor: f64) {
+        let next = (self.ivars().cell.get() * factor).clamp(MIN_CELL, MAX_CELL);
+        self.ivars().cell.set(next);
+        let width = self.frame().size.width;
+        self.setFrameSize(CGSize::new(width, 0.0));
+        self.setNeedsDisplay(true);
+    }
+
+    /// Current sorted paths, for building a slideshow playlist.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.ivars()
+            .files
+            .borrow()
+            .iter()
+            .map(|f| f.path.clone())
+            .collect()
+    }
+
+    /// Re-sort the whole grid, keeping the selection on the same
+    /// file.
+    pub fn resort(&self, order: SortOrder, descending: bool) {
+        {
+            let mut files = self.ivars().files.borrow_mut();
+            let selected = self.ivars().selection.get().map(|i| files[i].path.clone());
+            files.sort_by(|a, b| file_info_cmp(a, b, order, descending));
+            if let Some(path) = selected {
+                let index = files.iter().position(|f| f.path == path);
+                self.ivars().selection.set(index);
+            }
+        }
+        self.setNeedsDisplay(true);
+    }
+
     fn columns(&self, width: f64) -> usize {
-        (((width - PAD) / PITCH).floor() as usize).max(1)
+        (((width - PAD) / self.pitch()).floor() as usize).max(1)
     }
 
     fn content_height(&self, width: f64) -> f64 {
         let count = self.ivars().files.borrow().len();
         let cols = self.columns(width);
         let rows = count.div_ceil(cols).max(1);
-        rows as f64 * PITCH + PAD
+        rows as f64 * self.pitch() + PAD
     }
 
     fn cell_rect(&self, index: usize, cols: usize) -> CGRect {
         let row = index / cols;
         let col = index % cols;
         CGRect::new(
-            CGPoint::new(PAD + col as f64 * PITCH, PAD + row as f64 * PITCH),
-            CGSize::new(CELL, CELL),
+            CGPoint::new(PAD + col as f64 * self.pitch(), PAD + row as f64 * self.pitch()),
+            CGSize::new(self.ivars().cell.get(), self.ivars().cell.get()),
         )
     }
 
@@ -218,14 +266,16 @@ impl GridView {
         }
     }
 
-    /// Mirror the core's sorted inserts. Indices are valid when
-    /// applied in order (same rule as the core's event contract).
-    pub fn insert_files(&self, inserts: Vec<(usize, PathBuf)>) {
+    /// Mirror the core's sorted-by-name inserts. Indices are valid
+    /// when applied in order (same rule as the core's event
+    /// contract). The caller re-sorts afterwards when a different
+    /// sort order is active.
+    pub fn insert_files(&self, inserts: Vec<(usize, FileInfo)>) {
         {
             let mut files = self.ivars().files.borrow_mut();
             let mut selection = self.ivars().selection.get();
-            for (index, path) in inserts {
-                files.insert(index, path);
+            for (index, info) in inserts {
+                files.insert(index, info);
                 if let Some(sel) = selection {
                     if index <= sel {
                         selection = Some(sel + 1);
