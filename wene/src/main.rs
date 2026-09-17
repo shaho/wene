@@ -19,8 +19,9 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSColor, NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView, NSTextField,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSBrowser, NSBrowserCell, NSBrowserDelegate, NSColor, NSImage, NSMenu, NSMenuItem,
+    NSOpenPanel, NSScreen, NSScrollView, NSTextField, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
 use objc2_core_graphics::CGImage;
@@ -38,6 +39,10 @@ type Img = CFRetained<CGImage>;
 /// Slide memory budget: roughly 15 retina-screen slides, so stepping
 /// back through recent history never re-decodes.
 const SLIDE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Height of the folder browser pane at the top of the browse window.
+const BROWSER_H: f64 = 150.0;
+const STATUS_H: f64 = 24.0;
 
 static EVENTS: OnceLock<Mutex<Receiver<Event<Img>>>> = OnceLock::new();
 static DELEGATE: OnceLock<MainThreadBound<Retained<AppDelegate>>> = OnceLock::new();
@@ -60,6 +65,14 @@ pub struct DelegateIvars {
     engine: OnceCell<Engine<Img>>,
     window: OnceCell<Retained<NSWindow>>,
     grid: OnceCell<Retained<GridView>>,
+    browser: OnceCell<Retained<NSBrowser>>,
+    scroll: OnceCell<Retained<NSScrollView>>,
+    /// Folder names per browser column, filled by the delegate
+    /// callbacks (numberOfRows fills, willDisplayCell reads).
+    browser_cols: RefCell<Vec<Vec<String>>>,
+    /// The folder the grid currently shows, to skip no-op rescans.
+    current_root: RefCell<Option<PathBuf>>,
+    browser_item: OnceCell<Retained<NSMenuItem>>,
     show: RefCell<Option<Show>>,
     loop_enabled: Cell<bool>,
     shuffle_enabled: Cell<bool>,
@@ -85,6 +98,54 @@ define_class!(
     pub struct AppDelegate;
 
     unsafe impl NSObjectProtocol for AppDelegate {}
+
+    unsafe impl NSBrowserDelegate for AppDelegate {
+        // Matrix-style (passive) delegate: two callbacks, folders
+        // only. Column N lists the children of the path selected
+        // through columns 0..N.
+        #[unsafe(method(browser:numberOfRowsInColumn:))]
+        fn browser_number_of_rows_in_column(
+            &self,
+            sender: &NSBrowser,
+            column: isize,
+        ) -> isize {
+            let parent = {
+                let s = sender.pathToColumn(column).to_string();
+                if s.is_empty() {
+                    "/".to_string()
+                } else {
+                    s
+                }
+            };
+            let children = dir_children(std::path::Path::new(&parent));
+            let count = children.len();
+            let mut cols = self.ivars().browser_cols.borrow_mut();
+            cols.truncate(column as usize);
+            cols.push(children);
+            count as isize
+        }
+
+        #[unsafe(method(browser:willDisplayCell:atRow:column:))]
+        fn browser_will_display_cell(
+            &self,
+            _sender: &NSBrowser,
+            cell: &objc2::runtime::AnyObject,
+            row: isize,
+            column: isize,
+        ) {
+            let cols = self.ivars().browser_cols.borrow();
+            let name = cols
+                .get(column as usize)
+                .and_then(|c| c.get(row as usize))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(cell) = cell.downcast_ref::<NSBrowserCell>() {
+                cell.setStringValue(&NSString::from_str(&name));
+                // Every entry is a folder: keep the drill-in arrow.
+                cell.setLeaf(false);
+            }
+        }
+    }
 
     unsafe impl NSWindowDelegate for AppDelegate {
         // Only slideshow windows set us as their delegate. Covers the
@@ -113,7 +174,7 @@ define_class!(
             // scripted runs); otherwise ask.
             let arg = std::env::args().nth(1).map(PathBuf::from);
             match arg.filter(|p| p.is_dir()) {
-                Some(root) => self.scan_root(root),
+                Some(root) => self.scan_root(root, true),
                 None => self.open_folder(),
             }
         }
@@ -206,6 +267,37 @@ define_class!(
             self.apply_sort();
         }
 
+        #[unsafe(method(browserClicked:))]
+        fn browser_clicked(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let Some(browser) = self.ivars().browser.get() else { return };
+            let path = browser.path().to_string();
+            if path.is_empty() {
+                return;
+            }
+            let root = PathBuf::from(path);
+            if !root.is_dir() {
+                return;
+            }
+            if self.ivars().current_root.borrow().as_ref() == Some(&root) {
+                return;
+            }
+            // Browser navigation lists just that folder (the
+            // original's subfolders-off default); cmd-O stays
+            // recursive.
+            self.scan_root(root, false);
+        }
+
+        #[unsafe(method(toggleBrowser:))]
+        fn toggle_browser(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let Some(browser) = self.ivars().browser.get() else { return };
+            let visible = browser.isHidden();
+            browser.setHidden(!visible);
+            if let Some(item) = self.ivars().browser_item.get() {
+                item.setState(if visible { 1 } else { 0 });
+            }
+            self.layout_content();
+        }
+
         #[unsafe(method(toggleLabels:))]
         fn toggle_labels(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             let Some(grid) = self.ivars().grid.get() else { return };
@@ -257,6 +349,11 @@ impl AppDelegate {
             engine: OnceCell::new(),
             window: OnceCell::new(),
             grid: OnceCell::new(),
+            browser: OnceCell::new(),
+            scroll: OnceCell::new(),
+            browser_cols: RefCell::new(Vec::new()),
+            current_root: RefCell::new(None),
+            browser_item: OnceCell::new(),
             show: RefCell::new(None),
             loop_enabled: Cell::new(false),
             shuffle_enabled: Cell::new(false),
@@ -294,10 +391,10 @@ impl AppDelegate {
         }
         let Some(url) = panel.URL() else { return };
         let Some(path) = url.path() else { return };
-        self.scan_root(PathBuf::from(path.to_string()));
+        self.scan_root(PathBuf::from(path.to_string()), true);
     }
 
-    fn scan_root(&self, root: PathBuf) {
+    fn scan_root(&self, root: PathBuf, recursive: bool) {
         if let Some(grid) = self.ivars().grid.get() {
             grid.reset();
         }
@@ -307,7 +404,41 @@ impl AppDelegate {
                 root.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
             )));
         }
-        self.ivars().engine.get().unwrap().scan(root);
+        // Keep the folder browser pointed at the same place.
+        if let Some(browser) = self.ivars().browser.get() {
+            let target = root.to_string_lossy().into_owned();
+            if browser.path().to_string() != target {
+                let _ = browser.setPath(&NSString::from_str(&target));
+            }
+        }
+        *self.ivars().current_root.borrow_mut() = Some(root.clone());
+        self.ivars().engine.get().unwrap().scan(root, recursive);
+    }
+
+    /// Re-fit the browser pane, grid scroll view, and status bar to
+    /// the window (used by the browser show/hide toggle).
+    fn layout_content(&self) {
+        let (Some(window), Some(scroll), Some(browser)) = (
+            self.ivars().window.get(),
+            self.ivars().scroll.get(),
+            self.ivars().browser.get(),
+        ) else {
+            return;
+        };
+        let Some(content) = window.contentView() else { return };
+        let bounds = content.bounds();
+        let browser_h = if browser.isHidden() { 0.0 } else { BROWSER_H };
+        browser.setFrame(NSRect::new(
+            CGPoint::new(0.0, bounds.size.height - BROWSER_H),
+            CGSize::new(bounds.size.width, BROWSER_H),
+        ));
+        scroll.setFrame(NSRect::new(
+            CGPoint::new(0.0, STATUS_H),
+            CGSize::new(
+                bounds.size.width,
+                bounds.size.height - STATUS_H - browser_h,
+            ),
+        ));
     }
 
     pub fn request_thumb(&self, path: PathBuf) {
@@ -795,6 +926,34 @@ impl AppDelegate {
             .unwrap_or_default()
     }
 
+    /// Mirror a browser click on `path` (setPath does not fire the
+    /// widget's action, so e2e drives the handler directly).
+    pub fn e2e_browser_navigate(&self, path: &str) {
+        if let Some(browser) = self.ivars().browser.get() {
+            let _ = browser.setPath(&NSString::from_str(path));
+        }
+        self.scan_root(PathBuf::from(path), false);
+    }
+
+    pub fn e2e_browser_path(&self) -> String {
+        self.ivars()
+            .browser
+            .get()
+            .map(|b| b.path().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_browser_hidden(&self) -> bool {
+        self.ivars().browser.get().is_some_and(|b| b.isHidden())
+    }
+
+    pub fn e2e_toggle_browser(&self) {
+        if let Some(browser) = self.ivars().browser.get() {
+            browser.setHidden(!browser.isHidden());
+            self.layout_content();
+        }
+    }
+
     pub fn e2e_slide_animating(&self) -> bool {
         self.ivars()
             .show
@@ -934,6 +1093,22 @@ fn ns_image(image: &Img) -> Retained<NSImage> {
 /// Estimated decoded footprint for the LRU budgets: pixels × 4 bytes.
 fn image_cost(image: &Img) -> usize {
     CGImage::width(Some(image)) * CGImage::height(Some(image)) * 4
+}
+
+/// Direct subfolders of `path` for one browser column: visible
+/// directories, natural name order.
+fn dir_children(path: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    names.sort_by(|a, b| wene_core::natural_str_cmp(a, b));
+    names
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1118,6 +1293,17 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
     view_menu.addItem(&bigger);
     view_menu.addItem(&smaller);
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let browser_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Show browser"),
+            Some(sel!(toggleBrowser:)),
+            ns_string!(""),
+        )
+    };
+    browser_item.setState(1);
+    view_menu.addItem(&browser_item);
+    let _ = delegate.ivars().browser_item.set(browser_item);
     let labels_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -1164,15 +1350,35 @@ fn main() {
     };
     window.setTitle(ns_string!("wene"));
 
-    // Content: grid scroll view on top, status bar strip below.
-    const STATUS_H: f64 = 24.0;
+    // Content, top to bottom: folder browser, grid scroll view,
+    // status bar strip.
     let content =
         objc2_app_kit::NSView::initWithFrame(objc2_app_kit::NSView::alloc(mtm), frame);
+
+    let browser = NSBrowser::new(mtm);
+    browser.setFrame(NSRect::new(
+        CGPoint::new(0.0, frame.size.height - BROWSER_H),
+        CGSize::new(frame.size.width, BROWSER_H),
+    ));
+    browser.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
+    browser.setTitled(false);
+    browser.setHasHorizontalScroller(true);
+    browser.setTakesTitleFromPreviousColumn(false);
+    browser.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    unsafe {
+        browser.setTarget(Some(&delegate));
+        browser.setAction(Some(sel!(browserClicked:)));
+    }
+    browser.loadColumnZero();
+
     let scroll = NSScrollView::new(mtm);
     scroll.setHasVerticalScroller(true);
     scroll.setFrame(NSRect::new(
         CGPoint::new(0.0, STATUS_H),
-        CGSize::new(frame.size.width, frame.size.height - STATUS_H),
+        CGSize::new(frame.size.width, frame.size.height - STATUS_H - BROWSER_H),
     ));
     scroll.setAutoresizingMask(
         objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
@@ -1194,11 +1400,14 @@ fn main() {
             | objc2_app_kit::NSAutoresizingMaskOptions::ViewMaxYMargin,
     );
 
+    content.addSubview(&browser);
     content.addSubview(&scroll);
     content.addSubview(&status);
     window.setContentView(Some(&content));
     window.makeFirstResponder(Some(&grid));
     let _ = delegate.ivars().status.set(status);
+    let _ = delegate.ivars().browser.set(browser);
+    let _ = delegate.ivars().scroll.set(scroll.clone());
 
     let _ = delegate.ivars().window.set(window.clone());
     let _ = delegate.ivars().grid.set(grid);

@@ -122,6 +122,11 @@ fn is_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Natural string order for folder names in the shell's browser.
+pub fn natural_str_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    natural_lexical_cmp(a, b)
+}
+
 /// Finder-like order: natural comparison of the filename, full path
 /// as the tie break.
 fn file_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
@@ -210,15 +215,16 @@ impl<I: Send + 'static> Engine<I> {
         )
     }
 
-    /// Walk `root` recursively on a fresh thread. Batches of found
-    /// files stream out as FilesInserted events with sorted-insert
-    /// indices; the shell mirrors the inserts to keep the same order.
-    /// The folder is then watched: adds, removals, and edits under it
-    /// keep flowing as events until the next scan.
-    pub fn scan(&self, root: PathBuf) {
+    /// Walk `root` on a fresh thread, recursively or one level deep.
+    /// Batches of found files stream out as FilesInserted events with
+    /// sorted-insert indices; the shell mirrors the inserts to keep
+    /// the same order. The folder is then watched (matching depth):
+    /// adds, removals, and edits keep flowing as events until the
+    /// next scan.
+    pub fn scan(&self, root: PathBuf, recursive: bool) {
         self.files.lock().unwrap().clear();
         *self.watcher.lock().unwrap() = None;
-        self.start_watcher(&root);
+        self.start_watcher(&root, recursive);
 
         let events_tx = self.events_tx.clone();
         let wakeup = Arc::clone(&self.wakeup);
@@ -242,7 +248,9 @@ impl<I: Send + 'static> Engine<I> {
                         continue;
                     }
                     if path.is_dir() {
-                        stack.push(path);
+                        if recursive {
+                            stack.push(path);
+                        }
                     } else if is_image(&path) {
                         let meta = entry.metadata().ok();
                         // ponytail: dates read eagerly per file (one
@@ -272,7 +280,7 @@ impl<I: Send + 'static> Engine<I> {
         });
     }
 
-    fn start_watcher(&self, root: &Path) {
+    fn start_watcher(&self, root: &Path, recursive: bool) {
         use notify::Watcher;
         let events_tx = self.events_tx.clone();
         let wakeup = Arc::clone(&self.wakeup);
@@ -287,7 +295,12 @@ impl<I: Send + 'static> Engine<I> {
         let Ok(mut watcher) = notify::recommended_watcher(handler) else {
             return;
         };
-        if watcher.watch(root, notify::RecursiveMode::Recursive).is_ok() {
+        let mode = if recursive {
+            notify::RecursiveMode::Recursive
+        } else {
+            notify::RecursiveMode::NonRecursive
+        };
+        if watcher.watch(root, mode).is_ok() {
             *self.watcher.lock().unwrap() = Some(watcher);
         }
     }

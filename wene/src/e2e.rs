@@ -356,6 +356,34 @@ pub fn run_step(delegate: &AppDelegate) {
                 "gif removed after the test",
             );
         }
+        32 => {
+            // Folder browser: navigate to the fixture like a column
+            // click would, then hide and show the pane.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            delegate.e2e_browser_navigate(&root);
+            check(
+                state,
+                delegate.e2e_browser_path().ends_with(
+                    std::path::Path::new(&root)
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                ),
+                "browser shows the navigated path",
+            );
+        }
+        33 => {
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "browser navigation rescanned the folder",
+            );
+            delegate.e2e_toggle_browser();
+            check(state, delegate.e2e_browser_hidden(), "browser pane hides");
+            delegate.e2e_toggle_browser();
+            check(state, !delegate.e2e_browser_hidden(), "browser pane shows again");
+        }
         27 => {
             // Date sort orders: the fixture has no EXIF dates, so
             // both fall back to the modified date without breaking
