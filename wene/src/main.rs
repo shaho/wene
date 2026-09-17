@@ -184,6 +184,8 @@ define_class!(
                 2 => SortOrder::Modified,
                 3 => SortOrder::Size,
                 4 => SortOrder::Path,
+                5 => SortOrder::ExifDate,
+                6 => SortOrder::Added,
                 _ => SortOrder::Name,
             };
             // Re-picking the current order reverses it, like the
@@ -193,7 +195,10 @@ define_class!(
                 self.ivars().sort_desc.set(!self.ivars().sort_desc.get());
             } else {
                 self.ivars().sort_order.set(order);
-                self.ivars().sort_desc.set(order == SortOrder::Modified);
+                self.ivars().sort_desc.set(matches!(
+                    order,
+                    SortOrder::Modified | SortOrder::ExifDate | SortOrder::Added
+                ));
             }
             self.apply_sort();
         }
@@ -320,6 +325,8 @@ impl AppDelegate {
                 SortOrder::Modified => 2,
                 SortOrder::Size => 3,
                 SortOrder::Path => 4,
+                SortOrder::ExifDate => 5,
+                SortOrder::Added => 6,
             };
             for item in menu.itemArray() {
                 item.setState(if item.tag() == selected_tag { 1 } else { 0 });
@@ -1030,6 +1037,8 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         ("Sort by date modified", 2, "2"),
         ("Sort by size", 3, "3"),
         ("Sort by file path", 4, "4"),
+        ("Sort by EXIF date", 5, "5"),
+        ("Sort by date added", 6, "6"),
     ] {
         let item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(

@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::SystemTime;
+
+/// Platform hook that reads (EXIF date, date added) for one file.
+type DatesFn = Arc<dyn Fn(&Path) -> (Option<SystemTime>, Option<SystemTime>) + Send + Sync>;
 
 use lexical_sort::natural_lexical_cmp;
 
@@ -20,6 +24,13 @@ pub trait ImageDecoder: Send + Sync + 'static {
     /// full decode.
     fn decode_thumb(&self, path: &Path, max_px: i32) -> Option<Self::Image> {
         self.decode(path, max_px)
+    }
+
+    /// Extra sort metadata: (EXIF capture date, date added to its
+    /// folder). Read during the scan; None falls back to the
+    /// modified date when sorting.
+    fn file_dates(&self, _path: &Path) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
+        (None, None)
     }
 }
 
@@ -45,6 +56,10 @@ pub struct FileInfo {
     pub path: PathBuf,
     pub modified: std::time::SystemTime,
     pub size: u64,
+    /// EXIF capture date, when the file has one.
+    pub exif_date: Option<std::time::SystemTime>,
+    /// When the file was added to its folder (macOS attribute).
+    pub added: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,6 +68,8 @@ pub enum SortOrder {
     Modified,
     Size,
     Path,
+    ExifDate,
+    Added,
 }
 
 /// Compare two files under an order. Ties always fall back to the
@@ -70,6 +87,16 @@ pub fn file_info_cmp(
         SortOrder::Path => {
             natural_lexical_cmp(&a.path.to_string_lossy(), &b.path.to_string_lossy())
         }
+        // Missing dates fall back to the modified date, like the
+        // original app's EXIF/creation-date order.
+        SortOrder::ExifDate => a
+            .exif_date
+            .unwrap_or(a.modified)
+            .cmp(&b.exif_date.unwrap_or(b.modified)),
+        SortOrder::Added => a
+            .added
+            .unwrap_or(a.modified)
+            .cmp(&b.added.unwrap_or(b.modified)),
     };
     let primary = if descending { primary.reverse() } else { primary };
     primary.then_with(|| file_cmp(&a.path, &b.path))
@@ -118,6 +145,7 @@ pub struct Engine<I> {
     /// file watcher so insert indices stay consistent.
     files: Arc<Mutex<Vec<FileInfo>>>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    dates: DatesFn,
 }
 
 impl<I: Send + 'static> Engine<I> {
@@ -128,6 +156,10 @@ impl<I: Send + 'static> Engine<I> {
         wakeup: impl Fn() + Send + Sync + 'static,
     ) -> (Self, Receiver<Event<I>>) {
         let decoder = Arc::new(decoder);
+        let dates: DatesFn = {
+            let decoder = Arc::clone(&decoder);
+            Arc::new(move |path: &Path| decoder.file_dates(path))
+        };
         let wakeup: Arc<dyn Fn() + Send + Sync> = Arc::new(wakeup);
         let (events_tx, events_rx) = channel::<Event<I>>();
 
@@ -163,6 +195,7 @@ impl<I: Send + 'static> Engine<I> {
                 max_thumb_px,
                 files: Arc::new(Mutex::new(Vec::new())),
                 watcher: Mutex::new(None),
+                dates,
             },
             events_rx,
         )
@@ -181,6 +214,7 @@ impl<I: Send + 'static> Engine<I> {
         let events_tx = self.events_tx.clone();
         let wakeup = Arc::clone(&self.wakeup);
         let files = Arc::clone(&self.files);
+        let dates = Arc::clone(&self.dates);
         thread::spawn(move || {
             let mut pending: Vec<FileInfo> = Vec::new();
             let mut stack = vec![root];
@@ -202,6 +236,10 @@ impl<I: Send + 'static> Engine<I> {
                         stack.push(path);
                     } else if is_image(&path) {
                         let meta = entry.metadata().ok();
+                        // ponytail: dates read eagerly per file (one
+                        // header read each); go lazy if huge folders
+                        // make the scan crawl.
+                        let (exif_date, added) = dates(&path);
                         pending.push(FileInfo {
                             modified: meta
                                 .as_ref()
@@ -209,6 +247,8 @@ impl<I: Send + 'static> Engine<I> {
                                 .unwrap_or(std::time::UNIX_EPOCH),
                             size: meta.map(|m| m.len()).unwrap_or(0),
                             path,
+                            exif_date,
+                            added,
                         });
                         if pending.len() >= SCAN_BATCH {
                             flush(&files, &mut pending, &events_tx, &wakeup);
@@ -228,10 +268,11 @@ impl<I: Send + 'static> Engine<I> {
         let events_tx = self.events_tx.clone();
         let wakeup = Arc::clone(&self.wakeup);
         let files = Arc::clone(&self.files);
+        let dates = Arc::clone(&self.dates);
         let handler = move |result: Result<notify::Event, notify::Error>| {
             let Ok(event) = result else { return };
             for path in event.paths {
-                apply_fs_change(&path, &files, &events_tx, &wakeup);
+                apply_fs_change(&path, &files, &events_tx, &wakeup, &dates);
             }
         };
         let Ok(mut watcher) = notify::recommended_watcher(handler) else {
@@ -291,6 +332,7 @@ fn apply_fs_change<I>(
     files: &Arc<Mutex<Vec<FileInfo>>>,
     events_tx: &Sender<Event<I>>,
     wakeup: &Arc<dyn Fn() + Send + Sync>,
+    dates: &DatesFn,
 ) {
     if !is_image(path) {
         return;
@@ -304,25 +346,27 @@ fn apply_fs_change<I>(
         return;
     }
     let meta = std::fs::metadata(path).ok();
+    let make_info = |meta: &std::fs::Metadata| {
+        let (exif_date, added) = dates(path);
+        FileInfo {
+            path: path.to_path_buf(),
+            modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+            size: meta.len(),
+            exif_date,
+            added,
+        }
+    };
     let event = {
         let mut sorted = files.lock().unwrap();
         let existing = sorted.binary_search_by(|p| file_cmp(&p.path, path));
         match (meta, existing) {
             (Some(meta), Err(index)) => {
-                let info = FileInfo {
-                    path: path.to_path_buf(),
-                    modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    size: meta.len(),
-                };
+                let info = make_info(&meta);
                 sorted.insert(index, info.clone());
                 Some(Event::FilesInserted(vec![(index, info)]))
             }
             (Some(meta), Ok(index)) => {
-                let info = FileInfo {
-                    path: path.to_path_buf(),
-                    modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    size: meta.len(),
-                };
+                let info = make_info(&meta);
                 sorted[index] = info.clone();
                 Some(Event::FileChanged(info))
             }
@@ -376,6 +420,34 @@ fn spawn_decode_worker<I: Send + 'static, D: ImageDecoder<Image = I>>(
     });
 }
 
+/// Parse an EXIF datetime ("2023:07:14 10:30:05") into a SystemTime.
+/// EXIF carries no time zone; the value is treated as UTC, which
+/// keeps the ordering consistent.
+pub fn parse_exif_datetime(s: &str) -> Option<SystemTime> {
+    let mut it = s
+        .split(|c: char| c == ':' || c == ' ')
+        .map(|part| part.trim().parse::<i64>());
+    let mut next = || it.next()?.ok();
+    let (y, mo, d) = (next()?, next()?, next()?);
+    let (h, mi, se) = (next()?, next()?, next()?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    // Howard Hinnant's days-from-civil formula.
+    let y_adj = y - i64::from(mo <= 2);
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + h * 3600 + mi * 60 + se;
+    if secs < 0 {
+        return None;
+    }
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +477,8 @@ mod tests {
             path: PathBuf::from(format!("/x/{name}")),
             modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
             size,
+            exif_date: None,
+            added: None,
         }
     }
 
@@ -438,6 +512,39 @@ mod tests {
         let mut same = vec![info("b.jpg", 5, 9), info("a.jpg", 5, 9)];
         same.sort_by(|a, b| file_info_cmp(a, b, SortOrder::Size, false));
         assert_eq!(names(&same), ["a.jpg", "b.jpg"]);
+    }
+
+    #[test]
+    fn exif_datetime_parses() {
+        let t = parse_exif_datetime("1970:01:01 00:00:00").unwrap();
+        assert_eq!(t, std::time::UNIX_EPOCH);
+        let t = parse_exif_datetime("2023:07:14 10:30:05").unwrap();
+        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(secs, 1689330605); // date -u -j -f %Y-%m-%dT%T 2023-07-14T10:30:05 +%s
+        assert!(parse_exif_datetime("").is_none());
+        assert!(parse_exif_datetime("2023:13:01 00:00:00").is_none());
+        assert!(parse_exif_datetime("not a date").is_none());
+    }
+
+    #[test]
+    fn date_sorts_fall_back_to_modified() {
+        let day = 86400u64;
+        let mut a = info("a.jpg", 3 * day, 1); // no EXIF: uses modified
+        let b = {
+            let mut b = info("b.jpg", 9 * day, 1);
+            b.exif_date = parse_exif_datetime("1970:01:02 00:00:00"); // day 1
+            b
+        };
+        let mut files = vec![a.clone(), b.clone()];
+        files.sort_by(|x, y| file_info_cmp(x, y, SortOrder::ExifDate, false));
+        // b's EXIF day 1 sorts before a's modified day 3.
+        assert_eq!(files[0].path, b.path);
+
+        a.added = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(20 * day));
+        let mut files = vec![a.clone(), b.clone()];
+        files.sort_by(|x, y| file_info_cmp(x, y, SortOrder::Added, false));
+        // a added day 20 vs b's modified fallback day 9.
+        assert_eq!(files[0].path, b.path);
     }
 }
 

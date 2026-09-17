@@ -3,10 +3,12 @@
 //! never leaves the thread (it is !Send), only the CGImage does.
 
 use std::path::Path;
+use std::time::SystemTime;
 
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL};
 use objc2_core_graphics::CGImage;
 use objc2_image_io::{
+    kCGImagePropertyExifDateTimeOriginal, kCGImagePropertyExifDictionary,
     kCGImagePropertyPixelHeight, kCGImagePropertyPixelWidth,
     kCGImageSourceCreateThumbnailFromImageAlways, kCGImageSourceCreateThumbnailFromImageIfAbsent,
     kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceThumbnailMaxPixelSize, CGImageSource,
@@ -34,6 +36,39 @@ pub fn image_dimensions(path: &Path) -> Option<(i64, i64)> {
 }
 
 pub struct ImageIoDecoder;
+
+/// EXIF capture date from the header, no decode.
+fn exif_date(path: &Path) -> Option<SystemTime> {
+    let url = CFURL::from_file_path(path)?;
+    unsafe {
+        let src = CGImageSource::with_url(&url, None)?;
+        let props = src.properties_at_index(src.primary_image_index(), None)?;
+        let props: CFRetained<CFDictionary<CFString, CFType>> =
+            CFRetained::cast_unchecked(props);
+        let exif = props
+            .get(kCGImagePropertyExifDictionary)?
+            .downcast::<CFDictionary>()
+            .ok()?;
+        let exif: CFRetained<CFDictionary<CFString, CFType>> = CFRetained::cast_unchecked(exif);
+        let value = exif
+            .get(kCGImagePropertyExifDateTimeOriginal)?
+            .downcast::<CFString>()
+            .ok()?;
+        wene_core::parse_exif_datetime(&value.to_string())
+    }
+}
+
+/// When the file landed in its folder (Finder's "date added").
+fn date_added(path: &Path) -> Option<SystemTime> {
+    use objc2_foundation::{NSURLAddedToDirectoryDateKey, NSArray, NSString, NSURL};
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str()?));
+    let keys = NSArray::from_slice(&[unsafe { NSURLAddedToDirectoryDateKey }]);
+    let values = url.resourceValuesForKeys_error(&keys).ok()?;
+    let date = values.objectForKey(unsafe { NSURLAddedToDirectoryDateKey })?;
+    let date = date.downcast::<objc2_foundation::NSDate>().ok()?;
+    let secs = date.timeIntervalSince1970();
+    (secs >= 0.0).then(|| std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs))
+}
 
 /// One thumbnail request. `from_image` is Always for a real decode
 /// and IfAbsent for the fast path (use the preview embedded in the
@@ -82,5 +117,9 @@ impl ImageDecoder for ImageIoDecoder {
             }
         }
         self.decode(path, max_px).or(fast)
+    }
+
+    fn file_dates(&self, path: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
+        (exif_date(path), date_added(path))
     }
 }

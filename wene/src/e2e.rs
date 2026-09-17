@@ -311,6 +311,21 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             delegate.e2e_toggle_labels();
         }
+        27 => {
+            // Date sort orders: the fixture has no EXIF dates, so
+            // both fall back to the modified date without breaking
+            // the grid; then name order restores.
+            delegate.e2e_sort(wene_core::SortOrder::ExifDate, true);
+            check(state, delegate.e2e_file_count() == 4, "EXIF date sort keeps all files");
+            delegate.e2e_sort(wene_core::SortOrder::Added, true);
+            check(state, delegate.e2e_file_count() == 4, "date added sort keeps all files");
+            delegate.e2e_sort(wene_core::SortOrder::Name, false);
+            check(
+                state,
+                delegate.e2e_first_file().as_deref() == Some("apple.heic"),
+                "name order restored after date sorts",
+            );
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {
