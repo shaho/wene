@@ -21,6 +21,10 @@ pub enum Event<I> {
     /// index the file was inserted at (indices are valid when applied
     /// in order) plus its info.
     FilesInserted(Vec<(usize, FileInfo)>),
+    /// Files that disappeared from disk (watcher).
+    FilesRemoved(Vec<PathBuf>),
+    /// A file's contents changed on disk; caches for it are stale.
+    FileChanged(FileInfo),
     ScanDone { total: usize },
     ThumbReady { path: PathBuf, image: I },
     SlideReady { path: PathBuf, image: I },
@@ -103,6 +107,10 @@ pub struct Engine<I> {
     events_tx: Sender<Event<I>>,
     wakeup: Arc<dyn Fn() + Send + Sync>,
     max_thumb_px: i32,
+    /// Canonical name-sorted list; shared by the scan walk and the
+    /// file watcher so insert indices stay consistent.
+    files: Arc<Mutex<Vec<FileInfo>>>,
+    watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
 impl<I: Send + 'static> Engine<I> {
@@ -146,6 +154,8 @@ impl<I: Send + 'static> Engine<I> {
                 events_tx,
                 wakeup,
                 max_thumb_px,
+                files: Arc::new(Mutex::new(Vec::new())),
+                watcher: Mutex::new(None),
             },
             events_rx,
         )
@@ -154,11 +164,17 @@ impl<I: Send + 'static> Engine<I> {
     /// Walk `root` recursively on a fresh thread. Batches of found
     /// files stream out as FilesInserted events with sorted-insert
     /// indices; the shell mirrors the inserts to keep the same order.
+    /// The folder is then watched: adds, removals, and edits under it
+    /// keep flowing as events until the next scan.
     pub fn scan(&self, root: PathBuf) {
+        self.files.lock().unwrap().clear();
+        *self.watcher.lock().unwrap() = None;
+        self.start_watcher(&root);
+
         let events_tx = self.events_tx.clone();
         let wakeup = Arc::clone(&self.wakeup);
+        let files = Arc::clone(&self.files);
         thread::spawn(move || {
-            let mut sorted: Vec<FileInfo> = Vec::new();
             let mut pending: Vec<FileInfo> = Vec::new();
             let mut stack = vec![root];
             while let Some(dir) = stack.pop() {
@@ -188,17 +204,35 @@ impl<I: Send + 'static> Engine<I> {
                             path,
                         });
                         if pending.len() >= SCAN_BATCH {
-                            flush(&mut sorted, &mut pending, &events_tx, &wakeup);
+                            flush(&files, &mut pending, &events_tx, &wakeup);
                         }
                     }
                 }
             }
-            flush(&mut sorted, &mut pending, &events_tx, &wakeup);
-            let _ = events_tx.send(Event::ScanDone {
-                total: sorted.len(),
-            });
+            flush(&files, &mut pending, &events_tx, &wakeup);
+            let total = files.lock().unwrap().len();
+            let _ = events_tx.send(Event::ScanDone { total });
             wakeup();
         });
+    }
+
+    fn start_watcher(&self, root: &Path) {
+        use notify::Watcher;
+        let events_tx = self.events_tx.clone();
+        let wakeup = Arc::clone(&self.wakeup);
+        let files = Arc::clone(&self.files);
+        let handler = move |result: Result<notify::Event, notify::Error>| {
+            let Ok(event) = result else { return };
+            for path in event.paths {
+                apply_fs_change(&path, &files, &events_tx, &wakeup);
+            }
+        };
+        let Ok(mut watcher) = notify::recommended_watcher(handler) else {
+            return;
+        };
+        if watcher.watch(root, notify::RecursiveMode::Recursive).is_ok() {
+            *self.watcher.lock().unwrap() = Some(watcher);
+        }
     }
 
     pub fn request_thumb(&self, path: PathBuf) {
@@ -215,7 +249,7 @@ impl<I: Send + 'static> Engine<I> {
 }
 
 fn flush<I>(
-    sorted: &mut Vec<FileInfo>,
+    files: &Arc<Mutex<Vec<FileInfo>>>,
     pending: &mut Vec<FileInfo>,
     events_tx: &Sender<Event<I>>,
     wakeup: &Arc<dyn Fn() + Send + Sync>,
@@ -224,15 +258,78 @@ fn flush<I>(
         return;
     }
     let mut inserts = Vec::with_capacity(pending.len());
-    for info in pending.drain(..) {
-        let index = match sorted.binary_search_by(|p| file_cmp(&p.path, &info.path)) {
-            Ok(i) | Err(i) => i,
-        };
-        sorted.insert(index, info.clone());
-        inserts.push((index, info));
+    {
+        let mut sorted = files.lock().unwrap();
+        for info in pending.drain(..) {
+            match sorted.binary_search_by(|p| file_cmp(&p.path, &info.path)) {
+                // Already present (watcher raced the walk): skip.
+                Ok(_) => {}
+                Err(index) => {
+                    sorted.insert(index, info.clone());
+                    inserts.push((index, info));
+                }
+            }
+        }
     }
-    if events_tx.send(Event::FilesInserted(inserts)).is_ok() {
+    if !inserts.is_empty() && events_tx.send(Event::FilesInserted(inserts)).is_ok() {
         wakeup();
+    }
+}
+
+/// Watcher callback: reconcile one path against the canonical list.
+/// Existence on disk decides between insert, change, and removal,
+/// which absorbs create/modify/rename event ambiguity.
+fn apply_fs_change<I>(
+    path: &Path,
+    files: &Arc<Mutex<Vec<FileInfo>>>,
+    events_tx: &Sender<Event<I>>,
+    wakeup: &Arc<dyn Fn() + Send + Sync>,
+) {
+    if !is_image(path) {
+        return;
+    }
+    let hidden = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with('.'))
+        .unwrap_or(true);
+    if hidden {
+        return;
+    }
+    let meta = std::fs::metadata(path).ok();
+    let event = {
+        let mut sorted = files.lock().unwrap();
+        let existing = sorted.binary_search_by(|p| file_cmp(&p.path, path));
+        match (meta, existing) {
+            (Some(meta), Err(index)) => {
+                let info = FileInfo {
+                    path: path.to_path_buf(),
+                    modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    size: meta.len(),
+                };
+                sorted.insert(index, info.clone());
+                Some(Event::FilesInserted(vec![(index, info)]))
+            }
+            (Some(meta), Ok(index)) => {
+                let info = FileInfo {
+                    path: path.to_path_buf(),
+                    modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    size: meta.len(),
+                };
+                sorted[index] = info.clone();
+                Some(Event::FileChanged(info))
+            }
+            (None, Ok(index)) => {
+                sorted.remove(index);
+                Some(Event::FilesRemoved(vec![path.to_path_buf()]))
+            }
+            (None, Err(_)) => None,
+        }
+    };
+    if let Some(event) = event {
+        if events_tx.send(event).is_ok() {
+            wakeup();
+        }
     }
 }
 

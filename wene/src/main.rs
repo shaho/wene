@@ -286,9 +286,16 @@ impl AppDelegate {
 
     // ---- slideshow ----
 
+    /// Start with everything in the grid (e2e and default path).
     pub fn start_slideshow(&self, index: usize) {
-        let mtm = self.mtm();
         let files = self.ivars().grid.get().unwrap().paths();
+        self.start_slideshow_files(files, index);
+    }
+
+    /// Start with an explicit file set (the grid's selection
+    /// semantics decide what that is).
+    pub fn start_slideshow_files(&self, files: Vec<PathBuf>, index: usize) {
+        let mtm = self.mtm();
         if files.is_empty() {
             return;
         }
@@ -610,6 +617,21 @@ impl AppDelegate {
         }
     }
 
+    pub fn e2e_select(&self, indices: &[usize]) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.e2e_set_selected(indices);
+        }
+    }
+
+    pub fn e2e_start_from_selection(&self) {
+        let (files, start) = self.ivars().grid.get().unwrap().slideshow_request();
+        self.start_slideshow_files(files, start);
+    }
+
+    pub fn e2e_playlist_len(&self) -> Option<usize> {
+        self.ivars().show.borrow().as_ref().map(|s| s.playlist.len())
+    }
+
     // ---- core events ----
 
     fn handle_event(&self, event: Event<Img>) {
@@ -620,6 +642,41 @@ impl AppDelegate {
                 // the active order.
                 if !self.sort_is_default() {
                     self.apply_sort();
+                }
+            }
+            Event::FilesRemoved(paths) => {
+                self.ivars().grid.get().unwrap().remove_paths(&paths);
+                let current_gone = {
+                    let mut show = self.ivars().show.borrow_mut();
+                    if let Some(show) = show.as_mut() {
+                        let before = show.playlist.current().cloned();
+                        for path in &paths {
+                            show.playlist.remove(path);
+                            show.cache.remove(path);
+                        }
+                        before != show.playlist.current().cloned()
+                    } else {
+                        false
+                    }
+                };
+                if current_gone {
+                    self.show_current();
+                }
+            }
+            Event::FileChanged(info) => {
+                let grid = self.ivars().grid.get().unwrap();
+                grid.invalidate_thumb(&info.path);
+                let is_current = {
+                    let mut show = self.ivars().show.borrow_mut();
+                    if let Some(show) = show.as_mut() {
+                        show.cache.remove(&info.path);
+                        show.playlist.current() == Some(&info.path)
+                    } else {
+                        false
+                    }
+                };
+                if is_current {
+                    self.show_current();
                 }
             }
             Event::ScanDone { total } => {

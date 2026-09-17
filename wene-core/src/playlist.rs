@@ -146,6 +146,42 @@ impl Playlist {
         }
     }
 
+    /// Remove a file (e.g. deleted on disk while the show runs).
+    /// Keeps the playback position sensible: removing the current
+    /// file moves to what would have played next.
+    pub fn remove(&mut self, path: &std::path::Path) {
+        let Some(file_index) = self.files.iter().position(|p| p == path) else {
+            return;
+        };
+        self.files.remove(file_index);
+        if self.shuffled() {
+            let play_pos = self
+                .order
+                .iter()
+                .position(|&i| i == file_index)
+                .expect("order covers every file");
+            self.order.remove(play_pos);
+            for i in self.order.iter_mut() {
+                if *i > file_index {
+                    *i -= 1;
+                }
+            }
+            if play_pos < self.position {
+                self.position -= 1;
+            }
+        } else if file_index < self.position {
+            self.position -= 1;
+        }
+        if !self.files.is_empty() {
+            let max = if self.shuffled() {
+                self.order.len() - 1
+            } else {
+                self.files.len() - 1
+            };
+            self.position = self.position.min(max);
+        }
+    }
+
     /// Turn shuffle on (current file becomes position 0) or off (the
     /// current file keeps its place in the original order).
     pub fn set_shuffled(&mut self, shuffled: bool) {
@@ -233,6 +269,54 @@ mod tests {
         let current = name(pl.current().unwrap());
         pl.set_shuffled(false);
         assert_eq!(name(pl.current().unwrap()), current);
+    }
+
+    #[test]
+    fn remove_keeps_position_sane() {
+        let mut pl = playlist(4);
+        pl.step(1); // current = 1.jpg
+        pl.remove(&PathBuf::from("/f/0.jpg")); // before current
+        assert_eq!(name(pl.current().unwrap()), "1.jpg");
+        pl.remove(&PathBuf::from("/f/1.jpg")); // current itself
+        assert_eq!(name(pl.current().unwrap()), "2.jpg");
+        pl.remove(&PathBuf::from("/f/3.jpg")); // after current
+        assert_eq!(name(pl.current().unwrap()), "2.jpg");
+        assert_eq!(pl.len(), 1);
+        pl.remove(&PathBuf::from("/f/2.jpg"));
+        assert!(pl.current().is_none());
+    }
+
+    #[test]
+    fn remove_while_shuffled_covers_rest() {
+        let mut pl = playlist(6);
+        pl.set_shuffled(true);
+        pl.step(1);
+        let current = name(pl.current().unwrap());
+        // Remove a file that is not current.
+        let victim = (0..6)
+            .map(|i| format!("{i}.jpg"))
+            .find(|n| *n != current)
+            .unwrap();
+        pl.remove(&PathBuf::from(format!("/f/{victim}")));
+        assert_eq!(name(pl.current().unwrap()), current);
+        let mut seen = vec![name(pl.current().unwrap())];
+        while pl.step(1) {
+            seen.push(name(pl.current().unwrap()));
+        }
+        pl.jump_first();
+        // All remaining 5 files reachable, none repeated.
+        let mut all: Vec<String> = (0..6)
+            .map(|i| format!("{i}.jpg"))
+            .filter(|n| *n != victim)
+            .collect();
+        let mut from_start = vec![name(pl.current().unwrap())];
+        while pl.step(1) {
+            from_start.push(name(pl.current().unwrap()));
+        }
+        from_start.sort();
+        all.sort();
+        assert_eq!(from_start, all);
+        let _ = seen;
     }
 
     #[test]

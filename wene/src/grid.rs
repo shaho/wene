@@ -4,7 +4,7 @@
 //! drawn without one.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use wene_core::{file_info_cmp, FileInfo, SortOrder};
@@ -27,7 +27,14 @@ pub struct GridIvars {
     cell: Cell<f64>,
     thumbs: RefCell<HashMap<PathBuf, Retained<NSImage>>>,
     requested: RefCell<HashSet<PathBuf>>,
-    selection: Cell<Option<usize>>,
+    /// Multi-selection: indices into `files`.
+    selected: RefCell<BTreeSet<usize>>,
+    /// Keyboard focus / last clicked; also the shift-range anchor's
+    /// counterpart.
+    focus: Cell<Option<usize>>,
+    anchor: Cell<Option<usize>>,
+    /// Rubber-band drag state (origin, current point) in view coords.
+    band: Cell<Option<(CGPoint, CGPoint)>>,
     pub delegate: OnceCell<Retained<AppDelegate>>,
 }
 
@@ -71,16 +78,16 @@ define_class!(
             let first_row = ((dirty.origin.y - PAD) / self.pitch()).floor().max(0.0) as usize;
             let last_row =
                 ((dirty.origin.y + dirty.size.height) / self.pitch()).ceil() as usize;
-            let selection = self.ivars().selection.get();
+            let selected = self.ivars().selected.borrow().clone();
 
-            for row in first_row..=last_row {
+            'rows: for row in first_row..=last_row {
                 for col in 0..cols {
                     let index = row * cols + col;
                     if index >= files.len() {
-                        return;
+                        break 'rows;
                     }
                     let cell = self.cell_rect(index, cols);
-                    if selection == Some(index) {
+                    if selected.contains(&index) {
                         NSColor::selectedContentBackgroundColor().setFill();
                         let highlight = CGRect::new(
                             CGPoint::new(cell.origin.x - 3.0, cell.origin.y - 3.0),
@@ -122,6 +129,14 @@ define_class!(
                     }
                 }
             }
+            // Rubber band on top.
+            if let Some((a, b)) = self.ivars().band.get() {
+                let rect = band_rect(a, b);
+                NSColor::selectedContentBackgroundColor()
+                    .colorWithAlphaComponent(0.25)
+                    .setFill();
+                objc2_app_kit::NSRectFill(rect);
+            }
         }
 
         #[unsafe(method(magnifyWithEvent:))]
@@ -132,19 +147,61 @@ define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
-            let cols = self.columns(self.bounds().size.width);
-            let col = ((point.x - PAD) / self.pitch()).floor();
-            let row = ((point.y - PAD) / self.pitch()).floor();
-            if col < 0.0 || row < 0.0 || col >= cols as f64 {
+            let flags = event.modifierFlags();
+            let cmd = flags.contains(objc2_app_kit::NSEventModifierFlags::Command);
+            let shift = flags.contains(objc2_app_kit::NSEventModifierFlags::Shift);
+
+            let Some(index) = self.index_at(point) else {
+                // Empty space: start a rubber band (cmd keeps the
+                // existing selection as a base).
+                if !cmd {
+                    self.ivars().selected.borrow_mut().clear();
+                }
+                self.ivars().band.set(Some((point, point)));
+                self.setNeedsDisplay(true);
                 return;
+            };
+
+            if shift {
+                let anchor = self.ivars().anchor.get().unwrap_or(index);
+                let (lo, hi) = (anchor.min(index), anchor.max(index));
+                let mut selected = self.ivars().selected.borrow_mut();
+                selected.clear();
+                selected.extend(lo..=hi);
+            } else if cmd {
+                let mut selected = self.ivars().selected.borrow_mut();
+                if !selected.remove(&index) {
+                    selected.insert(index);
+                }
+                self.ivars().anchor.set(Some(index));
+            } else {
+                let mut selected = self.ivars().selected.borrow_mut();
+                selected.clear();
+                selected.insert(index);
+                self.ivars().anchor.set(Some(index));
             }
-            let index = row as usize * cols + col as usize;
-            if index >= self.ivars().files.borrow().len() {
-                return;
-            }
-            self.select(Some(index));
+            self.ivars().focus.set(Some(index));
+            self.setNeedsDisplay(true);
             if event.clickCount() >= 2 {
                 self.activate();
+            }
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            let Some((origin, _)) = self.ivars().band.get() else { return };
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            self.ivars().band.set(Some((origin, point)));
+            self.select_band(band_rect(origin, point));
+            self.autoscroll(event);
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {
+            if self.ivars().band.get().is_some() {
+                self.ivars().band.set(None);
+                self.setNeedsDisplay(true);
             }
         }
 
@@ -155,7 +212,9 @@ define_class!(
             let delta: i64 = match event.keyCode() {
                 36 => {
                     // return
-                    if self.ivars().selection.get().is_some() {
+                    if self.ivars().focus.get().is_some()
+                        || !self.ivars().selected.borrow().is_empty()
+                    {
                         self.activate();
                     }
                     return;
@@ -172,15 +231,29 @@ define_class!(
             if count == 0 {
                 return;
             }
-            let next = match self.ivars().selection.get() {
-                Some(sel) => (sel as i64 + delta).clamp(0, count as i64 - 1) as usize,
+            let next = match self.ivars().focus.get() {
+                Some(focus) => (focus as i64 + delta).clamp(0, count as i64 - 1) as usize,
                 None => 0,
             };
-            self.select(Some(next));
+            {
+                let mut selected = self.ivars().selected.borrow_mut();
+                selected.clear();
+                selected.insert(next);
+            }
+            self.ivars().focus.set(Some(next));
+            self.ivars().anchor.set(Some(next));
+            self.setNeedsDisplay(true);
             self.scrollRectToVisible(self.cell_rect(next, cols as usize));
         }
     }
 );
+
+fn band_rect(a: CGPoint, b: CGPoint) -> CGRect {
+    CGRect::new(
+        CGPoint::new(a.x.min(b.x), a.y.min(b.y)),
+        CGSize::new((a.x - b.x).abs(), (a.y - b.y).abs()),
+    )
+}
 
 impl GridView {
     pub fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
@@ -189,10 +262,50 @@ impl GridView {
             cell: Cell::new(CELL),
             thumbs: RefCell::new(HashMap::new()),
             requested: RefCell::new(HashSet::new()),
-            selection: Cell::new(None),
+            selected: RefCell::new(BTreeSet::new()),
+            focus: Cell::new(None),
+            anchor: Cell::new(None),
+            band: Cell::new(None),
             delegate: OnceCell::new(),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    /// Cell index under a view point, if any.
+    fn index_at(&self, point: CGPoint) -> Option<usize> {
+        let cols = self.columns(self.bounds().size.width);
+        let col = ((point.x - PAD) / self.pitch()).floor();
+        let row = ((point.y - PAD) / self.pitch()).floor();
+        if col < 0.0 || row < 0.0 || col >= cols as f64 {
+            return None;
+        }
+        // Only count hits inside the cell, not the padding gutter.
+        let cell = self.ivars().cell.get();
+        let in_x = point.x - PAD - col * self.pitch();
+        let in_y = point.y - PAD - row * self.pitch();
+        if in_x > cell || in_y > cell {
+            return None;
+        }
+        let index = row as usize * cols + col as usize;
+        (index < self.ivars().files.borrow().len()).then_some(index)
+    }
+
+    /// Select every cell intersecting the rubber-band rect.
+    fn select_band(&self, rect: CGRect) {
+        let cols = self.columns(self.bounds().size.width);
+        let count = self.ivars().files.borrow().len();
+        let mut selected = self.ivars().selected.borrow_mut();
+        selected.clear();
+        for index in 0..count {
+            let cell = self.cell_rect(index, cols);
+            let intersects = cell.origin.x < rect.origin.x + rect.size.width
+                && rect.origin.x < cell.origin.x + cell.size.width
+                && cell.origin.y < rect.origin.y + rect.size.height
+                && rect.origin.y < cell.origin.y + cell.size.height;
+            if intersects {
+                selected.insert(index);
+            }
+        }
     }
 
     fn pitch(&self) -> f64 {
@@ -219,16 +332,27 @@ impl GridView {
     }
 
     /// Re-sort the whole grid, keeping the selection on the same
-    /// file.
+    /// files.
     pub fn resort(&self, order: SortOrder, descending: bool) {
         {
             let mut files = self.ivars().files.borrow_mut();
-            let selected = self.ivars().selection.get().map(|i| files[i].path.clone());
+            let selected_paths: Vec<PathBuf> = {
+                let selected = self.ivars().selected.borrow();
+                selected.iter().map(|&i| files[i].path.clone()).collect()
+            };
+            let focus_path = self.ivars().focus.get().map(|i| files[i].path.clone());
             files.sort_by(|a, b| file_info_cmp(a, b, order, descending));
-            if let Some(path) = selected {
-                let index = files.iter().position(|f| f.path == path);
-                self.ivars().selection.set(index);
+            let mut selected = self.ivars().selected.borrow_mut();
+            selected.clear();
+            for path in &selected_paths {
+                if let Some(i) = files.iter().position(|f| &f.path == path) {
+                    selected.insert(i);
+                }
             }
+            self.ivars()
+                .focus
+                .set(focus_path.and_then(|p| files.iter().position(|f| f.path == p)));
+            self.ivars().anchor.set(self.ivars().focus.get());
         }
         self.setNeedsDisplay(true);
     }
@@ -253,16 +377,38 @@ impl GridView {
         )
     }
 
-    fn select(&self, index: Option<usize>) {
-        self.ivars().selection.set(index);
-        self.setNeedsDisplay(true);
+    fn activate(&self) {
+        if let Some(delegate) = self.ivars().delegate.get() {
+            let (files, start) = self.slideshow_request();
+            if !files.is_empty() {
+                delegate.start_slideshow_files(files, start);
+            }
+        }
     }
 
-    fn activate(&self) {
-        if let (Some(index), Some(delegate)) =
-            (self.ivars().selection.get(), self.ivars().delegate.get())
-        {
-            delegate.start_slideshow(index);
+    /// The original app's selection semantics: none or one selected
+    /// plays everything (starting at the selection); several selected
+    /// play just those, starting at the focused one.
+    pub fn slideshow_request(&self) -> (Vec<PathBuf>, usize) {
+        let selected = self.ivars().selected.borrow();
+        if selected.len() >= 2 {
+            let files = self.ivars().files.borrow();
+            let paths: Vec<PathBuf> = selected.iter().map(|&i| files[i].path.clone()).collect();
+            let start = self
+                .ivars()
+                .focus
+                .get()
+                .and_then(|f| selected.iter().position(|&i| i == f))
+                .unwrap_or(0);
+            (paths, start)
+        } else {
+            let start = self
+                .ivars()
+                .focus
+                .get()
+                .or_else(|| selected.iter().next().copied())
+                .unwrap_or(0);
+            (self.paths(), start)
         }
     }
 
@@ -273,19 +419,75 @@ impl GridView {
     pub fn insert_files(&self, inserts: Vec<(usize, FileInfo)>) {
         {
             let mut files = self.ivars().files.borrow_mut();
-            let mut selection = self.ivars().selection.get();
+            let mut selected = self.ivars().selected.borrow_mut();
             for (index, info) in inserts {
                 files.insert(index, info);
-                if let Some(sel) = selection {
-                    if index <= sel {
-                        selection = Some(sel + 1);
+                *selected = selected
+                    .iter()
+                    .map(|&i| if i >= index { i + 1 } else { i })
+                    .collect();
+                for slot in [&self.ivars().focus, &self.ivars().anchor] {
+                    if let Some(v) = slot.get() {
+                        if v >= index {
+                            slot.set(Some(v + 1));
+                        }
                     }
                 }
             }
-            self.ivars().selection.set(selection);
         }
         let width = self.frame().size.width;
         self.setFrameSize(CGSize::new(width, 0.0));
+        self.setNeedsDisplay(true);
+    }
+
+    /// Watcher removals: drop rows, remap selection and focus.
+    pub fn remove_paths(&self, paths: &[PathBuf]) {
+        {
+            let mut files = self.ivars().files.borrow_mut();
+            for path in paths {
+                let Some(index) = files.iter().position(|f| &f.path == path) else {
+                    continue;
+                };
+                files.remove(index);
+                self.ivars().thumbs.borrow_mut().remove(path);
+                self.ivars().requested.borrow_mut().remove(path);
+                let mut selected = self.ivars().selected.borrow_mut();
+                *selected = selected
+                    .iter()
+                    .filter(|&&i| i != index)
+                    .map(|&i| if i > index { i - 1 } else { i })
+                    .collect();
+                let len = files.len();
+                for slot in [&self.ivars().focus, &self.ivars().anchor] {
+                    match slot.get() {
+                        Some(v) if v > index => slot.set(Some(v - 1)),
+                        Some(v) if v == index => {
+                            slot.set((len > 0).then(|| index.min(len - 1)))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let width = self.frame().size.width;
+        self.setFrameSize(CGSize::new(width, 0.0));
+        self.setNeedsDisplay(true);
+    }
+
+    /// Test hook: set the selection directly.
+    pub fn e2e_set_selected(&self, indices: &[usize]) {
+        let mut selected = self.ivars().selected.borrow_mut();
+        selected.clear();
+        selected.extend(indices.iter().copied());
+        self.ivars().focus.set(indices.first().copied());
+        self.ivars().anchor.set(indices.first().copied());
+    }
+
+    /// A file changed on disk: forget its thumbnail so the next draw
+    /// re-requests it.
+    pub fn invalidate_thumb(&self, path: &PathBuf) {
+        self.ivars().thumbs.borrow_mut().remove(path);
+        self.ivars().requested.borrow_mut().remove(path);
         self.setNeedsDisplay(true);
     }
 
@@ -299,7 +501,9 @@ impl GridView {
         self.ivars().files.borrow_mut().clear();
         self.ivars().thumbs.borrow_mut().clear();
         self.ivars().requested.borrow_mut().clear();
-        self.ivars().selection.set(None);
+        self.ivars().selected.borrow_mut().clear();
+        self.ivars().focus.set(None);
+        self.ivars().anchor.set(None);
         let width = self.frame().size.width;
         self.setFrameSize(CGSize::new(width, 0.0));
         self.setNeedsDisplay(true);

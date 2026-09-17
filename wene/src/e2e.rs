@@ -140,6 +140,41 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, after > before, "bigger cells grow the grid");
             delegate.e2e_scale_cells(1.0 / 1.5);
         }
+        10 => {
+            // Multi-select: two files selected play just those two.
+            delegate.e2e_select(&[1, 3]);
+            delegate.e2e_start_from_selection();
+            check(
+                state,
+                delegate.e2e_playlist_len() == Some(2),
+                "selection of 2 plays exactly 2",
+            );
+            delegate.end_slideshow();
+        }
+        11 => {
+            // Watcher: a new file appears on disk.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let src = format!("{root}/img2.heic");
+            let dst = format!("{root}/zzz-watcher-test.heic");
+            let copied = std::fs::copy(&src, &dst).is_ok();
+            check(state, copied, "test file copied");
+        }
+        12 => {
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher picked up the new file",
+            );
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let _ = std::fs::remove_file(format!("{root}/zzz-watcher-test.heic"));
+        }
+        13 => {
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "watcher removed the deleted file",
+            );
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {
