@@ -357,32 +357,47 @@ pub fn run_step(delegate: &AppDelegate) {
             );
         }
         32 => {
-            // Folder browser: navigate to the fixture like a column
-            // click would, then hide and show the pane.
+            // Sidebar: open the tree down to the fixture folder and
+            // click it, the same path a user click takes.
             let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
-            delegate.e2e_browser_navigate(&root);
+            delegate.e2e_sidebar_click(&root);
             check(
                 state,
-                delegate.e2e_browser_path().ends_with(
+                delegate.e2e_sidebar_path().ends_with(
                     std::path::Path::new(&root)
                         .file_name()
                         .unwrap()
                         .to_str()
                         .unwrap(),
                 ),
-                "browser shows the navigated path",
+                "sidebar highlights the folder it opened",
             );
         }
         33 => {
             check(
                 state,
                 delegate.e2e_file_count() == 4,
-                "browser navigation rescanned the folder",
+                "sidebar click rescanned the folder",
             );
-            delegate.e2e_toggle_browser();
-            check(state, delegate.e2e_browser_hidden(), "browser pane hides");
-            delegate.e2e_toggle_browser();
-            check(state, !delegate.e2e_browser_hidden(), "browser pane shows again");
+            delegate.e2e_toggle_sidebar();
+            check(state, delegate.e2e_sidebar_hidden(), "sidebar collapses");
+            delegate.e2e_toggle_sidebar();
+            check(state, !delegate.e2e_sidebar_hidden(), "sidebar shows again");
+            // Favorites: three seeded, one added, one removed.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let before = delegate.e2e_favorite_count();
+            delegate.e2e_add_favorite(&root);
+            check(
+                state,
+                delegate.e2e_favorite_count() == before + 1,
+                "folder joins the favorites",
+            );
+            delegate.e2e_remove_favorite(&root);
+            check(
+                state,
+                delegate.e2e_favorite_count() == before,
+                "favorite goes away again",
+            );
         }
         34 => {
             // Preferences window and the default slideshow mode.

@@ -3,6 +3,7 @@
 mod decoder;
 mod e2e;
 mod grid;
+mod sidebar;
 mod slideshow;
 
 use std::cell::{Cell, OnceCell, RefCell};
@@ -19,9 +20,9 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSBrowser, NSBrowserCell, NSBrowserDelegate, NSColor, NSImage, NSMenu, NSMenuItem,
-    NSOpenPanel, NSScreen, NSScrollView, NSTextField, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSColor, NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView,
+    NSSplitViewController, NSSplitViewItem, NSTextField, NSViewController, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
 use objc2_core_graphics::CGImage;
@@ -33,6 +34,7 @@ use wene_core::{Engine, Event, LruCache, Playlist, SortOrder};
 
 use decoder::ImageIoDecoder;
 use grid::GridView;
+use sidebar::Sidebar;
 use slideshow::{SlideState, SlideView, SlideshowWindow};
 
 type Img = CFRetained<CGImage>;
@@ -41,8 +43,6 @@ type Img = CFRetained<CGImage>;
 /// back through recent history never re-decodes.
 const SLIDE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 
-/// Height of the folder browser pane at the top of the browse window.
-const BROWSER_H: f64 = 150.0;
 const STATUS_H: f64 = 24.0;
 
 static EVENTS: OnceLock<Mutex<Receiver<Event<Img>>>> = OnceLock::new();
@@ -66,14 +66,12 @@ pub struct DelegateIvars {
     engine: OnceCell<Engine<Img>>,
     window: OnceCell<Retained<NSWindow>>,
     grid: OnceCell<Retained<GridView>>,
-    browser: OnceCell<Retained<NSBrowser>>,
-    scroll: OnceCell<Retained<NSScrollView>>,
-    /// Folder names per browser column, filled by the delegate
-    /// callbacks (numberOfRows fills, willDisplayCell reads).
-    browser_cols: RefCell<Vec<Vec<String>>>,
-    /// The folder the grid currently shows, to skip no-op rescans.
-    current_root: RefCell<Option<PathBuf>>,
-    browser_item: OnceCell<Retained<NSMenuItem>>,
+    sidebar: OnceCell<Retained<Sidebar>>,
+    split: OnceCell<Retained<NSSplitViewController>>,
+    /// The folder the grid shows and whether it was scanned deep, to
+    /// skip no-op rescans.
+    current_scan: RefCell<Option<(PathBuf, bool)>>,
+    sidebar_item: OnceCell<Retained<NSMenuItem>>,
     prefs_window: OnceCell<Retained<NSWindow>>,
     /// Default slideshow mode from prefs; ⌥ at start inverts it.
     default_windowed: Cell<bool>,
@@ -103,54 +101,6 @@ define_class!(
 
     unsafe impl NSObjectProtocol for AppDelegate {}
 
-    unsafe impl NSBrowserDelegate for AppDelegate {
-        // Matrix-style (passive) delegate: two callbacks, folders
-        // only. Column N lists the children of the path selected
-        // through columns 0..N.
-        #[unsafe(method(browser:numberOfRowsInColumn:))]
-        fn browser_number_of_rows_in_column(
-            &self,
-            sender: &NSBrowser,
-            column: isize,
-        ) -> isize {
-            let parent = {
-                let s = sender.pathToColumn(column).to_string();
-                if s.is_empty() {
-                    "/".to_string()
-                } else {
-                    s
-                }
-            };
-            let children = dir_children(std::path::Path::new(&parent));
-            let count = children.len();
-            let mut cols = self.ivars().browser_cols.borrow_mut();
-            cols.truncate(column as usize);
-            cols.push(children);
-            count as isize
-        }
-
-        #[unsafe(method(browser:willDisplayCell:atRow:column:))]
-        fn browser_will_display_cell(
-            &self,
-            _sender: &NSBrowser,
-            cell: &objc2::runtime::AnyObject,
-            row: isize,
-            column: isize,
-        ) {
-            let cols = self.ivars().browser_cols.borrow();
-            let name = cols
-                .get(column as usize)
-                .and_then(|c| c.get(row as usize))
-                .cloned()
-                .unwrap_or_default();
-            if let Some(cell) = cell.downcast_ref::<NSBrowserCell>() {
-                cell.setStringValue(&NSString::from_str(&name));
-                // Every entry is a folder: keep the drill-in arrow.
-                cell.setLeaf(false);
-            }
-        }
-    }
-
     unsafe impl NSWindowDelegate for AppDelegate {
         // Only slideshow windows set us as their delegate. Covers the
         // close button in windowed mode; end_slideshow routes through
@@ -175,13 +125,27 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             self.load_prefs();
-            // A folder argument skips the open panel (useful for
-            // scripted runs); then the startup-folder pref; then ask.
-            let arg = std::env::args().nth(1).map(PathBuf::from);
-            let startup = startup_folder_pref().map(PathBuf::from);
-            match arg.or(startup).filter(|p| p.is_dir()) {
-                Some(root) => self.scan_root(root, true),
-                None => self.open_folder(),
+            // A folder argument skips everything else (useful for
+            // scripted runs). Otherwise restore the last folder, then
+            // the startup-folder preference, then Pictures.
+            let arg = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_dir());
+            if let Some(root) = arg {
+                self.scan_root(root, true);
+                return;
+            }
+            if let Some(root) = last_folder_pref().filter(|p| p.is_dir()) {
+                self.scan_root(root, false);
+                return;
+            }
+            let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+            let fallback = startup_folder_pref()
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .or(Some(home.join("Pictures")).filter(|p| p.is_dir()));
+            // Nothing readable: leave the grid empty with the tree
+            // shown and nothing selected.
+            if let Some(root) = fallback {
+                self.scan_root_inner(root, false, false);
             }
         }
 
@@ -327,36 +291,9 @@ define_class!(
             self.sync_prefs_controls();
         }
 
-        #[unsafe(method(browserClicked:))]
-        fn browser_clicked(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            let Some(browser) = self.ivars().browser.get() else { return };
-            let path = browser.path().to_string();
-            if path.is_empty() {
-                return;
-            }
-            let root = PathBuf::from(path);
-            if !root.is_dir() {
-                return;
-            }
-            if self.ivars().current_root.borrow().as_ref() == Some(&root) {
-                return;
-            }
-            // Browser navigation lists just that folder (the
-            // original's subfolders-off default); cmd-O stays
-            // recursive.
-            self.scan_root(root, false);
-        }
-
-        #[unsafe(method(toggleBrowser:))]
-        fn toggle_browser(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            let Some(browser) = self.ivars().browser.get() else { return };
-            let visible = browser.isHidden();
-            browser.setHidden(!visible);
-            if let Some(item) = self.ivars().browser_item.get() {
-                item.setState(if visible { 1 } else { 0 });
-            }
-            self.layout_content();
-            self.save_prefs();
+        #[unsafe(method(toggleSidebarMenu:))]
+        fn toggle_sidebar_menu(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.toggle_sidebar();
         }
 
         #[unsafe(method(toggleLabels:))]
@@ -411,11 +348,10 @@ impl AppDelegate {
             engine: OnceCell::new(),
             window: OnceCell::new(),
             grid: OnceCell::new(),
-            browser: OnceCell::new(),
-            scroll: OnceCell::new(),
-            browser_cols: RefCell::new(Vec::new()),
-            current_root: RefCell::new(None),
-            browser_item: OnceCell::new(),
+            sidebar: OnceCell::new(),
+            split: OnceCell::new(),
+            current_scan: RefCell::new(None),
+            sidebar_item: OnceCell::new(),
             prefs_window: OnceCell::new(),
             default_windowed: Cell::new(false),
             show: RefCell::new(None),
@@ -458,7 +394,19 @@ impl AppDelegate {
         self.scan_root(PathBuf::from(path.to_string()), true);
     }
 
-    fn scan_root(&self, root: PathBuf, recursive: bool) {
+    pub fn scan_root(&self, root: PathBuf, recursive: bool) {
+        self.scan_root_inner(root, recursive, true);
+    }
+
+    /// The folder the grid shows and how deep, so a repeat of the
+    /// same request skips the scan.
+    pub fn current_scan(&self) -> Option<(PathBuf, bool)> {
+        self.ivars().current_scan.borrow().clone()
+    }
+
+    /// `remember` is false only for the launch fallback: a folder the
+    /// user never picked must not overwrite the saved one.
+    fn scan_root_inner(&self, root: PathBuf, recursive: bool, remember: bool) {
         if let Some(grid) = self.ivars().grid.get() {
             grid.reset();
         }
@@ -468,41 +416,37 @@ impl AppDelegate {
                 root.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
             )));
         }
-        // Keep the folder browser pointed at the same place.
-        if let Some(browser) = self.ivars().browser.get() {
-            let target = root.to_string_lossy().into_owned();
-            if browser.path().to_string() != target {
-                let _ = browser.setPath(&NSString::from_str(&target));
-            }
+        // The sidebar follows the grid, whatever changed the folder.
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.reveal(&root);
         }
-        *self.ivars().current_root.borrow_mut() = Some(root.clone());
+        if remember {
+            save_last_folder(&root);
+        }
+        *self.ivars().current_scan.borrow_mut() = Some((root.clone(), recursive));
         self.ivars().engine.get().unwrap().scan(root, recursive);
     }
 
-    /// Re-fit the browser pane, grid scroll view, and status bar to
-    /// the window (used by the browser show/hide toggle).
-    fn layout_content(&self) {
-        let (Some(window), Some(scroll), Some(browser)) = (
-            self.ivars().window.get(),
-            self.ivars().scroll.get(),
-            self.ivars().browser.get(),
-        ) else {
+    /// Show or hide the sidebar. The split view controller owns the
+    /// collapse animation.
+    fn toggle_sidebar(&self) {
+        let Some(split) = self.ivars().split.get() else { return };
+        unsafe { split.toggleSidebar(None) };
+        self.sync_sidebar_item();
+    }
+
+    /// Tick the View menu item to match the sidebar.
+    fn sync_sidebar_item(&self) {
+        let (Some(split), Some(item)) =
+            (self.ivars().split.get(), self.ivars().sidebar_item.get())
+        else {
             return;
         };
-        let Some(content) = window.contentView() else { return };
-        let bounds = content.bounds();
-        let browser_h = if browser.isHidden() { 0.0 } else { BROWSER_H };
-        browser.setFrame(NSRect::new(
-            CGPoint::new(0.0, bounds.size.height - BROWSER_H),
-            CGSize::new(bounds.size.width, BROWSER_H),
-        ));
-        scroll.setFrame(NSRect::new(
-            CGPoint::new(0.0, STATUS_H),
-            CGSize::new(
-                bounds.size.width,
-                bounds.size.height - STATUS_H - browser_h,
-            ),
-        ));
+        let collapsed = split
+            .splitViewItems()
+            .firstObject()
+            .is_some_and(|item| item.isCollapsed());
+        item.setState(if collapsed { 0 } else { 1 });
     }
 
     pub fn request_thumb(&self, path: PathBuf) {
@@ -572,18 +516,6 @@ impl AppDelegate {
                 item.setState(1);
             }
         }
-        // Browser defaults to visible: only an explicit false hides.
-        let browser_off = d.objectForKey(ns_string!("showBrowser")).is_some()
-            && !d.boolForKey(ns_string!("showBrowser"));
-        if browser_off {
-            if let Some(browser) = self.ivars().browser.get() {
-                browser.setHidden(true);
-            }
-            if let Some(item) = self.ivars().browser_item.get() {
-                item.setState(0);
-            }
-            self.layout_content();
-        }
     }
 
     /// Persist everything the prefs window and the menus control.
@@ -610,9 +542,6 @@ impl AppDelegate {
         d.setInteger_forKey(tenths, ns_string!("autoAdvanceTenths"));
         if let Some(grid) = self.ivars().grid.get() {
             d.setBool_forKey(grid.labels_visible(), ns_string!("showFilenames"));
-        }
-        if let Some(browser) = self.ivars().browser.get() {
-            d.setBool_forKey(!browser.isHidden(), ns_string!("showBrowser"));
         }
     }
 
@@ -649,10 +578,6 @@ impl AppDelegate {
         set_check(
             4,
             self.ivars().grid.get().is_some_and(|g| g.labels_visible()),
-        );
-        set_check(
-            5,
-            self.ivars().browser.get().is_some_and(|b| !b.isHidden()),
         );
         if let Some(view) = content.viewWithTag(6) {
             if let Some(popup) = view.downcast_ref::<objc2_app_kit::NSPopUpButton>() {
@@ -1128,32 +1053,53 @@ impl AppDelegate {
             .unwrap_or_default()
     }
 
-    /// Mirror a browser click on `path` (setPath does not fire the
-    /// widget's action, so e2e drives the handler directly).
-    pub fn e2e_browser_navigate(&self, path: &str) {
-        if let Some(browser) = self.ivars().browser.get() {
-            let _ = browser.setPath(&NSString::from_str(path));
+    /// Mirror a sidebar click on `path`: open the tree down to it and
+    /// run the same handler the selection callback runs.
+    pub fn e2e_sidebar_click(&self, path: &str) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.e2e_click(std::path::Path::new(path));
         }
-        self.scan_root(PathBuf::from(path), false);
     }
 
-    pub fn e2e_browser_path(&self) -> String {
+    pub fn e2e_sidebar_path(&self) -> String {
         self.ivars()
-            .browser
+            .sidebar
             .get()
-            .map(|b| b.path().to_string())
+            .and_then(|s| s.selected_path())
+            .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     }
 
-    pub fn e2e_browser_hidden(&self) -> bool {
-        self.ivars().browser.get().is_some_and(|b| b.isHidden())
+    pub fn e2e_sidebar_hidden(&self) -> bool {
+        self.ivars()
+            .split
+            .get()
+            .and_then(|split| split.splitViewItems().firstObject().map(|i| i.isCollapsed()))
+            .unwrap_or(false)
     }
 
-    pub fn e2e_toggle_browser(&self) {
-        if let Some(browser) = self.ivars().browser.get() {
-            browser.setHidden(!browser.isHidden());
-            self.layout_content();
+    pub fn e2e_toggle_sidebar(&self) {
+        self.toggle_sidebar();
+    }
+
+    pub fn e2e_add_favorite(&self, path: &str) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.add_favorite(std::path::Path::new(path));
         }
+    }
+
+    pub fn e2e_remove_favorite(&self, path: &str) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.remove_favorite(std::path::Path::new(path));
+        }
+    }
+
+    pub fn e2e_favorite_count(&self) -> usize {
+        self.ivars()
+            .sidebar
+            .get()
+            .map(|s| s.e2e_favorites().len())
+            .unwrap_or(0)
     }
 
     pub fn e2e_prefs_visible(&self) -> bool {
@@ -1314,6 +1260,29 @@ fn image_cost(image: &Img) -> usize {
     CGImage::width(Some(image)) * CGImage::height(Some(image)) * 4
 }
 
+/// The folder the grid showed last. A failed restore leaves it
+/// alone, so an unplugged disk comes back next time.
+fn last_folder_pref() -> Option<PathBuf> {
+    if e2e::enabled() {
+        return None;
+    }
+    NSUserDefaults::standardUserDefaults()
+        .stringForKey(ns_string!("lastFolder"))
+        .map(|s| PathBuf::from(s.to_string()))
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+fn save_last_folder(root: &std::path::Path) {
+    if e2e::enabled() {
+        return;
+    }
+    let value = NSString::from_str(&root.to_string_lossy());
+    unsafe {
+        NSUserDefaults::standardUserDefaults()
+            .setObject_forKey(Some(&value), ns_string!("lastFolder"));
+    }
+}
+
 fn startup_folder_pref() -> Option<String> {
     if e2e::enabled() {
         return None;
@@ -1327,7 +1296,7 @@ fn startup_folder_pref() -> Option<String> {
 /// The preferences window: one plain pane, controls looked up by tag
 /// (1-5 checkboxes, 6 auto-advance popup, 7 startup folder field).
 fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained<NSWindow> {
-    let frame = NSRect::new(CGPoint::new(360.0, 360.0), CGSize::new(430.0, 292.0));
+    let frame = NSRect::new(CGPoint::new(360.0, 360.0), CGSize::new(430.0, 264.0));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
@@ -1364,9 +1333,9 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
     };
 
     // Startup folder row (top).
-    label("Startup folder:", 20.0, 252.0);
+    label("Startup folder:", 20.0, 224.0);
     let field = NSTextField::labelWithString(ns_string!(""), mtm);
-    field.setFrame(NSRect::new(CGPoint::new(20.0, 228.0), CGSize::new(250.0, 18.0)));
+    field.setFrame(NSRect::new(CGPoint::new(20.0, 200.0), CGSize::new(250.0, 18.0)));
     field.setTag(7);
     field.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(11.0)));
     field.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -1383,7 +1352,7 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
                 mtm,
             )
         };
-        b.setFrame(NSRect::new(CGPoint::new(x, 222.0), CGSize::new(72.0, 28.0)));
+        b.setFrame(NSRect::new(CGPoint::new(x, 194.0), CGSize::new(72.0, 28.0)));
         content.addSubview(&b);
     }
 
@@ -1391,14 +1360,14 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
         "Start slideshows in a window",
         sel!(prefsToggleWindowed:),
         1,
-        188.0,
+        160.0,
     );
-    checkbox("Loop slideshows", sel!(toggleLoop:), 2, 160.0);
-    checkbox("Shuffle slideshows", sel!(toggleShuffle:), 3, 132.0);
+    checkbox("Loop slideshows", sel!(toggleLoop:), 2, 132.0);
+    checkbox("Shuffle slideshows", sel!(toggleShuffle:), 3, 104.0);
 
-    label("Auto-advance:", 20.0, 100.0);
+    label("Auto-advance:", 20.0, 72.0);
     let popup = objc2_app_kit::NSPopUpButton::new(mtm);
-    popup.setFrame(NSRect::new(CGPoint::new(150.0, 92.0), CGSize::new(180.0, 26.0)));
+    popup.setFrame(NSRect::new(CGPoint::new(150.0, 64.0), CGSize::new(180.0, 26.0)));
     popup.setTag(6);
     for (title, tag) in [
         ("Off", 0isize),
@@ -1418,27 +1387,10 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
     }
     content.addSubview(&popup);
 
-    checkbox("Show filenames", sel!(toggleLabels:), 4, 56.0);
-    checkbox("Show browser", sel!(toggleBrowser:), 5, 28.0);
+    checkbox("Show filenames", sel!(toggleLabels:), 4, 28.0);
 
     window.setContentView(Some(&content));
     window
-}
-
-/// Direct subfolders of `path` for one browser column: visible
-/// directories, natural name order.
-fn dir_children(path: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| !n.starts_with('.'))
-        .collect();
-    names.sort_by(|a, b| wene_core::natural_str_cmp(a, b));
-    names
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1633,17 +1585,21 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
     view_menu.addItem(&bigger);
     view_menu.addItem(&smaller);
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let browser_item = unsafe {
+    let sidebar_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            ns_string!("Show browser"),
-            Some(sel!(toggleBrowser:)),
-            ns_string!(""),
+            ns_string!("Show sidebar"),
+            Some(sel!(toggleSidebarMenu:)),
+            ns_string!("s"),
         )
     };
-    browser_item.setState(1);
-    view_menu.addItem(&browser_item);
-    let _ = delegate.ivars().browser_item.set(browser_item);
+    sidebar_item.setKeyEquivalentModifierMask(
+        objc2_app_kit::NSEventModifierFlags::Command
+            | objc2_app_kit::NSEventModifierFlags::Control,
+    );
+    sidebar_item.setState(1);
+    view_menu.addItem(&sidebar_item);
+    let _ = delegate.ivars().sidebar_item.set(sidebar_item);
     let labels_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -1674,7 +1630,9 @@ fn main() {
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     build_menu(mtm, &app, &delegate);
 
-    // Browse window: scroll view + grid.
+    // Browse window: the sidebar on the left, the grid and the
+    // status bar on the right. A split view controller gives the
+    // sidebar the native look and collapse animation.
     let frame = NSRect::new(CGPoint::new(200.0, 200.0), CGSize::new(1000.0, 700.0));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -1683,42 +1641,36 @@ fn main() {
             NSWindowStyleMask::Titled
                 | NSWindowStyleMask::Closable
                 | NSWindowStyleMask::Miniaturizable
-                | NSWindowStyleMask::Resizable,
+                | NSWindowStyleMask::Resizable
+                | NSWindowStyleMask::FullSizeContentView,
             NSBackingStoreType::Buffered,
             false,
         )
     };
     window.setTitle(ns_string!("wene"));
+    // A sidebar runs the full height of the window only when the
+    // window carries a toolbar. It stays empty until the control
+    // strip slice fills it.
+    let toolbar = objc2_app_kit::NSToolbar::new(mtm);
+    window.setToolbar(Some(&toolbar));
+    window.setToolbarStyle(objc2_app_kit::NSWindowToolbarStyle::Unified);
+    // Tahoe draws the title as a wide capsule over the content when
+    // a sidebar window carries no toolbar; an empty toolbar restores
+    // the plain titlebar. The control strip is a later slice.
 
-    // Content, top to bottom: folder browser, grid scroll view,
-    // status bar strip.
-    let content =
-        objc2_app_kit::NSView::initWithFrame(objc2_app_kit::NSView::alloc(mtm), frame);
+    let (sidebar, sidebar_scroll) = Sidebar::new(mtm, &delegate);
 
-    let browser = NSBrowser::new(mtm);
-    browser.setFrame(NSRect::new(
-        CGPoint::new(0.0, frame.size.height - BROWSER_H),
-        CGSize::new(frame.size.width, BROWSER_H),
-    ));
-    browser.setAutoresizingMask(
-        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
-            | objc2_app_kit::NSAutoresizingMaskOptions::ViewMinYMargin,
+    let content_size = CGSize::new(frame.size.width - sidebar::WIDTH, frame.size.height);
+    let content = objc2_app_kit::NSView::initWithFrame(
+        objc2_app_kit::NSView::alloc(mtm),
+        NSRect::new(CGPoint::new(0.0, 0.0), content_size),
     );
-    browser.setTitled(false);
-    browser.setHasHorizontalScroller(true);
-    browser.setTakesTitleFromPreviousColumn(false);
-    browser.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    unsafe {
-        browser.setTarget(Some(&delegate));
-        browser.setAction(Some(sel!(browserClicked:)));
-    }
-    browser.loadColumnZero();
 
     let scroll = NSScrollView::new(mtm);
     scroll.setHasVerticalScroller(true);
     scroll.setFrame(NSRect::new(
         CGPoint::new(0.0, STATUS_H),
-        CGSize::new(frame.size.width, frame.size.height - STATUS_H - BROWSER_H),
+        CGSize::new(content_size.width, content_size.height - STATUS_H),
     ));
     scroll.setAutoresizingMask(
         objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
@@ -1733,22 +1685,34 @@ fn main() {
     status.setTextColor(Some(&NSColor::secondaryLabelColor()));
     status.setFrame(NSRect::new(
         CGPoint::new(8.0, 4.0),
-        CGSize::new(frame.size.width - 16.0, 16.0),
+        CGSize::new(content_size.width - 16.0, 16.0),
     ));
     status.setAutoresizingMask(
         objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
             | objc2_app_kit::NSAutoresizingMaskOptions::ViewMaxYMargin,
     );
 
-    content.addSubview(&browser);
     content.addSubview(&scroll);
     content.addSubview(&status);
-    window.setContentView(Some(&content));
-    window.makeFirstResponder(Some(&grid));
-    let _ = delegate.ivars().status.set(status);
-    let _ = delegate.ivars().browser.set(browser);
-    let _ = delegate.ivars().scroll.set(scroll.clone());
 
+    let sidebar_vc = NSViewController::new(mtm);
+    sidebar_vc.setView(&sidebar_scroll);
+    let content_vc = NSViewController::new(mtm);
+    content_vc.setView(&content);
+
+    let split = NSSplitViewController::new(mtm);
+    let sidebar_pane = NSSplitViewItem::sidebarWithViewController(&sidebar_vc);
+    sidebar_pane.setMinimumThickness(sidebar::MIN_WIDTH);
+    sidebar_pane.setMaximumThickness(sidebar::MAX_WIDTH);
+    split.addSplitViewItem(&sidebar_pane);
+    split.addSplitViewItem(&NSSplitViewItem::splitViewItemWithViewController(&content_vc));
+    window.setContentViewController(Some(&split));
+    window.setFrame_display(frame, false);
+    window.makeFirstResponder(Some(&grid));
+
+    let _ = delegate.ivars().status.set(status);
+    let _ = delegate.ivars().sidebar.set(sidebar);
+    let _ = delegate.ivars().split.set(split);
     let _ = delegate.ivars().window.set(window.clone());
     let _ = delegate.ivars().grid.set(grid);
 
