@@ -8,8 +8,22 @@ cargo build --release
 
 APP=target/wene.app
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/wene "$APP/Contents/MacOS/wene"
+
+# App icon: iconutil wants its own naming, so restage the artwork
+# from branding/ under the names it expects.
+ICONSET=target/AppIcon.iconset
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+for size in 16 32 128 256 512; do
+  cp "branding/macos/AppIcon.appiconset/icon-$size.png" \
+    "$ICONSET/icon_${size}x${size}.png"
+  cp "branding/macos/AppIcon.appiconset/icon-$size@2x.png" \
+    "$ICONSET/icon_${size}x${size}@2x.png"
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+rm -rf "$ICONSET"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -19,7 +33,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <dict>
   <key>CFBundleExecutable</key><string>wene</string>
   <key>CFBundleIdentifier</key><string>dev.shaho.wene</string>
-  <key>CFBundleName</key><string>wene</string>
+  <key>CFBundleName</key><string>Wêne</string>
+  <key>CFBundleDisplayName</key><string>Wêne</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>NSHighResolutionCapable</key><true/>

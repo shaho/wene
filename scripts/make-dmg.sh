@@ -11,6 +11,6 @@ mkdir -p "$STAGE"
 cp -R target/wene.app "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 
-hdiutil create -volname wene -srcfolder "$STAGE" -ov -format UDZO target/wene.dmg
+hdiutil create -volname "Wêne" -srcfolder "$STAGE" -ov -format UDZO target/wene.dmg
 rm -rf "$STAGE"
 echo "built target/wene.dmg"

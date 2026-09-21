@@ -566,7 +566,7 @@ impl AppDelegate {
         }
         if let Some(window) = self.ivars().window.get() {
             window.setTitle(&NSString::from_str(&format!(
-                "wene — {}",
+                "Wêne — {}",
                 root.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
             )));
         }
@@ -2186,7 +2186,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
     let quit = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            ns_string!("Quit wene"),
+            ns_string!("Quit Wêne"),
             Some(sel!(terminate:)),
             ns_string!("q"),
         )
@@ -2464,7 +2464,7 @@ fn main() {
             false,
         )
     };
-    window.setTitle(ns_string!("wene"));
+    window.setTitle(ns_string!("Wêne"));
     // A sidebar runs the full height of the window only when the
     // window carries a toolbar. It stays empty until the control
     // strip slice fills it.
