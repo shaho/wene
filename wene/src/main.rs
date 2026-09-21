@@ -21,7 +21,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSColor, NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView,
+    NSColor, NSControlTextEditingDelegate, NSTextFieldDelegate, NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView,
     NSSplitViewController, NSSplitViewItem, NSTextField, NSViewController, NSWindow,
     NSWindowDelegate, NSWindowStyleMask,
 };
@@ -46,6 +46,8 @@ type Img = CFRetained<CGImage>;
 const SLIDE_CACHE_BYTES: usize = 512 * 1024 * 1024;
 
 const STATUS_H: f64 = 24.0;
+/// Height of the filter bar above the grid, while it is open.
+const FILTER_H: f64 = 28.0;
 
 static EVENTS: OnceLock<Mutex<Receiver<Event<Img>>>> = OnceLock::new();
 static DELEGATE: OnceLock<MainThreadBound<Retained<AppDelegate>>> = OnceLock::new();
@@ -74,6 +76,12 @@ pub struct DelegateIvars {
     grid: OnceCell<Retained<GridView>>,
     sidebar: OnceCell<Retained<Sidebar>>,
     split: OnceCell<Retained<NSSplitViewController>>,
+    /// The right-hand pane and the pieces stacked in it, for layout
+    /// when the filter bar opens or closes.
+    content: OnceCell<Retained<objc2_app_kit::NSView>>,
+    scroll: OnceCell<Retained<NSScrollView>>,
+    filter_bar: OnceCell<Retained<objc2_app_kit::NSView>>,
+    filter_field: OnceCell<Retained<NSTextField>>,
     /// The folder the grid shows and whether it was scanned deep, to
     /// skip no-op rescans.
     current_scan: RefCell<Option<(PathBuf, bool)>>,
@@ -115,6 +123,26 @@ define_class!(
     pub struct AppDelegate;
 
     unsafe impl NSObjectProtocol for AppDelegate {}
+
+    unsafe impl NSTextFieldDelegate for AppDelegate {}
+
+    unsafe impl NSControlTextEditingDelegate for AppDelegate {
+        // Only the filter field has us as its delegate.
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _notification: &NSNotification) {
+            self.filter_changed();
+        }
+
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        fn control_do_command(
+            &self,
+            _control: &objc2_app_kit::NSControl,
+            _text_view: &objc2_app_kit::NSTextView,
+            command: objc2::runtime::Sel,
+        ) -> bool {
+            self.filter_field_command(command)
+        }
+    }
 
     unsafe impl NSWindowDelegate for AppDelegate {
         // Only slideshow windows set us as their delegate. Covers the
@@ -311,6 +339,16 @@ define_class!(
             self.menu_item_enabled(item)
         }
 
+        #[unsafe(method(contentResized:))]
+        fn content_resized(&self, _notification: Option<&NSNotification>) {
+            self.layout_content();
+        }
+
+        #[unsafe(method(showFilter:))]
+        fn show_filter(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.open_filter();
+        }
+
         #[unsafe(method(moveToTrash:))]
         fn move_to_trash(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.trash_selection();
@@ -418,6 +456,10 @@ impl AppDelegate {
             grid: OnceCell::new(),
             sidebar: OnceCell::new(),
             split: OnceCell::new(),
+            content: OnceCell::new(),
+            scroll: OnceCell::new(),
+            filter_bar: OnceCell::new(),
+            filter_field: OnceCell::new(),
             current_scan: RefCell::new(None),
             sidebar_item: OnceCell::new(),
             last_move: RefCell::new(None),
@@ -480,6 +522,9 @@ impl AppDelegate {
     /// `remember` is false only for the launch fallback: a folder the
     /// user never picked must not overwrite the saved one.
     fn scan_root_inner(&self, root: PathBuf, recursive: bool, remember: bool) {
+        // A filter typed for the last folder would explain nothing
+        // here, and an almost empty grid reads as a bug.
+        self.close_filter();
         if let Some(grid) = self.ivars().grid.get() {
             grid.reset();
         }
@@ -671,6 +716,105 @@ impl AppDelegate {
         }
     }
 
+    // ---- filter ----
+
+    /// The field's text is the filter. Typing lands here.
+    fn filter_changed(&self) {
+        let Some(field) = self.ivars().filter_field.get() else { return };
+        let text = field.stringValue().to_string();
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.set_filter(&text);
+        }
+    }
+
+    /// Esc, from anywhere in the browse window.
+    pub fn escape_pressed(&self) {
+        self.close_filter();
+    }
+
+    /// Keys the filter field hands over: Esc clears the filter and
+    /// closes the bar, Return leaves the field with the filter still
+    /// on. Anything else stays with the field.
+    fn filter_field_command(&self, command: objc2::runtime::Sel) -> bool {
+        if command == sel!(cancelOperation:) {
+            self.close_filter();
+            return true;
+        }
+        if command == sel!(insertNewline:) {
+            self.focus_grid();
+            return true;
+        }
+        false
+    }
+
+    /// cmd-F: the bar appears above the grid with the field ready to
+    /// type in. Filtering happens in bursts, so the bar takes no
+    /// room while it is closed.
+    fn open_filter(&self) {
+        let (Some(bar), Some(field), Some(window)) = (
+            self.ivars().filter_bar.get(),
+            self.ivars().filter_field.get(),
+            self.ivars().window.get(),
+        ) else {
+            return;
+        };
+        bar.setHidden(false);
+        self.layout_content();
+        window.makeFirstResponder(Some(field));
+    }
+
+    /// Esc: the filter goes, the bar goes, the grid takes the keys
+    /// back.
+    fn close_filter(&self) {
+        let Some(bar) = self.ivars().filter_bar.get() else { return };
+        if bar.isHidden() {
+            return;
+        }
+        bar.setHidden(true);
+        if let Some(field) = self.ivars().filter_field.get() {
+            field.setStringValue(ns_string!(""));
+        }
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.set_filter("");
+        }
+        self.layout_content();
+        self.focus_grid();
+    }
+
+    fn focus_grid(&self) {
+        let (Some(window), Some(grid)) = (self.ivars().window.get(), self.ivars().grid.get())
+        else {
+            return;
+        };
+        window.makeFirstResponder(Some(grid));
+    }
+
+    /// Stack the right-hand pane: filter bar on top when it is open,
+    /// then the grid, then the status bar.
+    fn layout_content(&self) {
+        let (Some(content), Some(scroll), Some(bar)) = (
+            self.ivars().content.get(),
+            self.ivars().scroll.get(),
+            self.ivars().filter_bar.get(),
+        ) else {
+            return;
+        };
+        let size = content.bounds().size;
+        // The pane runs under the title bar, so the bar starts below
+        // the safe area. The grid keeps scrolling under the title bar
+        // while the filter is closed.
+        let title_h = content.safeAreaInsets().top;
+        let taken = if bar.isHidden() { 0.0 } else { title_h + FILTER_H };
+        bar.setFrame(NSRect::new(
+            CGPoint::new(0.0, size.height - title_h - FILTER_H),
+            CGSize::new(size.width, FILTER_H),
+        ));
+        scroll.setFrame(NSRect::new(
+            CGPoint::new(0.0, STATUS_H),
+            CGSize::new(size.width, size.height - STATUS_H - taken),
+        ));
+    }
+
     // ---- move and copy ----
 
     /// Ask for the target folder. Cancel returns None.
@@ -802,6 +946,16 @@ impl AppDelegate {
     /// also need a folder to repeat to.
     fn menu_item_enabled(&self, item: &NSMenuItem) -> bool {
         let action = item.action();
+        let prefs_key = self
+            .ivars()
+            .prefs_window
+            .get()
+            .is_some_and(|window| window.isKeyWindow());
+        // Selecting and filtering belong to the grid, so they go
+        // grey during a slideshow and in the preferences window.
+        if action == Some(sel!(selectAll:)) || action == Some(sel!(showFilter:)) {
+            return !prefs_key && self.ivars().show.borrow().is_none();
+        }
         let acts_on_images = [
             sel!(moveToTrash:),
             sel!(moveToFolder:),
@@ -826,11 +980,6 @@ impl AppDelegate {
             .grid
             .get()
             .is_some_and(|grid| !grid.selected_paths().is_empty());
-        let prefs_key = self
-            .ivars()
-            .prefs_window
-            .get()
-            .is_some_and(|window| window.isKeyWindow());
         (in_show || selected) && !prefs_key
     }
 
@@ -954,8 +1103,14 @@ impl AppDelegate {
         let Some(status) = self.ivars().status.get() else { return };
         let Some(grid) = self.ivars().grid.get() else { return };
         let (total, selected) = grid.selection_info();
+        let (shown, in_folder) = grid.counts();
+        let all_text = if grid.filtering() {
+            format!("{shown} of {in_folder} images")
+        } else {
+            format!("{total} images")
+        };
         let text = match selected.as_slice() {
-            [] => format!("{total} images"),
+            [] => all_text,
             [info] => {
                 let name = info
                     .path
@@ -965,11 +1120,16 @@ impl AppDelegate {
                 let dims = decoder::image_dimensions(&info.path)
                     .map(|(w, h)| format!(" — {w}×{h}"))
                     .unwrap_or_default();
-                format!("{name}{dims} — {} · {total} images", format_bytes(info.size))
+                format!("{name}{dims} — {} · {all_text}", format_bytes(info.size))
             }
             many => {
                 let bytes: u64 = many.iter().map(|f| f.size).sum();
-                format!("{} of {total} selected — {}", many.len(), format_bytes(bytes))
+                let mut text =
+                    format!("{} of {shown} selected — {}", many.len(), format_bytes(bytes));
+                if grid.filtering() {
+                    text.push_str(&format!(" · {all_text}"));
+                }
+                text
             }
         };
         status.setStringValue(&NSString::from_str(&text));
@@ -1472,6 +1632,36 @@ impl AppDelegate {
         self.transfer_selection(PathBuf::from(folder), kind);
     }
 
+    pub fn e2e_open_filter(&self) {
+        self.open_filter();
+    }
+
+    /// Esc, the same way the field hands it over.
+    pub fn e2e_close_filter(&self) {
+        self.filter_field_command(sel!(cancelOperation:));
+    }
+
+    /// Type into the field and let the delegate do the rest.
+    pub fn e2e_type_filter(&self, text: &str) {
+        if let Some(field) = self.ivars().filter_field.get() {
+            field.setStringValue(&NSString::from_str(text));
+        }
+        self.filter_changed();
+    }
+
+    pub fn e2e_filter_open(&self) -> bool {
+        self.ivars()
+            .filter_bar
+            .get()
+            .is_some_and(|bar| !bar.isHidden())
+    }
+
+    pub fn e2e_select_all(&self) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.select_all();
+        }
+    }
+
     pub fn e2e_transfer_busy(&self) -> bool {
         self.ivars().transfer_busy.get()
     }
@@ -1944,6 +2134,29 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
     file_item.setSubmenu(Some(&file_menu));
     menubar.addItem(&file_item);
 
+    let edit_item = NSMenuItem::new(mtm);
+    let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
+    let select_all = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Select all"),
+            Some(sel!(selectAll:)),
+            ns_string!("a"),
+        )
+    };
+    edit_menu.addItem(&select_all);
+    let filter = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Filter by name"),
+            Some(sel!(showFilter:)),
+            ns_string!("f"),
+        )
+    };
+    edit_menu.addItem(&filter);
+    edit_item.setSubmenu(Some(&edit_menu));
+    menubar.addItem(&edit_item);
+
     let show_item = NSMenuItem::new(mtm);
     let show_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Slideshow"));
     let start = unsafe {
@@ -2179,6 +2392,36 @@ fn main() {
             | objc2_app_kit::NSAutoresizingMaskOptions::ViewMaxYMargin,
     );
 
+    // Filter bar, above the grid and hidden until cmd-F.
+    let filter_bar = objc2_app_kit::NSView::initWithFrame(
+        objc2_app_kit::NSView::alloc(mtm),
+        NSRect::new(
+            CGPoint::new(0.0, content_size.height - FILTER_H),
+            CGSize::new(content_size.width, FILTER_H),
+        ),
+    );
+    // Its real place is worked out in layout_content, which knows
+    // where the title bar ends.
+
+    filter_bar.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
+    filter_bar.setHidden(true);
+    let filter_field = NSTextField::textFieldWithString(ns_string!(""), mtm);
+    filter_field.setFrame(NSRect::new(
+        CGPoint::new(8.0, 3.0),
+        CGSize::new(content_size.width - 16.0, 22.0),
+    ));
+    filter_field.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable,
+    );
+    filter_field.setPlaceholderString(Some(ns_string!("Filter by name")));
+    filter_field.setBezelStyle(objc2_app_kit::NSTextFieldBezelStyle::RoundedBezel);
+    unsafe { filter_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
+    filter_bar.addSubview(&filter_field);
+
+    content.addSubview(&filter_bar);
     content.addSubview(&scroll);
     content.addSubview(&status);
 
@@ -2198,6 +2441,22 @@ fn main() {
     window.makeFirstResponder(Some(&grid));
 
     let _ = delegate.ivars().status.set(status);
+    // The bar and the grid are stacked by hand, so a resize has to
+    // run the same maths again.
+    content.setPostsFrameChangedNotifications(true);
+    unsafe {
+        objc2_foundation::NSNotificationCenter::defaultCenter()
+            .addObserver_selector_name_object(
+                &delegate,
+                sel!(contentResized:),
+                Some(objc2_app_kit::NSViewFrameDidChangeNotification),
+                Some(&content),
+            );
+    }
+    let _ = delegate.ivars().content.set(content);
+    let _ = delegate.ivars().scroll.set(scroll);
+    let _ = delegate.ivars().filter_bar.set(filter_bar);
+    let _ = delegate.ivars().filter_field.set(filter_field);
     let _ = delegate.ivars().sidebar.set(sidebar);
     let _ = delegate.ivars().split.set(split);
     let _ = delegate.ivars().window.set(window.clone());

@@ -658,6 +658,112 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             let _ = std::fs::remove_dir_all(transfer_folder());
         }
+        48 => {
+            // Filter: the bar opens, typing narrows the grid, and the
+            // grid that is left is the grid.
+            delegate.e2e_open_filter();
+            check(state, delegate.e2e_filter_open(), "the filter bar opens");
+            delegate.e2e_type_filter("img1");
+            check(
+                state,
+                delegate.e2e_file_count() == 2,
+                "the filter narrows the grid to the matches",
+            );
+            check(
+                state,
+                delegate.e2e_status_text().ends_with("2 of 4 images"),
+                "status bar counts what is hidden",
+            );
+        }
+        49 => {
+            // Case is ignored, and select-all takes the matches only.
+            delegate.e2e_type_filter("IMG1");
+            check(
+                state,
+                delegate.e2e_file_count() == 2,
+                "the filter ignores case",
+            );
+            delegate.e2e_select_all();
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("2 of 2 selected"),
+                "select all takes the matches only",
+            );
+            check(
+                state,
+                delegate.e2e_playlist_len().is_none(),
+                "no slideshow is running yet",
+            );
+            delegate.e2e_start_from_selection();
+        }
+        50 => {
+            check(
+                state,
+                delegate.e2e_playlist_len() == Some(2),
+                "a slideshow plays the matches only",
+            );
+            delegate.end_slideshow();
+            delegate.e2e_close_filter();
+        }
+        51 => {
+            check(state, !delegate.e2e_filter_open(), "escape closes the bar");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "closing the bar brings the folder back",
+            );
+            // A new folder starts unfiltered.
+            delegate.e2e_open_filter();
+            delegate.e2e_type_filter("img1");
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            delegate.e2e_sidebar_click(&root);
+        }
+        52 => {
+            check(state, !delegate.e2e_filter_open(), "a folder change closes the bar");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "a folder change clears the filter",
+            );
+        }
+        53 => {
+            // New files show up only when they match.
+            delegate.e2e_open_filter();
+            delegate.e2e_type_filter("img1");
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let pid = std::process::id();
+            let matching = std::fs::copy(
+                format!("{root}/img1.heic"),
+                format!("{root}/img1-extra-{pid}.heic"),
+            )
+            .is_ok();
+            let other = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/zzz-hidden-{pid}.heic"),
+            )
+            .is_ok();
+            check(state, matching && other, "two more files copied in");
+        }
+        54 => {
+            check(
+                state,
+                delegate.e2e_file_count() == 3,
+                "only the matching new file joins the grid",
+            );
+            check(
+                state,
+                delegate.e2e_status_text().ends_with("3 of 6 images"),
+                "the count knows about the hidden file",
+            );
+            delegate.e2e_close_filter();
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let pid = std::process::id();
+            let _ = std::fs::remove_file(format!("{root}/img1-extra-{pid}.heic"));
+            let _ = std::fs::remove_file(format!("{root}/zzz-hidden-{pid}.heic"));
+        }
+        55 => {
+            check(state, delegate.e2e_file_count() == 4, "grid back to the fixture");
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {
