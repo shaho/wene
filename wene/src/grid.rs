@@ -540,8 +540,12 @@ impl GridView {
         self.notify_selection();
     }
 
-    /// Watcher removals: drop rows, remap selection and focus.
+    /// Watcher removals: drop rows, remap selection and focus. A
+    /// removal the app already applied changes nothing, and must not
+    /// redraw or re-announce the selection: the status bar is showing
+    /// what the app just did.
     pub fn remove_paths(&self, paths: &[PathBuf]) {
+        let mut removed = 0;
         {
             let mut files = self.ivars().files.borrow_mut();
             for path in paths {
@@ -549,6 +553,7 @@ impl GridView {
                     continue;
                 };
                 files.remove(index);
+                removed += 1;
                 self.ivars().thumbs.borrow_mut().remove(path);
                 self.ivars().requested.borrow_mut().remove(path);
                 let mut selected = self.ivars().selected.borrow_mut();
@@ -569,8 +574,57 @@ impl GridView {
                 }
             }
         }
+        if removed == 0 {
+            return;
+        }
         let width = self.frame().size.width;
         self.setFrameSize(CGSize::new(width, 0.0));
+        self.setNeedsDisplay(true);
+        self.notify_selection();
+    }
+
+    /// The files the user picked, for an action that works on them.
+    pub fn selected_paths(&self) -> Vec<PathBuf> {
+        let files = self.ivars().files.borrow();
+        self.ivars()
+            .selected
+            .borrow()
+            .iter()
+            .filter_map(|&i| files.get(i).map(|f| f.path.clone()))
+            .collect()
+    }
+
+    /// Drop the rows the app just trashed and select the image that
+    /// slid into the last deleted one's place, so holding the key
+    /// culls a run. Deleting the last image steps back instead.
+    pub fn remove_trashed(&self, paths: &[PathBuf]) {
+        let follower = {
+            let files = self.ivars().files.borrow();
+            let mut indices: Vec<usize> = paths
+                .iter()
+                .filter_map(|path| files.iter().position(|f| &f.path == path))
+                .collect();
+            indices.sort_unstable();
+            indices
+                .last()
+                .map(|&last| (last + 1).saturating_sub(indices.len()))
+        };
+        self.remove_paths(paths);
+        let count = self.ivars().files.borrow().len();
+        let Some(follower) = follower.filter(|_| count > 0) else {
+            self.notify_selection();
+            return;
+        };
+        let index = follower.min(count - 1);
+        {
+            let mut selected = self.ivars().selected.borrow_mut();
+            selected.clear();
+            selected.insert(index);
+        }
+        self.ivars().focus.set(Some(index));
+        self.ivars().anchor.set(Some(index));
+        let cols = self.columns(self.bounds().size.width);
+        self.scrollRectToVisible(self.cell_rect(index, cols));
         self.setNeedsDisplay(true);
         self.notify_selection();
     }

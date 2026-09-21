@@ -58,9 +58,9 @@ fn check(state: &RefCell<E2eState>, ok: bool, what: &str) {
     }
 }
 
-/// Fire an item of the Slideshow menu through NSMenu's own action
-/// dispatch, the same target/responder resolution as a user click.
-fn perform_slideshow_menu_item(index: isize) -> bool {
+/// Fire a menu item through NSMenu's own action dispatch, the same
+/// target and responder resolution as a user click.
+fn perform_menu_item(menu_title: &str, index: isize) -> bool {
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         return false;
     };
@@ -68,12 +68,26 @@ fn perform_slideshow_menu_item(index: isize) -> bool {
     let Some(menubar) = app.mainMenu() else { return false };
     for item in menubar.itemArray() {
         let Some(submenu) = item.submenu() else { continue };
-        if submenu.title().to_string() == "Slideshow" {
+        if submenu.title().to_string() == menu_title {
             submenu.performActionForItemAtIndex(index);
             return true;
         }
     }
     false
+}
+
+/// Name of a cull test file. The process id keeps it unique, so the
+/// trash can never rename it and the cleanup can never hit a file
+/// that was already there.
+fn cull_name(tag: &str) -> String {
+    format!("zzz-cull-{}-{tag}.heic", std::process::id())
+}
+
+/// Take a cull test file back out of the trash, so a run leaves
+/// nothing behind.
+fn empty_from_trash(name: &str) {
+    let Ok(home) = std::env::var("HOME") else { return };
+    let _ = std::fs::remove_file(format!("{home}/.Trash/{name}"));
 }
 
 fn snapshot(view: &NSView, path: &str) -> bool {
@@ -260,7 +274,7 @@ pub fn run_step(delegate: &AppDelegate) {
             // way a click does (no synthetic OS events).
             check(
                 state,
-                perform_slideshow_menu_item(1),
+                perform_menu_item("Slideshow", 1),
                 "menu item 'Start slideshow in window' fired",
             );
         }
@@ -276,7 +290,7 @@ pub fn run_step(delegate: &AppDelegate) {
         22 => {
             check(
                 state,
-                perform_slideshow_menu_item(0),
+                perform_menu_item("Slideshow", 0),
                 "menu item 'Start slideshow' fired",
             );
         }
@@ -427,6 +441,83 @@ pub fn run_step(delegate: &AppDelegate) {
                 delegate.e2e_first_file().as_deref() == Some("apple.heic"),
                 "name order restored after date sorts",
             );
+        }
+        35 => {
+            // Trash from the grid: cull a copy, not a fixture file.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let copied = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/{}", cull_name("a")),
+            )
+            .is_ok();
+            check(state, copied, "cull test file copied");
+        }
+        36 => {
+            check(state, delegate.e2e_file_count() == 5, "watcher saw the cull test file");
+            // Name order puts zzz-trash-a.heic last: index 4.
+            delegate.e2e_select(&[4]);
+            // File menu: 0 open folder, 1 separator, 2 move to trash.
+            check(
+                state,
+                perform_menu_item("File", 2),
+                "menu item 'Move to trash' fired",
+            );
+            check(state, delegate.e2e_file_count() == 4, "trashed image left the grid");
+            check(
+                state,
+                delegate.e2e_status_text() == format!("Moved to trash: {}", cull_name("a")),
+                "status bar names the trashed file",
+            );
+            check(
+                state,
+                delegate.e2e_selected_name().as_deref() == Some("img10.heic"),
+                "culling the last image steps the selection back",
+            );
+            empty_from_trash(&cull_name("a"));
+        }
+        37 => {
+            // A step later the watcher has echoed the app's own
+            // delete. That echo must change nothing, the status line
+            // included: it is the only record of what went.
+            check(
+                state,
+                delegate.e2e_status_text() == format!("Moved to trash: {}", cull_name("a")),
+                "watcher echo leaves the status line alone",
+            );
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let copied = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/{}", cull_name("b")),
+            )
+            .is_ok();
+            check(state, copied, "second cull test file copied");
+        }
+        38 => {
+            check(state, delegate.e2e_file_count() == 5, "watcher saw the second file");
+            delegate.start_slideshow(4, false);
+            check(
+                state,
+                perform_menu_item("File", 2),
+                "menu item 'Move to trash' fired with a show up",
+            );
+            check(state, delegate.e2e_show_active(), "slideshow stays up after a cull");
+            check(
+                state,
+                delegate.e2e_playlist_len() == Some(4),
+                "trashed slide left the playlist",
+            );
+            check(
+                state,
+                delegate
+                    .e2e_overlay_text()
+                    .is_some_and(|t| t == format!("Moved to trash: {}", cull_name("b"))),
+                "slide overlay names the trashed file",
+            );
+            delegate.end_slideshow();
+            empty_from_trash(&cull_name("b"));
+        }
+        39 => {
+            check(state, delegate.e2e_file_count() == 4, "grid back to the fixture");
         }
         _ => {
             let failures = state.borrow().failures.clone();

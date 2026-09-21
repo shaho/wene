@@ -5,6 +5,7 @@ mod e2e;
 mod grid;
 mod sidebar;
 mod slideshow;
+mod trash;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
@@ -60,6 +61,10 @@ struct Show {
     /// advancing (paused = interval set, timer gone).
     interval: Option<f64>,
     timer: Option<Retained<NSTimer>>,
+    /// A message shown over the slide for a moment, in place of the
+    /// usual overlay line. Fullscreen has no status bar.
+    flash: Option<String>,
+    flash_timer: Option<Retained<NSTimer>>,
 }
 
 pub struct DelegateIvars {
@@ -289,6 +294,29 @@ define_class!(
                 }
             }
             self.sync_prefs_controls();
+        }
+
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
+            self.menu_item_enabled(item)
+        }
+
+        #[unsafe(method(moveToTrash:))]
+        fn move_to_trash(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.trash_selection();
+        }
+
+        #[unsafe(method(clearFlash:))]
+        fn clear_flash(&self, _timer: Option<&objc2::runtime::AnyObject>) {
+            let overlay = {
+                let mut show = self.ivars().show.borrow_mut();
+                let Some(show) = show.as_mut() else { return };
+                show.flash = None;
+                show.flash_timer = None;
+                show.overlay.clone()
+            };
+            overlay.setHidden(!self.ivars().overlay_visible.get());
+            self.update_overlay();
         }
 
         #[unsafe(method(toggleSidebarMenu:))]
@@ -598,6 +626,130 @@ impl AppDelegate {
         }
     }
 
+    // ---- trash ----
+
+    /// Only "Move to trash" needs a rule: it works on the slideshow's
+    /// slide or the grid's selection, so with neither, and with the
+    /// preferences window in front, the item goes grey.
+    fn menu_item_enabled(&self, item: &NSMenuItem) -> bool {
+        if item.action() != Some(sel!(moveToTrash:)) {
+            return true;
+        }
+        let in_show = self.ivars().show.borrow().is_some();
+        let selected = self
+            .ivars()
+            .grid
+            .get()
+            .is_some_and(|grid| !grid.selected_paths().is_empty());
+        let prefs_key = self
+            .ivars()
+            .prefs_window
+            .get()
+            .is_some_and(|window| window.isKeyWindow());
+        (in_show || selected) && !prefs_key
+    }
+
+    /// cmd-Delete: move the slideshow's current slide, or the grid's
+    /// selection, to the system trash. No confirmation: the trash is
+    /// the safety net.
+    pub fn trash_selection(&self) {
+        let current = self
+            .ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .and_then(|show| show.playlist.current().cloned());
+        let paths = match current {
+            Some(path) => vec![path],
+            None => self.ivars().grid.get().map(|g| g.selected_paths()).unwrap_or_default(),
+        };
+        if paths.is_empty() {
+            return;
+        }
+
+        let failed = trash::move_to_trash(&paths);
+        let moved: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| !failed.contains(path))
+            .cloned()
+            .collect();
+
+        // The app's delete is the authority. The rows go now, so the
+        // watcher's echo a moment later finds nothing and does
+        // nothing.
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.remove_trashed(&moved);
+        }
+        self.drop_from_slideshow(&moved);
+
+        let message = trash_message(&moved, failed.len());
+        self.show_status_message(&message);
+        self.flash_overlay(&message);
+    }
+
+    /// Take gone files out of a running show, wherever the removal
+    /// came from, and end the show if that empties it.
+    fn drop_from_slideshow(&self, paths: &[PathBuf]) {
+        let (emptied, changed) = {
+            let mut show = self.ivars().show.borrow_mut();
+            let Some(show) = show.as_mut() else { return };
+            let before_len = show.playlist.len();
+            let before_current = show.playlist.current().cloned();
+            for path in paths {
+                show.playlist.remove(path);
+                show.cache.remove(path);
+                show.view_states.remove(path);
+            }
+            let changed = show.playlist.len() != before_len
+                || show.playlist.current().cloned() != before_current;
+            (show.playlist.is_empty(), changed)
+        };
+        if emptied {
+            self.end_slideshow();
+        } else if changed {
+            self.show_current();
+        }
+    }
+
+    /// Put a line in the status bar. The next selection or scan
+    /// replaces it.
+    fn show_status_message(&self, text: &str) {
+        if let Some(status) = self.ivars().status.get() {
+            status.setStringValue(&NSString::from_str(text));
+        }
+    }
+
+    /// Show a line over the slide for a moment, even when the overlay
+    /// is off: fullscreen has no status bar and no thumbnail to watch
+    /// vanish.
+    fn flash_overlay(&self, text: &str) {
+        let overlay = {
+            let mut show = self.ivars().show.borrow_mut();
+            let Some(show) = show.as_mut() else { return };
+            show.flash = Some(text.to_string());
+            // One timer at a time, so a second cull gets its own full
+            // moment on screen.
+            if let Some(timer) = show.flash_timer.take() {
+                timer.invalidate();
+            }
+            show.overlay.clone()
+        };
+        overlay.setHidden(false);
+        self.update_overlay();
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                2.0,
+                self,
+                sel!(clearFlash:),
+                None,
+                false,
+            )
+        };
+        if let Some(show) = self.ivars().show.borrow_mut().as_mut() {
+            show.flash_timer = Some(timer);
+        }
+    }
+
     // ---- status bar ----
 
     /// The grid calls this after any selection or file-list change.
@@ -701,6 +853,8 @@ impl AppDelegate {
             view_states: HashMap::new(),
             interval: None,
             timer: None,
+            flash: None,
+            flash_timer: None,
         });
         // Apply the remembered pace (menu pick or last key).
         if let Some(seconds) = self.ivars().default_interval.get() {
@@ -867,6 +1021,9 @@ impl AppDelegate {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            if let Some(flash) = show.flash.clone() {
+                (show.overlay.clone(), show.window.clone(), name, flash)
+            } else {
             let mut text = format!(
                 "{}/{}  {}",
                 show.playlist.current_index() + 1,
@@ -897,6 +1054,7 @@ impl AppDelegate {
                 text.push_str(&format!("  [{:.0}%]", zoom * 100.0));
             }
             (show.overlay.clone(), show.window.clone(), name, text)
+            }
         };
         overlay.setStringValue(&NSString::from_str(&text));
         // Visible as the title bar in windowed mode.
@@ -911,6 +1069,12 @@ impl AppDelegate {
         {
             let mut show = self.ivars().show.borrow_mut();
             let Some(show) = show.as_mut() else { return };
+            // A flash is about the slide that just left. The slide
+            // arriving now gets the usual line back.
+            if let Some(timer) = show.flash_timer.take() {
+                timer.invalidate();
+            }
+            show.flash = None;
 
             let mut wanted: Vec<PathBuf> = Vec::with_capacity(3);
             for delta in [-1i64, 0, 1] {
@@ -1102,6 +1266,19 @@ impl AppDelegate {
             .unwrap_or(0)
     }
 
+    /// The name of the first selected image, for selection checks.
+    pub fn e2e_selected_name(&self) -> Option<String> {
+        let (_, selected) = self.ivars().grid.get()?.selection_info();
+        selected
+            .first()
+            .and_then(|info| info.path.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+    }
+
+    pub fn e2e_trash_selection(&self) {
+        self.trash_selection();
+    }
+
     pub fn e2e_prefs_visible(&self) -> bool {
         self.ivars()
             .prefs_window
@@ -1147,22 +1324,7 @@ impl AppDelegate {
             }
             Event::FilesRemoved(paths) => {
                 self.ivars().grid.get().unwrap().remove_paths(&paths);
-                let current_gone = {
-                    let mut show = self.ivars().show.borrow_mut();
-                    if let Some(show) = show.as_mut() {
-                        let before = show.playlist.current().cloned();
-                        for path in &paths {
-                            show.playlist.remove(path);
-                            show.cache.remove(path);
-                        }
-                        before != show.playlist.current().cloned()
-                    } else {
-                        false
-                    }
-                };
-                if current_gone {
-                    self.show_current();
-                }
+                self.drop_from_slideshow(&paths);
             }
             Event::FileChanged(info) => {
                 let grid = self.ivars().grid.get().unwrap();
@@ -1245,7 +1407,11 @@ impl AppDelegate {
                 }
             }
             Event::DecodeFailed { path } => {
-                eprintln!("decode failed: {}", path.display());
+                // A culled image fails a request that was already in
+                // flight. That is not worth reporting.
+                if path.exists() {
+                    eprintln!("decode failed: {}", path.display());
+                }
             }
         }
     }
@@ -1393,6 +1559,30 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
     window
 }
 
+/// What the status bar and the slide overlay say after a delete.
+fn trash_message(moved: &[PathBuf], failed: usize) -> String {
+    let total = moved.len() + failed;
+    if moved.is_empty() {
+        return format!("{failed} of {total} could not be moved to trash");
+    }
+    // The line is the only record of what went, so it names files,
+    // not just a count.
+    let names: Vec<String> = moved
+        .iter()
+        .take(3)
+        .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        .collect();
+    let mut moved_text = format!("Moved to trash: {}", names.join(", "));
+    if moved.len() > names.len() {
+        moved_text.push_str(&format!(" and {} more", moved.len() - names.len()));
+    }
+    if failed == 0 {
+        moved_text
+    } else {
+        format!("{moved_text} — {failed} of {total} could not be moved to trash")
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -1454,6 +1644,17 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         )
     };
     file_menu.addItem(&open);
+    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // cmd-Delete, Finder's binding, in the grid and the slideshow.
+    let trash = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Move to trash"),
+            Some(sel!(moveToTrash:)),
+            &NSString::from_str("\u{8}"),
+        )
+    };
+    file_menu.addItem(&trash);
     file_item.setSubmenu(Some(&file_menu));
     menubar.addItem(&file_item);
 
