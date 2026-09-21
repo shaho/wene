@@ -724,6 +724,40 @@ impl GridView {
         self.notify_selection();
     }
 
+    /// Whether every one of these files is in the grid right now.
+    pub fn holds_all(&self, paths: &[PathBuf]) -> bool {
+        let files = self.ivars().files.borrow();
+        paths
+            .iter()
+            .all(|path| files.iter().any(|f| &f.path == path))
+    }
+
+    /// Select exactly these files, as far as the grid holds them,
+    /// and put the focus on the first one it found.
+    pub fn select_paths(&self, paths: &[PathBuf]) {
+        let indices: Vec<usize> = {
+            let files = self.ivars().files.borrow();
+            paths
+                .iter()
+                .filter_map(|path| files.iter().position(|f| &f.path == path))
+                .collect()
+        };
+        {
+            let mut selected = self.ivars().selected.borrow_mut();
+            selected.clear();
+            selected.extend(indices.iter().copied());
+        }
+        let first = indices.first().copied();
+        self.ivars().focus.set(first);
+        self.ivars().anchor.set(first);
+        if let Some(index) = first {
+            let cols = self.columns(self.bounds().size.width);
+            self.scrollRectToVisible(self.cell_rect(index, cols));
+        }
+        self.setNeedsDisplay(true);
+        self.notify_selection();
+    }
+
     /// Test hook: set the selection directly.
     pub fn e2e_set_selected(&self, indices: &[usize]) {
         {

@@ -24,8 +24,41 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSMinimumSystemVersion</key><string>11.5</string>
+  <!-- Image types wene can decode, so Finder offers it in Open With
+       and lets it be made the default. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Image</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Default</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.jpeg</string>
+        <string>public.png</string>
+        <string>public.heic</string>
+        <string>com.compuserve.gif</string>
+        <string>org.webmproject.webp</string>
+        <string>public.tiff</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Folder</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.folder</string>
+      </array>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST
+
+# Launch Services keeps the old document types until it re-reads the
+# bundle, so force it during development.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+[ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP" || true
 
 echo "built $APP"

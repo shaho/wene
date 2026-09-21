@@ -99,6 +99,15 @@ fn transfer_folder() -> String {
         .into_owned()
 }
 
+/// A folder of our own, to open from "Finder" and land somewhere
+/// other than the fixture.
+fn open_folder() -> String {
+    std::env::temp_dir()
+        .join(format!("wene-e2e-open-{}", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn transfer_name() -> String {
     format!("zzz-transfer-{}.heic", std::process::id())
 }
@@ -763,6 +772,89 @@ pub fn run_step(delegate: &AppDelegate) {
         }
         55 => {
             check(state, delegate.e2e_file_count() == 4, "grid back to the fixture");
+        }
+        56 => {
+            // Finder open: a file in the folder already showing.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            // A show is up and a filter is on, so the open has to
+            // clear both to leave the grid visible.
+            delegate.start_slideshow(0, false);
+            delegate.e2e_open_filter();
+            delegate.e2e_type_filter("apple");
+            delegate.open_from_finder(vec![std::path::PathBuf::from(format!(
+                "{root}/img2.heic"
+            ))]);
+            check(
+                state,
+                delegate.e2e_selected_name().as_deref() == Some("img2.heic"),
+                "an opened image is selected in the grid",
+            );
+            check(
+                state,
+                !delegate.e2e_show_active(),
+                "opening an image ends the slideshow instead of starting one",
+            );
+            check(
+                state,
+                !delegate.e2e_filter_open() && delegate.e2e_file_count() == 4,
+                "opening an image clears a filter that would hide it",
+            );
+        }
+        57 => {
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            delegate.open_from_finder(vec![
+                std::path::PathBuf::from(format!("{root}/img1.heic")),
+                std::path::PathBuf::from(format!("{root}/img2.heic")),
+            ]);
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("2 of 4 selected"),
+                "two opened images are both selected",
+            );
+            // A file in another folder: the grid follows it there.
+            let _ = std::fs::create_dir_all(open_folder());
+            let _ = std::fs::copy(
+                format!("{root}/apple.heic"),
+                format!("{}/apple.heic", open_folder()),
+            );
+            delegate.open_from_finder(vec![std::path::PathBuf::from(format!(
+                "{}/apple.heic",
+                open_folder()
+            ))]);
+        }
+        58 => {
+            check(
+                state,
+                delegate.e2e_file_count() == 1,
+                "opening a file elsewhere scans its folder",
+            );
+            check(
+                state,
+                delegate.e2e_selected_name().as_deref() == Some("apple.heic"),
+                "the opened image is selected once the scan lands",
+            );
+            check(
+                state,
+                delegate.e2e_sidebar_path().ends_with(
+                    std::path::Path::new(&open_folder())
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                ),
+                "the sidebar follows the opened image's folder",
+            );
+            // A folder opens as a folder.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            delegate.open_from_finder(vec![std::path::PathBuf::from(root)]);
+        }
+        59 => {
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "opening a folder shows that folder",
+            );
+            let _ = std::fs::remove_dir_all(open_folder());
         }
         _ => {
             let failures = state.borrow().failures.clone();

@@ -82,6 +82,12 @@ pub struct DelegateIvars {
     scroll: OnceCell<Retained<NSScrollView>>,
     filter_bar: OnceCell<Retained<objc2_app_kit::NSView>>,
     filter_field: OnceCell<Retained<NSTextField>>,
+    /// Images Finder asked for, waiting for their folder to finish
+    /// scanning so they can be selected.
+    pending_open: RefCell<Vec<PathBuf>>,
+    /// True once Finder has handed the app something to open, so
+    /// launch does not go off and restore the last folder instead.
+    opened_from_finder: Cell<bool>,
     /// The folder the grid shows and whether it was scanned deep, to
     /// skip no-op rescans.
     current_scan: RefCell<Option<(PathBuf, bool)>>,
@@ -165,16 +171,44 @@ define_class!(
     }
 
     unsafe impl NSApplicationDelegate for AppDelegate {
+        #[unsafe(method(application:openURLs:))]
+        fn application_open_urls(
+            &self,
+            _app: &NSApplication,
+            urls: &objc2_foundation::NSArray<objc2_foundation::NSURL>,
+        ) {
+            let paths: Vec<PathBuf> = urls
+                .iter()
+                .filter_map(|url| url.path())
+                .map(|path| PathBuf::from(path.to_string()))
+                .collect();
+            self.open_from_finder(paths);
+        }
+
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             self.load_prefs();
+            // Finder's open call arrives before this one on a cold
+            // start, and it has already picked the folder.
+            if self.ivars().opened_from_finder.get() {
+                return;
+            }
             // A folder argument skips everything else (useful for
             // scripted runs). Otherwise restore the last folder, then
             // the startup-folder preference, then Pictures.
-            let arg = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_dir());
-            if let Some(root) = arg {
-                self.scan_root(root, true);
-                return;
+            let arg = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.exists());
+            match arg {
+                Some(path) if path.is_dir() => {
+                    self.scan_root(path, true);
+                    return;
+                }
+                // An unbundled run gets its files on the command
+                // line, since Launch Services never sees it.
+                Some(path) => {
+                    self.open_from_finder(vec![path]);
+                    return;
+                }
+                None => {}
             }
             if let Some(root) = last_folder_pref().filter(|p| p.is_dir()) {
                 self.scan_root(root, false);
@@ -460,6 +494,8 @@ impl AppDelegate {
             scroll: OnceCell::new(),
             filter_bar: OnceCell::new(),
             filter_field: OnceCell::new(),
+            pending_open: RefCell::new(Vec::new()),
+            opened_from_finder: Cell::new(false),
             current_scan: RefCell::new(None),
             sidebar_item: OnceCell::new(),
             last_move: RefCell::new(None),
@@ -714,6 +750,76 @@ impl AppDelegate {
                 field.setStringValue(&NSString::from_str(&text));
             }
         }
+    }
+
+    // ---- opening from Finder ----
+
+    /// Finder handed the app files or a folder. The grid shows the
+    /// folder holding them, with the images selected. Starting the
+    /// slideshow stays the user's move.
+    pub fn open_from_finder(&self, paths: Vec<PathBuf>) {
+        // The grid is what the user asked to see, so a slideshow
+        // over it and a filter hiding half of it both go.
+        self.end_slideshow();
+        self.close_filter();
+        if let Some(window) = self.ivars().window.get() {
+            window.makeKeyAndOrderFront(None);
+        }
+        let Some(first) = paths.first().cloned() else { return };
+        if first.is_dir() {
+            // A folder opens as a folder, one level deep, like a
+            // click in the sidebar.
+            self.ivars().opened_from_finder.set(true);
+            self.scan_root(first, false);
+            return;
+        }
+        let files: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_file()).collect();
+        // A path that went away between the Finder gesture and the
+        // launch leaves the flag alone, so launch still restores the
+        // last folder instead of showing nothing.
+        let Some(folder) = files.first().and_then(|path| path.parent()).map(PathBuf::from) else {
+            return;
+        };
+        self.ivars().opened_from_finder.set(true);
+        // Calls can arrive one after another, so they add up rather
+        // than replace each other.
+        self.ivars().pending_open.borrow_mut().extend(files);
+        // A grid already holding them needs no rescan, which keeps a
+        // recursive cmd-O grid intact.
+        if self.select_pending() {
+            return;
+        }
+        self.scan_root(folder, false);
+    }
+
+    /// Select the images Finder asked for. False means the grid does
+    /// not hold them all yet, so their folder still has to be
+    /// scanned.
+    fn select_pending(&self) -> bool {
+        let pending = self.ivars().pending_open.borrow().clone();
+        if pending.is_empty() {
+            return true;
+        }
+        let Some(grid) = self.ivars().grid.get() else { return false };
+        // Only touch the selection once the grid really holds them.
+        // A scan of some other folder must leave it alone.
+        if !grid.holds_all(&pending) {
+            return false;
+        }
+        grid.select_paths(&pending);
+        self.ivars().pending_open.borrow_mut().clear();
+        self.focus_grid();
+        true
+    }
+
+    /// The folder the images waiting to be opened live in.
+    fn pending_folder(&self) -> Option<PathBuf> {
+        self.ivars()
+            .pending_open
+            .borrow()
+            .first()
+            .and_then(|path| path.parent())
+            .map(PathBuf::from)
     }
 
     // ---- filter ----
@@ -1744,6 +1850,17 @@ impl AppDelegate {
             }
             Event::ScanDone { total } => {
                 println!("scan done: {total} images");
+                // Their own folder has finished scanning and they
+                // are still not there: the files are gone from disk,
+                // so stop waiting for them. A scan of any other
+                // folder leaves them waiting.
+                let theirs = self.pending_folder();
+                if !self.select_pending()
+                    && theirs.is_some()
+                    && theirs == self.current_scan().map(|(root, _)| root)
+                {
+                    self.ivars().pending_open.borrow_mut().clear();
+                }
                 self.update_status();
                 if e2e::enabled() && !self.ivars().e2e.borrow().started {
                     self.ivars().e2e.borrow_mut().started = true;
