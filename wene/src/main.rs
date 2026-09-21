@@ -9,7 +9,7 @@ mod trash;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Mutex, OnceLock};
 
@@ -31,6 +31,7 @@ use objc2_foundation::{
     ns_string, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString, NSTimer,
     NSUserDefaults,
 };
+use wene_core::transfer::Transfer;
 use wene_core::{Engine, Event, LruCache, Playlist, SortOrder};
 
 use decoder::ImageIoDecoder;
@@ -77,6 +78,15 @@ pub struct DelegateIvars {
     /// skip no-op rescans.
     current_scan: RefCell<Option<(PathBuf, bool)>>,
     sidebar_item: OnceCell<Retained<NSMenuItem>>,
+    /// Targets of the last move and the last copy, for the repeat
+    /// actions. The menu items name them.
+    last_move: RefCell<Option<PathBuf>>,
+    last_copy: RefCell<Option<PathBuf>>,
+    move_again_item: OnceCell<Retained<NSMenuItem>>,
+    copy_again_item: OnceCell<Retained<NSMenuItem>>,
+    /// True while a batch runs, so a second one cannot start on top
+    /// of it and scribble over its progress line.
+    transfer_busy: Cell<bool>,
     prefs_window: OnceCell<Retained<NSWindow>>,
     /// Default slideshow mode from prefs; ⌥ at start inverts it.
     default_windowed: Cell<bool>,
@@ -306,6 +316,36 @@ define_class!(
             self.trash_selection();
         }
 
+        #[unsafe(method(moveToFolder:))]
+        fn move_to_folder(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if let Some(folder) = self.choose_folder(Transfer::Move) {
+                self.transfer_selection(folder, Transfer::Move);
+            }
+        }
+
+        #[unsafe(method(copyToFolder:))]
+        fn copy_to_folder(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if let Some(folder) = self.choose_folder(Transfer::Copy) {
+                self.transfer_selection(folder, Transfer::Copy);
+            }
+        }
+
+        #[unsafe(method(moveAgain:))]
+        fn move_again(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let folder = self.ivars().last_move.borrow().clone();
+            if let Some(folder) = folder {
+                self.transfer_selection(folder, Transfer::Move);
+            }
+        }
+
+        #[unsafe(method(copyAgain:))]
+        fn copy_again(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            let folder = self.ivars().last_copy.borrow().clone();
+            if let Some(folder) = folder {
+                self.transfer_selection(folder, Transfer::Copy);
+            }
+        }
+
         #[unsafe(method(clearFlash:))]
         fn clear_flash(&self, _timer: Option<&objc2::runtime::AnyObject>) {
             let overlay = {
@@ -380,6 +420,11 @@ impl AppDelegate {
             split: OnceCell::new(),
             current_scan: RefCell::new(None),
             sidebar_item: OnceCell::new(),
+            last_move: RefCell::new(None),
+            last_copy: RefCell::new(None),
+            move_again_item: OnceCell::new(),
+            copy_again_item: OnceCell::new(),
+            transfer_busy: Cell::new(false),
             prefs_window: OnceCell::new(),
             default_windowed: Cell::new(false),
             show: RefCell::new(None),
@@ -626,14 +671,154 @@ impl AppDelegate {
         }
     }
 
+    // ---- move and copy ----
+
+    /// Ask for the target folder. Cancel returns None.
+    fn choose_folder(&self, kind: Transfer) -> Option<PathBuf> {
+        let mtm = self.mtm();
+        let panel = NSOpenPanel::openPanel(mtm);
+        panel.setCanChooseDirectories(true);
+        panel.setCanChooseFiles(false);
+        panel.setAllowsMultipleSelection(false);
+        // Culling usually invents its target folder ("Keepers") on
+        // the spot.
+        panel.setCanCreateDirectories(true);
+        panel.setPrompt(Some(&NSString::from_str(match kind {
+            Transfer::Move => "Move",
+            Transfer::Copy => "Copy",
+        })));
+        if panel.runModal() != objc2_app_kit::NSModalResponseOK {
+            return None;
+        }
+        let path = panel.URL()?.path()?;
+        Some(PathBuf::from(path.to_string()))
+    }
+
+    /// Send the images to `folder` on a background thread, so a long
+    /// batch (a move to another disk is a copy and a delete) leaves
+    /// the window usable. Each file reports back as it lands, and the
+    /// status bar carries the count and then the result.
+    fn transfer_selection(&self, folder: PathBuf, kind: Transfer) {
+        let paths = self.action_targets();
+        if paths.is_empty() || self.ivars().transfer_busy.get() {
+            return;
+        }
+        self.ivars().transfer_busy.set(true);
+
+        let total = paths.len();
+        std::thread::spawn(move || {
+            let mut done: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(total);
+            let mut renamed = 0usize;
+            let mut failed = 0usize;
+            for (index, source) in paths.iter().enumerate() {
+                if total > 1 {
+                    let line = format!("{} {} of {total}…", kind.present(), index + 1);
+                    on_main(move |delegate| delegate.show_status_message(&line));
+                }
+                match kind.apply(source, &folder) {
+                    Ok(transferred) => {
+                        renamed += usize::from(transferred.renamed);
+                        // The row leaves now, not at the end of the
+                        // batch, so the watcher never gets there
+                        // first and the selection keeps stepping.
+                        if kind == Transfer::Move {
+                            let source = source.clone();
+                            on_main(move |delegate| delegate.moved_away(&source));
+                        }
+                        done.push((source.clone(), transferred.target));
+                    }
+                    Err(error) => {
+                        eprintln!("{} failed: {}: {error}", kind.past(), source.display());
+                        failed += 1;
+                    }
+                }
+            }
+            on_main(move |delegate| delegate.finish_transfer(kind, done, folder, renamed, failed));
+        });
+    }
+
+    /// One image has left the folder: its row goes, and the
+    /// selection steps onto whatever slid into its place.
+    fn moved_away(&self, source: &Path) {
+        let gone = [source.to_path_buf()];
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.remove_and_advance(&gone);
+        }
+        self.drop_from_slideshow(&gone);
+    }
+
+    /// Back on the main thread when the batch ends: remember the
+    /// folder, name the repeat items after it, and say what happened.
+    fn finish_transfer(
+        &self,
+        kind: Transfer,
+        done: Vec<(PathBuf, PathBuf)>,
+        folder: PathBuf,
+        renamed: usize,
+        failed: usize,
+    ) {
+        self.ivars().transfer_busy.set(false);
+        if !done.is_empty() {
+            // Only a folder that took files is worth repeating to.
+            let slot = match kind {
+                Transfer::Move => &self.ivars().last_move,
+                Transfer::Copy => &self.ivars().last_copy,
+            };
+            *slot.borrow_mut() = Some(folder.clone());
+            self.sync_repeat_items();
+        }
+        let message = transfer_message(kind, &done, &folder, renamed, failed);
+        self.show_status_message(&message);
+        self.flash_overlay(&message);
+    }
+
+    /// Name the repeat items after their folders.
+    fn sync_repeat_items(&self) {
+        for (item, folder, verb) in [
+            (
+                self.ivars().move_again_item.get(),
+                self.ivars().last_move.borrow().clone(),
+                "Move",
+            ),
+            (
+                self.ivars().copy_again_item.get(),
+                self.ivars().last_copy.borrow().clone(),
+                "Copy",
+            ),
+        ] {
+            let Some(item) = item else { continue };
+            let title = match folder {
+                Some(folder) => format!("{verb} again to {}", folder_label(&folder)),
+                None => format!("{verb} again"),
+            };
+            item.setTitle(&NSString::from_str(&title));
+        }
+    }
+
     // ---- trash ----
 
-    /// Only "Move to trash" needs a rule: it works on the slideshow's
-    /// slide or the grid's selection, so with neither, and with the
-    /// preferences window in front, the item goes grey.
+    /// Items that act on images need something to act on: the
+    /// slideshow's slide or the grid's selection. The repeat items
+    /// also need a folder to repeat to.
     fn menu_item_enabled(&self, item: &NSMenuItem) -> bool {
-        if item.action() != Some(sel!(moveToTrash:)) {
+        let action = item.action();
+        let acts_on_images = [
+            sel!(moveToTrash:),
+            sel!(moveToFolder:),
+            sel!(copyToFolder:),
+            sel!(moveAgain:),
+            sel!(copyAgain:),
+        ]
+        .iter()
+        .any(|wanted| action == Some(*wanted));
+        if !acts_on_images {
             return true;
+        }
+        if action == Some(sel!(moveAgain:)) && self.ivars().last_move.borrow().is_none() {
+            return false;
+        }
+        if action == Some(sel!(copyAgain:)) && self.ivars().last_copy.borrow().is_none() {
+            return false;
         }
         let in_show = self.ivars().show.borrow().is_some();
         let selected = self
@@ -649,20 +834,26 @@ impl AppDelegate {
         (in_show || selected) && !prefs_key
     }
 
-    /// cmd-Delete: move the slideshow's current slide, or the grid's
-    /// selection, to the system trash. No confirmation: the trash is
-    /// the safety net.
-    pub fn trash_selection(&self) {
+    /// The images an action works on: the slide on screen during a
+    /// slideshow, the grid's selection otherwise.
+    fn action_targets(&self) -> Vec<PathBuf> {
         let current = self
             .ivars()
             .show
             .borrow()
             .as_ref()
             .and_then(|show| show.playlist.current().cloned());
-        let paths = match current {
+        match current {
             Some(path) => vec![path],
             None => self.ivars().grid.get().map(|g| g.selected_paths()).unwrap_or_default(),
-        };
+        }
+    }
+
+    /// cmd-Delete: move the slideshow's current slide, or the grid's
+    /// selection, to the system trash. No confirmation: the trash is
+    /// the safety net.
+    pub fn trash_selection(&self) {
+        let paths = self.action_targets();
         if paths.is_empty() {
             return;
         }
@@ -678,7 +869,7 @@ impl AppDelegate {
         // watcher's echo a moment later finds nothing and does
         // nothing.
         if let Some(grid) = self.ivars().grid.get() {
-            grid.remove_trashed(&moved);
+            grid.remove_and_advance(&moved);
         }
         self.drop_from_slideshow(&moved);
 
@@ -1275,6 +1466,25 @@ impl AppDelegate {
             .map(|n| n.to_string_lossy().into_owned())
     }
 
+    /// Drive a move or a copy without the folder chooser.
+    pub fn e2e_transfer(&self, folder: &str, moving: bool) {
+        let kind = if moving { Transfer::Move } else { Transfer::Copy };
+        self.transfer_selection(PathBuf::from(folder), kind);
+    }
+
+    pub fn e2e_transfer_busy(&self) -> bool {
+        self.ivars().transfer_busy.get()
+    }
+
+    pub fn e2e_repeat_item_title(&self, moving: bool) -> String {
+        let item = if moving {
+            self.ivars().move_again_item.get()
+        } else {
+            self.ivars().copy_again_item.get()
+        };
+        item.map(|i| i.title().to_string()).unwrap_or_default()
+    }
+
     pub fn e2e_trash_selection(&self) {
         self.trash_selection();
     }
@@ -1559,6 +1769,51 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
     window
 }
 
+/// Run `f` on the main thread with the app delegate, from a worker.
+fn on_main(f: impl FnOnce(&AppDelegate) + Send + 'static) {
+    DispatchQueue::main().exec_async(move || {
+        let mtm = MainThreadMarker::new().expect("main queue is the main thread");
+        f(DELEGATE.get().expect("delegate is set at launch").get(mtm));
+    });
+}
+
+/// A folder's own name, for menu titles and status lines.
+fn folder_label(folder: &Path) -> String {
+    folder
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| folder.to_string_lossy().into_owned())
+}
+
+/// What the status bar and the slide overlay say after a move or a
+/// copy. A single file is named by the name it has now, which is the
+/// only record of a rename.
+fn transfer_message(
+    kind: Transfer,
+    done: &[(PathBuf, PathBuf)],
+    folder: &Path,
+    renamed: usize,
+    failed: usize,
+) -> String {
+    let verb = kind.past();
+    let target = folder_label(folder);
+    let mut text = match done {
+        [] => format!("Nothing {} to {target}", verb.to_lowercase()),
+        [(_, one)] => format!(
+            "{verb} {} to {target}",
+            one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        ),
+        many => format!("{verb} {} images to {target}", many.len()),
+    };
+    if renamed > 0 {
+        text.push_str(&format!(", {renamed} renamed"));
+    }
+    if failed > 0 {
+        text.push_str(&format!(", {failed} failed"));
+    }
+    text
+}
+
 /// What the status bar and the slide overlay say after a delete.
 fn trash_message(moved: &[PathBuf], failed: usize) -> String {
     let total = moved.len() + failed;
@@ -1655,6 +1910,37 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         )
     };
     file_menu.addItem(&trash);
+    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Plain cmd-M is the system minimize, and cmd-C stays free for a
+    // copy to the clipboard later.
+    for (title, action, key, shift) in [
+        ("Move to…", sel!(moveToFolder:), "m", true),
+        ("Copy to…", sel!(copyToFolder:), "c", true),
+        ("Move again", sel!(moveAgain:), "m", false),
+        ("Copy again", sel!(copyAgain:), "c", false),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        item.setKeyEquivalentModifierMask(if shift {
+            objc2_app_kit::NSEventModifierFlags::Command
+                | objc2_app_kit::NSEventModifierFlags::Shift
+        } else {
+            objc2_app_kit::NSEventModifierFlags::Command
+                | objc2_app_kit::NSEventModifierFlags::Control
+        });
+        file_menu.addItem(&item);
+        if action == sel!(moveAgain:) {
+            let _ = delegate.ivars().move_again_item.set(item);
+        } else if action == sel!(copyAgain:) {
+            let _ = delegate.ivars().copy_again_item.set(item);
+        }
+    }
     file_item.setSubmenu(Some(&file_menu));
     menubar.addItem(&file_item);
 

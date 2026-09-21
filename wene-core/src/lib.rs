@@ -570,5 +570,6 @@ mod tests {
 
 pub mod cache;
 pub mod playlist;
+pub mod transfer;
 pub use cache::LruCache;
 pub use playlist::Playlist;

@@ -594,10 +594,11 @@ impl GridView {
             .collect()
     }
 
-    /// Drop the rows the app just trashed and select the image that
-    /// slid into the last deleted one's place, so holding the key
-    /// culls a run. Deleting the last image steps back instead.
-    pub fn remove_trashed(&self, paths: &[PathBuf]) {
+    /// Drop rows the app itself removed (trashed or moved away) and
+    /// select the image that slid into the last one's place, so
+    /// holding the keys works through a run. Removing the last image
+    /// steps back instead.
+    pub fn remove_and_advance(&self, paths: &[PathBuf]) {
         let follower = {
             let files = self.ivars().files.borrow();
             let mut indices: Vec<usize> = paths

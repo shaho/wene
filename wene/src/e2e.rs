@@ -90,6 +90,19 @@ fn empty_from_trash(name: &str) {
     let _ = std::fs::remove_file(format!("{home}/.Trash/{name}"));
 }
 
+/// The folder move and copy send files to, outside the fixture so a
+/// recursive scan never sees them again.
+fn transfer_folder() -> String {
+    std::env::temp_dir()
+        .join(format!("wene-e2e-transfer-{}", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn transfer_name() -> String {
+    format!("zzz-transfer-{}.heic", std::process::id())
+}
+
 fn snapshot(view: &NSView, path: &str) -> bool {
     let bounds = view.bounds();
     let Some(rep) = view.bitmapImageRepForCachingDisplayInRect(bounds) else {
@@ -518,6 +531,132 @@ pub fn run_step(delegate: &AppDelegate) {
         }
         39 => {
             check(state, delegate.e2e_file_count() == 4, "grid back to the fixture");
+        }
+        40 => {
+            // Move and copy: a test file of our own, into a folder
+            // outside the fixture.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let made = std::fs::create_dir_all(transfer_folder()).is_ok();
+            let copied = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/{}", transfer_name()),
+            )
+            .is_ok();
+            check(state, made && copied, "transfer test folder and file ready");
+        }
+        41 => {
+            check(state, delegate.e2e_file_count() == 5, "watcher saw the transfer file");
+            // Name order puts the zzz file last: index 4.
+            delegate.e2e_select(&[4]);
+            delegate.e2e_transfer(&transfer_folder(), true);
+        }
+        42 => {
+            check(state, !delegate.e2e_transfer_busy(), "the batch finished");
+            check(state, delegate.e2e_file_count() == 4, "moved image left the grid");
+            check(
+                state,
+                std::path::Path::new(&format!("{}/{}", transfer_folder(), transfer_name()))
+                    .exists(),
+                "moved image arrived in the target folder",
+            );
+            let folder_name = std::path::Path::new(&transfer_folder())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            check(
+                state,
+                delegate.e2e_status_text()
+                    == format!("Moved {} to {folder_name}", transfer_name()),
+                "status bar names the moved file and its folder",
+            );
+            check(
+                state,
+                delegate.e2e_repeat_item_title(true) == format!("Move again to {folder_name}"),
+                "the repeat item names the last folder",
+            );
+            check(
+                state,
+                delegate.e2e_selected_name().as_deref() == Some("img10.heic"),
+                "a move steps the selection like a delete",
+            );
+            // A second file of the same name, to collide on the move.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let _ = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/{}", transfer_name()),
+            );
+        }
+        43 => {
+            check(state, delegate.e2e_file_count() == 5, "watcher saw the second file");
+            delegate.e2e_select(&[4]);
+            // File menu: 4 move to, 5 copy to, 6 move again.
+            check(
+                state,
+                perform_menu_item("File", 6),
+                "menu item 'Move again' fired",
+            );
+        }
+        44 => {
+            check(state, delegate.e2e_file_count() == 4, "second move left the grid");
+            let stem_now = transfer_name().trim_end_matches(".heic").to_string();
+            check(
+                state,
+                delegate.e2e_status_text().contains(&format!("{stem_now} 2.heic"))
+                    && delegate.e2e_status_text().ends_with(", 1 renamed"),
+                "status bar names the file by its new name and reports the rename",
+            );
+            let stem = transfer_name().trim_end_matches(".heic").to_string();
+            check(
+                state,
+                std::path::Path::new(&format!("{}/{stem} 2.heic", transfer_folder())).exists(),
+                "the collision kept both files",
+            );
+            // Copy leaves the grid alone.
+            delegate.e2e_select(&[0]);
+            delegate.e2e_transfer(&transfer_folder(), false);
+        }
+        45 => {
+            check(state, delegate.e2e_file_count() == 4, "a copy leaves the grid alone");
+            check(
+                state,
+                std::path::Path::new(&format!("{}/apple.heic", transfer_folder())).exists(),
+                "copied image arrived in the target folder",
+            );
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("Copied apple.heic to "),
+                "status bar names the copied file",
+            );
+            // Two files at once, to check the batch line and that
+            // the grid loses both.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            for tag in ["m1", "m2"] {
+                let _ = std::fs::copy(
+                    format!("{root}/img1.heic"),
+                    format!("{root}/zzz-{tag}-{}.heic", std::process::id()),
+                );
+            }
+        }
+        46 => {
+            check(state, delegate.e2e_file_count() == 6, "watcher saw both batch files");
+            delegate.e2e_select(&[4, 5]);
+            delegate.e2e_transfer(&transfer_folder(), true);
+        }
+        47 => {
+            check(state, !delegate.e2e_transfer_busy(), "the two-file batch finished");
+            check(state, delegate.e2e_file_count() == 4, "the batch left the grid");
+            let folder_name = std::path::Path::new(&transfer_folder())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            check(
+                state,
+                delegate.e2e_status_text() == format!("Moved 2 images to {folder_name}"),
+                "status bar counts a batch",
+            );
+            let _ = std::fs::remove_dir_all(transfer_folder());
         }
         _ => {
             let failures = state.borrow().failures.clone();
