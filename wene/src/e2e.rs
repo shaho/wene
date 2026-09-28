@@ -932,6 +932,36 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             delegate.e2e_remove_favorite(&root);
         }
+        63 => {
+            // A folder dragged into Favorites lands in the gap it was
+            // dropped in, and dragging one that is already there moves
+            // it instead of doubling it.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let before = delegate.e2e_favorite_count();
+            delegate.e2e_insert_favorite(&root, 0);
+            let names = delegate.e2e_favorite_names();
+            check(
+                state,
+                delegate.e2e_favorite_count() == before + 1
+                    && names.first().map(String::as_str)
+                        == std::path::Path::new(&root).file_name().and_then(|n| n.to_str()),
+                "a folder dropped at the top of Favorites lands there",
+            );
+            delegate.e2e_insert_favorite(&root, 3);
+            let names = delegate.e2e_favorite_names();
+            check(
+                state,
+                delegate.e2e_favorite_count() == before + 1
+                    && names.first().map(String::as_str) != std::path::Path::new(&root).file_name().and_then(|n| n.to_str()),
+                "dropping it again moves it instead of adding a second row",
+            );
+            delegate.e2e_remove_favorite(&root);
+            check(
+                state,
+                delegate.e2e_favorite_count() == before,
+                "Favorites is back to what it was",
+            );
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {

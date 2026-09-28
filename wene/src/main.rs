@@ -1758,6 +1758,27 @@ impl AppDelegate {
             .unwrap_or_default()
     }
 
+    /// Drop a folder into Favorites at `at`, the way a drag does.
+    pub fn e2e_insert_favorite(&self, path: &str, at: usize) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.insert_favorite(std::path::Path::new(path), at);
+        }
+    }
+
+    pub fn e2e_favorite_names(&self) -> Vec<String> {
+        self.ivars()
+            .sidebar
+            .get()
+            .map(|sidebar| {
+                sidebar
+                    .e2e_favorites()
+                    .iter()
+                    .filter_map(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn e2e_favorite_count(&self) -> usize {
         self.ivars()
             .sidebar

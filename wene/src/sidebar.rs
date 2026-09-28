@@ -18,9 +18,9 @@ use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOn
 use objc2_app_kit::{
     NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent, NSEventModifierFlags,
     NSImage, NSImageView, NSMenu, NSMenuDelegate, NSMenuItem, NSOutlineView, NSOutlineViewDataSource,
-    NSOutlineViewDelegate, NSOutlineViewDropOnItemIndex, NSPasteboardTypeFileURL, NSScrollView,
-    NSTableCellView, NSTableColumn, NSTableViewRowSizeStyle, NSTableViewStyle, NSTextField, NSView,
-    NSWorkspace,
+    NSOutlineViewDelegate, NSOutlineViewDropOnItemIndex, NSPasteboardItem, NSPasteboardTypeFileURL,
+    NSPasteboardWriting, NSScrollView, NSTableCellView, NSTableColumn, NSTableViewRowSizeStyle,
+    NSTableViewStyle, NSTextField, NSView, NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGSize};
 use objc2_foundation::{
@@ -127,8 +127,20 @@ define_class!(
             self.expandable(item)
         }
 
-        // A drop is only ever on a folder row, never between rows:
-        // the tree has no order to insert into.
+        // Folder rows can be picked up, so a folder can be dragged
+        // into Favorites. Section headers cannot.
+        #[unsafe(method_id(outlineView:pasteboardWriterForItem:))]
+        #[unsafe(method_family = none)]
+        fn pasteboard_writer_for_item(
+            &self,
+            _outline: &NSOutlineView,
+            item: &AnyObject,
+        ) -> Option<Retained<ProtocolObject<dyn NSPasteboardWriting>>> {
+            self.row_pasteboard_writer(item)
+        }
+
+        // Two drops share this view. Folders land in Favorites, at the
+        // place they were dropped. Images land in a folder.
         #[unsafe(method(outlineView:validateDrop:proposedItem:proposedChildIndex:))]
         fn validate_drop(
             &self,
@@ -137,14 +149,32 @@ define_class!(
             item: Option<&AnyObject>,
             index: NSInteger,
         ) -> NSDragOperation {
+            let paths = dropped_paths(info);
+            if paths.iter().all(|path| path.is_dir()) {
+                return match self.favorites_slot(item, index) {
+                    Some(slot) => {
+                        // Aim every folder drop at the gap it was
+                        // dropped in, whichever row it was over.
+                        unsafe {
+                            outline.setDropItem_dropChildIndex(
+                                Some(&item_for(self.ivars().favorites_root.get())),
+                                slot as NSInteger,
+                            )
+                        };
+                        NSDragOperation::Generic
+                    }
+                    None => NSDragOperation::None,
+                };
+            }
             let Some(target) = self.drop_target(item) else {
                 return NSDragOperation::None;
             };
-            if !drop_allowed(&target, &dropped_paths(info)) {
+            if !drop_allowed(&target, &paths) {
                 return NSDragOperation::None;
             }
             if index != NSOutlineViewDropOnItemIndex as NSInteger {
-                // Retarget a drop between rows onto the row itself.
+                // An image dropped between rows lands in the row's
+                // folder: the tree has no order to insert into.
                 unsafe {
                     outline.setDropItem_dropChildIndex(
                         item,
@@ -161,9 +191,9 @@ define_class!(
             _outline: &NSOutlineView,
             info: &ProtocolObject<dyn NSDraggingInfo>,
             item: Option<&AnyObject>,
-            _index: NSInteger,
+            index: NSInteger,
         ) -> bool {
-            self.take_drop(info, item)
+            self.take_drop(info, item, index)
         }
     }
 
@@ -450,9 +480,18 @@ impl Sidebar {
         &self,
         info: &ProtocolObject<dyn NSDraggingInfo>,
         item: Option<&AnyObject>,
+        index: NSInteger,
     ) -> bool {
-        let Some(target) = self.drop_target(item) else { return false };
         let paths = dropped_paths(info);
+        if !paths.is_empty() && paths.iter().all(|path| path.is_dir()) {
+            let Some(slot) = self.favorites_slot(item, index) else { return false };
+            // Dropped together, they keep the order they were in.
+            for (offset, path) in paths.iter().enumerate() {
+                self.insert_favorite(path, slot + offset);
+            }
+            return true;
+        }
+        let Some(target) = self.drop_target(item) else { return false };
         let Some(delegate) = self.ivars().delegate.get() else { return false };
         if paths.is_empty() {
             return false;
@@ -464,6 +503,41 @@ impl Sidebar {
         };
         delegate.transfer_paths(paths, target, kind);
         true
+    }
+
+    /// The file URL a folder row carries when it is dragged.
+    fn row_pasteboard_writer(
+        &self,
+        item: &AnyObject,
+    ) -> Option<Retained<ProtocolObject<dyn NSPasteboardWriting>>> {
+        let path = self.drop_target(Some(item))?;
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let entry = NSPasteboardItem::new();
+        unsafe {
+            entry.setString_forType(
+                &url.absoluteString().unwrap_or_default(),
+                NSPasteboardTypeFileURL,
+            )
+        };
+        Some(ProtocolObject::from_retained(entry))
+    }
+
+    /// Where a dropped folder would sit in Favorites, or None when the
+    /// drop is not aimed at that section. A drop on a favourite row
+    /// counts as the gap above it, so a folder never lands inside
+    /// another folder by accident.
+    fn favorites_slot(&self, item: Option<&AnyObject>, index: NSInteger) -> Option<usize> {
+        let root = self.ivars().favorites_root.get();
+        let target = index_of(item)?;
+        let children = self.with_node(root, |node| node.children.clone()).unwrap_or_default();
+        if target == root {
+            return Some(if index < 0 {
+                children.len()
+            } else {
+                index as usize
+            });
+        }
+        children.iter().position(|&child| child == target)
     }
 
     /// The folder a drop would land in: a folder row, never a section
@@ -556,6 +630,17 @@ impl Sidebar {
                 return;
             }
             favorites.push(path.to_path_buf());
+        }
+        self.save_favorites();
+        self.reload_section(self.ivars().favorites_root.get());
+    }
+
+    /// Put a folder in Favorites at `at`, moving it when it is already
+    /// there. This is what a drag into the section does.
+    pub fn insert_favorite(&self, path: &Path, at: usize) {
+        {
+            let mut favorites = self.ivars().favorites.borrow_mut();
+            reorder(&mut favorites, path, at);
         }
         self.save_favorites();
         self.reload_section(self.ivars().favorites_root.get());
@@ -701,6 +786,20 @@ fn dropped_paths(info: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
         .filter_map(|url| url.path())
         .map(|path| PathBuf::from(path.to_string()))
         .collect()
+}
+
+/// Insert `path` at `at`, or move it there when the list already holds
+/// it. Moving a row down has to account for the gap it leaves behind,
+/// or it lands one place short.
+fn reorder(list: &mut Vec<PathBuf>, path: &Path, at: usize) {
+    let mut at = at.min(list.len());
+    if let Some(old) = list.iter().position(|held| held == path) {
+        list.remove(old);
+        if old < at {
+            at -= 1;
+        }
+    }
+    list.insert(at.min(list.len()), path.to_path_buf());
 }
 
 /// Whether a drop on `target` is worth taking: at least one image has
@@ -873,8 +972,36 @@ fn has_subfolder(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::drop_allowed;
+    use super::{drop_allowed, reorder};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_folder_lands_where_it_was_dropped() {
+        let mut list = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+        ];
+        // A new folder takes the gap it was dropped in.
+        reorder(&mut list, Path::new("/new"), 1);
+        assert_eq!(list[1], PathBuf::from("/new"));
+        assert_eq!(list.len(), 4);
+        // Past the end it goes last, and never out of bounds.
+        reorder(&mut list, Path::new("/last"), 99);
+        assert_eq!(list.last().unwrap(), &PathBuf::from("/last"));
+        // A row moved down accounts for the gap it leaves behind.
+        let mut list = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+        ];
+        reorder(&mut list, Path::new("/a"), 2);
+        assert_eq!(list, vec![PathBuf::from("/b"), PathBuf::from("/a"), PathBuf::from("/c")]);
+        // And moving up lands above the row it was dropped on.
+        reorder(&mut list, Path::new("/c"), 0);
+        assert_eq!(list[0], PathBuf::from("/c"));
+        assert_eq!(list.len(), 3);
+    }
 
     #[test]
     fn a_drop_needs_an_image_from_another_folder() {
