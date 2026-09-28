@@ -954,7 +954,12 @@ impl AppDelegate {
     /// the window usable. Each file reports back as it lands, and the
     /// status bar carries the count and then the result.
     fn transfer_selection(&self, folder: PathBuf, kind: Transfer) {
-        let paths = self.action_targets();
+        self.transfer_paths(self.action_targets(), folder, kind);
+    }
+
+    /// The same batch for images named by something other than the
+    /// selection, such as a drop on a sidebar folder.
+    pub fn transfer_paths(&self, paths: Vec<PathBuf>, folder: PathBuf, kind: Transfer) {
         if paths.is_empty() || self.ivars().transfer_busy.get() {
             return;
         }

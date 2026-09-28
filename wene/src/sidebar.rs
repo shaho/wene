@@ -16,17 +16,20 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSControlTextEditingDelegate, NSImage, NSImageView, NSMenu, NSMenuDelegate, NSMenuItem, NSOutlineView,
-    NSOutlineViewDataSource, NSOutlineViewDelegate, NSScrollView, NSTableCellView, NSTableColumn,
-    NSTableViewRowSizeStyle, NSTableViewStyle, NSTextField, NSView, NSWorkspace,
+    NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent, NSEventModifierFlags,
+    NSImage, NSImageView, NSMenu, NSMenuDelegate, NSMenuItem, NSOutlineView, NSOutlineViewDataSource,
+    NSOutlineViewDelegate, NSOutlineViewDropOnItemIndex, NSPasteboardTypeFileURL, NSScrollView,
+    NSTableCellView, NSTableColumn, NSTableViewRowSizeStyle, NSTableViewStyle, NSTextField, NSView,
+    NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGSize};
 use objc2_foundation::{
-    ns_string, NSIndexSet, NSNotification, NSNumber, NSObject, NSObjectProtocol, NSRect, NSString,
-    NSURL, NSUserDefaults,
+    ns_string, NSArray, NSIndexSet, NSInteger, NSNotification, NSNumber, NSObject,
+    NSObjectProtocol, NSRect, NSString, NSURL, NSUserDefaults,
 };
 
 use crate::{e2e, AppDelegate};
+use wene_core::transfer::Transfer;
 
 /// Width of the sidebar pane, and the limits the split view allows.
 pub const WIDTH: f64 = 200.0;
@@ -122,6 +125,45 @@ define_class!(
         #[unsafe(method(outlineView:isItemExpandable:))]
         fn is_item_expandable(&self, _outline: &NSOutlineView, item: &AnyObject) -> bool {
             self.expandable(item)
+        }
+
+        // A drop is only ever on a folder row, never between rows:
+        // the tree has no order to insert into.
+        #[unsafe(method(outlineView:validateDrop:proposedItem:proposedChildIndex:))]
+        fn validate_drop(
+            &self,
+            outline: &NSOutlineView,
+            info: &ProtocolObject<dyn NSDraggingInfo>,
+            item: Option<&AnyObject>,
+            index: NSInteger,
+        ) -> NSDragOperation {
+            let Some(target) = self.drop_target(item) else {
+                return NSDragOperation::None;
+            };
+            if !drop_allowed(&target, &dropped_paths(info)) {
+                return NSDragOperation::None;
+            }
+            if index != NSOutlineViewDropOnItemIndex as NSInteger {
+                // Retarget a drop between rows onto the row itself.
+                unsafe {
+                    outline.setDropItem_dropChildIndex(
+                        item,
+                        NSOutlineViewDropOnItemIndex as NSInteger,
+                    )
+                };
+            }
+            drop_kind()
+        }
+
+        #[unsafe(method(outlineView:acceptDrop:item:childIndex:))]
+        fn accept_drop(
+            &self,
+            _outline: &NSOutlineView,
+            info: &ProtocolObject<dyn NSDraggingInfo>,
+            item: Option<&AnyObject>,
+            _index: NSInteger,
+        ) -> bool {
+            self.take_drop(info, item)
         }
     }
 
@@ -253,6 +295,12 @@ impl Sidebar {
             outline.setTarget(Some(&this));
             outline.setAction(Some(objc2::sel!(rowClicked:)));
         }
+
+        // Images dragged out of the grid, or in from Finder, land
+        // on a folder row.
+        unsafe {
+            outline.registerForDraggedTypes(&NSArray::from_slice(&[NSPasteboardTypeFileURL]))
+        };
 
         let menu = NSMenu::new(mtm);
         menu.setDelegate(Some(ProtocolObject::from_ref(&*this)));
@@ -394,6 +442,35 @@ impl Sidebar {
             &self.path_of(index).to_string_lossy(),
         ));
         NSWorkspace::sharedWorkspace().openURL(&url);
+    }
+
+    /// File the dropped images into the row's folder. A plain drop
+    /// moves, the way Finder does inside one disk; option copies.
+    fn take_drop(
+        &self,
+        info: &ProtocolObject<dyn NSDraggingInfo>,
+        item: Option<&AnyObject>,
+    ) -> bool {
+        let Some(target) = self.drop_target(item) else { return false };
+        let paths = dropped_paths(info);
+        let Some(delegate) = self.ivars().delegate.get() else { return false };
+        if paths.is_empty() {
+            return false;
+        }
+        let kind = if drop_kind() == NSDragOperation::Copy {
+            Transfer::Copy
+        } else {
+            Transfer::Move
+        };
+        delegate.transfer_paths(paths, target, kind);
+        true
+    }
+
+    /// The folder a drop would land in: a folder row, never a section
+    /// header and never the gap below the last row.
+    fn drop_target(&self, item: Option<&AnyObject>) -> Option<PathBuf> {
+        let index = index_of(item)?;
+        self.with_node(index, |node| (!node.section).then(|| node.path.clone()))
     }
 
     fn path_of(&self, index: usize) -> PathBuf {
@@ -610,6 +687,40 @@ impl Sidebar {
     }
 }
 
+/// The images a drop carries, as paths. Anything that is not a file
+/// URL is ignored.
+fn dropped_paths(info: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
+    let pasteboard = info.draggingPasteboard();
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| unsafe { item.stringForType(NSPasteboardTypeFileURL) })
+        .filter_map(|text| NSURL::URLWithString(&text))
+        .filter_map(|url| url.path())
+        .map(|path| PathBuf::from(path.to_string()))
+        .collect()
+}
+
+/// Whether a drop on `target` is worth taking: at least one image has
+/// to come from somewhere else. A drop on the folder the images
+/// already sit in would do nothing.
+fn drop_allowed(target: &Path, paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| path.parent() != Some(target))
+}
+
+/// A drop moves, the way dragging inside one disk does in Finder, and
+/// copies while the option key is down.
+fn drop_kind() -> NSDragOperation {
+    let held = NSEvent::modifierFlags_class();
+    if held.contains(NSEventModifierFlags::Option) {
+        NSDragOperation::Copy
+    } else {
+        NSDragOperation::Move
+    }
+}
+
 /// The index an outline item stands for.
 fn index_of(item: Option<&AnyObject>) -> Option<usize> {
     item?.downcast_ref::<NSNumber>().map(|n| n.as_usize())
@@ -758,4 +869,25 @@ fn has_subfolder(path: &Path) -> bool {
             && e.path().is_dir()
             && !is_package(&e.path())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drop_allowed;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_drop_needs_an_image_from_another_folder() {
+        let target = Path::new("/pics/keepers");
+        let inside = vec![PathBuf::from("/pics/keepers/a.heic")];
+        let outside = vec![PathBuf::from("/pics/a.heic")];
+        let mixed = vec![
+            PathBuf::from("/pics/keepers/a.heic"),
+            PathBuf::from("/pics/b.heic"),
+        ];
+        assert!(!drop_allowed(target, &inside));
+        assert!(!drop_allowed(target, &[]));
+        assert!(drop_allowed(target, &outside));
+        assert!(drop_allowed(target, &mixed));
+    }
 }

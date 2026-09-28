@@ -11,11 +11,17 @@ use wene_core::transfer::Transfer;
 use wene_core::{file_info_cmp, FileInfo, LruCache, SortOrder};
 
 use objc2::rc::Retained;
-use objc2::runtime::Sel;
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSColor, NSEvent, NSImage, NSMenu, NSMenuItem, NSView};
+use objc2::runtime::{ProtocolObject, Sel};
+use objc2::{
+    define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
+};
+use objc2_app_kit::{
+    NSColor, NSDragOperation, NSDraggingItem, NSDraggingSession, NSDraggingSource,
+    NSDraggingContext, NSEvent, NSImage, NSMenu, NSMenuItem, NSPasteboardItem,
+    NSPasteboardTypeFileURL, NSView,
+};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSRect, NSString};
+use objc2_foundation::{NSArray, NSObjectProtocol, NSRect, NSString, NSURL};
 
 use crate::AppDelegate;
 
@@ -23,6 +29,8 @@ pub const CELL: f64 = 160.0;
 pub const PAD: f64 = 8.0;
 const MIN_CELL: f64 = 60.0;
 const MAX_CELL: f64 = 400.0;
+/// How far the pointer travels before a press becomes a drag.
+const DRAG_SLOP: f64 = 4.0;
 /// Height of the filename strip under a cell when labels are on.
 const LABEL_H: f64 = 16.0;
 /// Thumbnail memory budget. Evicted cells re-request on next draw.
@@ -48,6 +56,9 @@ pub struct GridIvars {
     anchor: Cell<Option<usize>>,
     /// Rubber-band drag state (origin, current point) in view coords.
     band: Cell<Option<(CGPoint, CGPoint)>>,
+    /// Where a press on a cell landed, until it turns into a drag of
+    /// the selection or the button comes up again.
+    press: Cell<Option<CGPoint>>,
     pub delegate: OnceCell<Retained<AppDelegate>>,
 }
 
@@ -57,6 +68,21 @@ define_class!(
     #[name = "WeneGridView"]
     #[ivars = GridIvars]
     pub struct GridView;
+
+    unsafe impl NSObjectProtocol for GridView {}
+
+    unsafe impl NSDraggingSource for GridView {
+        // Both inside the window and out in Finder, a drag can move
+        // or copy; the modifier the user holds picks which.
+        #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
+        fn dragging_source_operation_mask(
+            &self,
+            _session: &NSDraggingSession,
+            _context: NSDraggingContext,
+        ) -> NSDragOperation {
+            NSDragOperation::Move | NSDragOperation::Copy
+        }
+    }
 
     impl GridView {
         #[unsafe(method(isFlipped))]
@@ -183,6 +209,7 @@ define_class!(
                 if !cmd {
                     self.ivars().selected.borrow_mut().clear();
                 }
+                self.ivars().press.set(None);
                 self.ivars().band.set(Some((point, point)));
                 self.setNeedsDisplay(true);
                 self.notify_selection();
@@ -208,6 +235,7 @@ define_class!(
                 self.ivars().anchor.set(Some(index));
             }
             self.ivars().focus.set(Some(index));
+            self.ivars().press.set(Some(point));
             self.setNeedsDisplay(true);
             self.notify_selection();
             if event.clickCount() >= 2 {
@@ -227,7 +255,19 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
-            let Some((origin, _)) = self.ivars().band.get() else { return };
+            let Some((origin, _)) = self.ivars().band.get() else {
+                // A press on a cell that travels far enough drags the
+                // selection instead: onto a sidebar folder, or out to
+                // Finder and other apps.
+                let Some(start) = self.ivars().press.get() else { return };
+                let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                if (point.x - start.x).abs() < DRAG_SLOP && (point.y - start.y).abs() < DRAG_SLOP {
+                    return;
+                }
+                self.ivars().press.set(None);
+                self.begin_drag(event);
+                return;
+            };
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             self.ivars().band.set(Some((origin, point)));
             self.select_band(band_rect(origin, point));
@@ -238,6 +278,7 @@ define_class!(
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
+            self.ivars().press.set(None);
             if self.ivars().band.get().is_some() {
                 self.ivars().band.set(None);
                 self.setNeedsDisplay(true);
@@ -368,6 +409,7 @@ impl GridView {
             focus: Cell::new(None),
             anchor: Cell::new(None),
             band: Cell::new(None),
+            press: Cell::new(None),
             delegate: OnceCell::new(),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -734,6 +776,51 @@ impl GridView {
             menu.addItem(&item);
         }
         menu
+    }
+
+    /// Start dragging the selection. Each image rides along as a file
+    /// URL, which is what Finder and the sidebar both read, and each
+    /// one drags its own thumbnail from its own cell.
+    fn begin_drag(&self, event: &NSEvent) {
+        let cols = self.columns(self.bounds().size.width);
+        let selected: Vec<usize> = self.ivars().selected.borrow().iter().copied().collect();
+        let mut items = Vec::with_capacity(selected.len());
+        for index in selected {
+            let Some(path) = self
+                .ivars()
+                .files
+                .borrow()
+                .get(index)
+                .map(|info| info.path.clone())
+            else {
+                continue;
+            };
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+            let entry = NSPasteboardItem::new();
+            unsafe {
+                entry.setString_forType(&url.absoluteString().unwrap_or_default(), NSPasteboardTypeFileURL)
+            };
+            let item = NSDraggingItem::initWithPasteboardWriter(
+                NSDraggingItem::alloc(),
+                ProtocolObject::from_ref(&*entry),
+            );
+            let thumb = self.ivars().thumbs.borrow_mut().get(&path).cloned();
+            unsafe {
+                item.setDraggingFrame_contents(
+                    self.cell_rect(index, cols),
+                    thumb.as_deref().map(|image| image.as_ref()),
+                )
+            };
+            items.push(item);
+        }
+        if items.is_empty() {
+            return;
+        }
+        self.beginDraggingSessionWithItems_event_source(
+            &NSArray::from_retained_slice(&items),
+            event,
+            ProtocolObject::from_ref(self),
+        );
     }
 
     /// The files the user picked, for an action that works on them.
