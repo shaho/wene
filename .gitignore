@@ -85,4 +85,7 @@ reports/
 prototypes/
 /server/target/
 /target/
-/branding/
+/branding/*
+!/branding/macos/
+/branding/macos/*
+!/branding/macos/AppIcon.appiconset/
