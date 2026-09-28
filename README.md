@@ -69,7 +69,8 @@ To build the .app bundle in `target/wene.app`:
 ./scripts/make-app.sh
 ```
 
-To build a disk image in `target/wene.dmg`:
+To build a disk image, named after the version in `wene/Cargo.toml`
+(`target/wene-0.3.1.dmg` today):
 
 ```bash
 ./scripts/make-dmg.sh

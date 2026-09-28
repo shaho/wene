@@ -23,7 +23,7 @@ use objc2_app_kit::{
 use objc2_core_foundation::{CGPoint, CGSize};
 use objc2_foundation::{
     ns_string, NSIndexSet, NSNotification, NSNumber, NSObject, NSObjectProtocol, NSRect, NSString,
-    NSUserDefaults,
+    NSURL, NSUserDefaults,
 };
 
 use crate::{e2e, AppDelegate};
@@ -161,33 +161,13 @@ define_class!(
     }
 
     unsafe impl NSMenuDelegate for Sidebar {
-        // The right-click menu offers one entry, and which one
-        // depends on the row under the pointer.
+        // The right-click menu is built for the row under the
+        // pointer. Section headers are not folders, so they get none.
         #[unsafe(method(menuNeedsUpdate:))]
         fn menu_needs_update(&self, menu: &NSMenu) {
-            let mtm = self.mtm();
             menu.removeAllItems();
             let Some(index) = self.clicked_index() else { return };
-            if self.with_node(index, |node| node.section) {
-                return;
-            }
-            let path = self.path_of(index);
-            let is_favorite = self.ivars().favorites.borrow().contains(&path);
-            let (title, action) = if is_favorite {
-                ("Remove from favorites", objc2::sel!(removeFavorite:))
-            } else {
-                ("Add to favorites", objc2::sel!(addFavorite:))
-            };
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(title),
-                    Some(action),
-                    ns_string!(""),
-                )
-            };
-            unsafe { item.setTarget(Some(self)) };
-            menu.addItem(&item);
+            self.fill_context_menu(menu, index);
         }
     }
 
@@ -207,6 +187,18 @@ define_class!(
         fn remove_favorite_action(&self, _sender: Option<&AnyObject>) {
             let Some(index) = self.clicked_index() else { return };
             self.remove_favorite(&self.path_of(index));
+        }
+
+        #[unsafe(method(scanRecursive:))]
+        fn scan_recursive_action(&self, _sender: Option<&AnyObject>) {
+            let Some(index) = self.clicked_index() else { return };
+            self.scan_recursive(index);
+        }
+
+        #[unsafe(method(openInFinder:))]
+        fn open_in_finder_action(&self, _sender: Option<&AnyObject>) {
+            let Some(index) = self.clicked_index() else { return };
+            self.open_in_finder(index);
         }
 
         #[unsafe(method(volumesChanged:))]
@@ -347,6 +339,61 @@ impl Sidebar {
             Some(node) => f(node),
             None => f(&folder_node(PathBuf::new(), Some(String::new()))),
         }
+    }
+
+    /// Build the right-click menu for one row. Split out from the
+    /// menu delegate so the e2e harness can build the same menu for a
+    /// row it names itself.
+    pub fn fill_context_menu(&self, menu: &NSMenu, index: usize) {
+        if self.with_node(index, |node| node.section) {
+            return;
+        }
+        let mtm = self.mtm();
+        let path = self.path_of(index);
+        let favorite = self.ivars().favorites.borrow().contains(&path);
+        let entries: [Option<(&str, objc2::runtime::Sel)>; 5] = [
+            Some(("Include subfolders", objc2::sel!(scanRecursive:))),
+            None,
+            Some(if favorite {
+                ("Remove from favorites", objc2::sel!(removeFavorite:))
+            } else {
+                ("Add to favorites", objc2::sel!(addFavorite:))
+            }),
+            None,
+            Some(("Open in Finder", objc2::sel!(openInFinder:))),
+        ];
+        for entry in entries {
+            let Some((title, action)) = entry else {
+                menu.addItem(&NSMenuItem::separatorItem(mtm));
+                continue;
+            };
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(title),
+                    Some(action),
+                    ns_string!(""),
+                )
+            };
+            unsafe { item.setTarget(Some(self)) };
+            menu.addItem(&item);
+        }
+    }
+
+    /// Load the row's folder and everything under it, the way cmd-O
+    /// does, and move the highlight onto it.
+    fn scan_recursive(&self, index: usize) {
+        let path = self.path_of(index);
+        if let Some(delegate) = self.ivars().delegate.get() {
+            delegate.scan_root(path, true);
+        }
+    }
+
+    fn open_in_finder(&self, index: usize) {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(
+            &self.path_of(index).to_string_lossy(),
+        ));
+        NSWorkspace::sharedWorkspace().openURL(&url);
     }
 
     fn path_of(&self, index: usize) -> PathBuf {
@@ -543,6 +590,19 @@ impl Sidebar {
         if let (Some(path), Some(delegate)) = (self.selected_path(), self.ivars().delegate.get()) {
             delegate.scan_root(path, false);
         }
+    }
+
+    /// Titles of the right-click menu for the row that holds `path`.
+    pub fn e2e_context_menu(&self, path: &Path) -> Vec<String> {
+        let index = {
+            let nodes = self.ivars().nodes.borrow();
+            nodes.iter().position(|node| !node.section && node.path == path)
+        };
+        let menu = NSMenu::new(self.mtm());
+        if let Some(index) = index {
+            self.fill_context_menu(&menu, index);
+        }
+        menu.itemArray().iter().map(|item| item.title().to_string()).collect()
     }
 
     pub fn e2e_favorites(&self) -> Vec<PathBuf> {

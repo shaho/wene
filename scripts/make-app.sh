@@ -6,6 +6,9 @@ set -eu
 cd "$(dirname "$0")/.."
 cargo build --release
 
+# One source for the version: the crate the app is built from.
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' wene/Cargo.toml | head -1)
+
 APP=target/wene.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -25,7 +28,7 @@ done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 rm -rf "$ICONSET"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -38,7 +41,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSMinimumSystemVersion</key><string>11.5</string>
   <!-- Image types wene can decode, so Finder offers it in Open With
@@ -78,4 +81,4 @@ PLIST
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP" || true
 
-echo "built $APP"
+echo "built $APP ($VERSION)"

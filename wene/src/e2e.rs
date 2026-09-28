@@ -59,8 +59,9 @@ fn check(state: &RefCell<E2eState>, ok: bool, what: &str) {
 }
 
 /// Fire a menu item through NSMenu's own action dispatch, the same
-/// target and responder resolution as a user click.
-fn perform_menu_item(menu_title: &str, index: isize) -> bool {
+/// target and responder resolution as a user click. The item is found
+/// by what it says, so a new entry above it changes nothing here.
+fn perform_menu_item(menu_title: &str, item_title: &str) -> bool {
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         return false;
     };
@@ -68,9 +69,14 @@ fn perform_menu_item(menu_title: &str, index: isize) -> bool {
     let Some(menubar) = app.mainMenu() else { return false };
     for item in menubar.itemArray() {
         let Some(submenu) = item.submenu() else { continue };
-        if submenu.title().to_string() == menu_title {
-            submenu.performActionForItemAtIndex(index);
-            return true;
+        if submenu.title().to_string() != menu_title {
+            continue;
+        }
+        for (index, entry) in submenu.itemArray().iter().enumerate() {
+            if entry.title().to_string().starts_with(item_title) {
+                submenu.performActionForItemAtIndex(index as isize);
+                return true;
+            }
         }
     }
     false
@@ -296,7 +302,7 @@ pub fn run_step(delegate: &AppDelegate) {
             // way a click does (no synthetic OS events).
             check(
                 state,
-                perform_menu_item("Slideshow", 1),
+                perform_menu_item("Slideshow", "Start slideshow in window"),
                 "menu item 'Start slideshow in window' fired",
             );
         }
@@ -312,7 +318,7 @@ pub fn run_step(delegate: &AppDelegate) {
         22 => {
             check(
                 state,
-                perform_menu_item("Slideshow", 0),
+                perform_menu_item("Slideshow", "Start slideshow"),
                 "menu item 'Start slideshow' fired",
             );
         }
@@ -478,10 +484,9 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, delegate.e2e_file_count() == 5, "watcher saw the cull test file");
             // Name order puts zzz-trash-a.heic last: index 4.
             delegate.e2e_select(&[4]);
-            // File menu: 0 open folder, 1 separator, 2 move to trash.
             check(
                 state,
-                perform_menu_item("File", 2),
+                perform_menu_item("File", "Move to trash"),
                 "menu item 'Move to trash' fired",
             );
             check(state, delegate.e2e_file_count() == 4, "trashed image left the grid");
@@ -519,7 +524,7 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.start_slideshow(4, false);
             check(
                 state,
-                perform_menu_item("File", 2),
+                perform_menu_item("File", "Move to trash"),
                 "menu item 'Move to trash' fired with a show up",
             );
             check(state, delegate.e2e_show_active(), "slideshow stays up after a cull");
@@ -599,10 +604,9 @@ pub fn run_step(delegate: &AppDelegate) {
         43 => {
             check(state, delegate.e2e_file_count() == 5, "watcher saw the second file");
             delegate.e2e_select(&[4]);
-            // File menu: 4 move to, 5 copy to, 6 move again.
             check(
                 state,
-                perform_menu_item("File", 6),
+                perform_menu_item("File", "Move again"),
                 "menu item 'Move again' fired",
             );
         }
@@ -855,6 +859,78 @@ pub fn run_step(delegate: &AppDelegate) {
                 "opening a folder shows that folder",
             );
             let _ = std::fs::remove_dir_all(open_folder());
+        }
+        60 => {
+            // Right-click a cell outside the selection: it takes that
+            // cell, Finder style.
+            delegate.e2e_select(&[0]);
+            let first = delegate.e2e_selected_name();
+            let menu = delegate.e2e_grid_context_menu(2);
+            let taken = delegate.e2e_selected_name();
+            check(
+                state,
+                taken.is_some()
+                    && taken != first
+                    && delegate
+                        .e2e_status_text()
+                        .starts_with(taken.as_deref().unwrap_or_default()),
+                "right-click outside the selection takes the cell under the pointer",
+            );
+            let titles: Vec<String> = menu.iter().map(|(title, _)| title.clone()).collect();
+            check(
+                state,
+                titles.iter().any(|t| t == "Start slideshow")
+                    && titles.iter().any(|t| t == "Reveal in Finder")
+                    && titles.iter().any(|t| t == "Move to…")
+                    && titles.iter().any(|t| t == "Copy to…")
+                    && titles.iter().any(|t| t == "Move to trash"),
+                "the grid menu offers the slideshow, reveal, filing and trash entries",
+            );
+            check(
+                state,
+                titles.iter().any(|t| t.starts_with("Move again to ")),
+                "the grid menu names the folder a repeat move goes to",
+            );
+            check(
+                state,
+                menu.iter()
+                    .any(|(title, enabled)| title == "Move to trash" && *enabled),
+                "trash is live while images are selected",
+            );
+        }
+        61 => {
+            // Right-click inside the selection leaves it alone, so a
+            // menu never acts on less than it looks like.
+            delegate.e2e_select(&[0, 1]);
+            delegate.e2e_grid_context_menu(1);
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("2 of 4 selected"),
+                "right-click inside the selection keeps it",
+            );
+        }
+        62 => {
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let titles = delegate.e2e_sidebar_context_menu(&root);
+            check(
+                state,
+                titles.first().map(String::as_str) == Some("Include subfolders")
+                    && titles.last().map(String::as_str) == Some("Open in Finder"),
+                "the sidebar menu runs from subfolders to Finder",
+            );
+            check(
+                state,
+                titles.iter().any(|t| t == "Add to favorites"),
+                "a folder outside favorites offers to join them",
+            );
+            delegate.e2e_add_favorite(&root);
+            let titles = delegate.e2e_sidebar_context_menu(&root);
+            check(
+                state,
+                titles.iter().any(|t| t == "Remove from favorites"),
+                "a favorite offers to leave instead",
+            );
+            delegate.e2e_remove_favorite(&root);
         }
         _ => {
             let failures = state.borrow().failures.clone();

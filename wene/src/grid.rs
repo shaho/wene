@@ -7,13 +7,15 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
+use wene_core::transfer::Transfer;
 use wene_core::{file_info_cmp, FileInfo, LruCache, SortOrder};
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSColor, NSEvent, NSImage, NSView};
+use objc2::runtime::Sel;
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{NSColor, NSEvent, NSImage, NSMenu, NSMenuItem, NSView};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::NSRect;
+use objc2_foundation::{NSRect, NSString};
 
 use crate::AppDelegate;
 
@@ -211,6 +213,16 @@ define_class!(
             if event.clickCount() >= 2 {
                 self.activate();
             }
+        }
+
+        // Right-click inside the grid. Empty space has nothing to
+        // act on, so it gets no menu.
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            let Some(index) = self.index_at(point) else { return };
+            let menu = self.context_click(index);
+            NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
         }
 
         #[unsafe(method(mouseDragged:))]
@@ -659,6 +671,71 @@ impl GridView {
         }
     }
 
+    /// Right-click on a cell. Outside the selection it takes the cell
+    /// under the pointer, Finder style; inside it the selection
+    /// stands, so a menu never shrinks what it acts on.
+    pub fn context_click(&self, index: usize) -> Retained<NSMenu> {
+        let outside = !self.ivars().selected.borrow().contains(&index);
+        if outside {
+            {
+                let mut selected = self.ivars().selected.borrow_mut();
+                selected.clear();
+                selected.insert(index);
+            }
+            self.ivars().anchor.set(Some(index));
+            self.ivars().focus.set(Some(index));
+            self.setNeedsDisplay(true);
+            self.notify_selection();
+        }
+        self.context_menu()
+    }
+
+    /// The grid's right-click menu. Every entry is a menu bar action
+    /// already, aimed at the delegate, so validation and behaviour
+    /// stay in one place.
+    fn context_menu(&self) -> Retained<NSMenu> {
+        let mtm = self.mtm();
+        let delegate = self.ivars().delegate.get();
+        let repeat = |kind: Transfer| match delegate {
+            Some(delegate) => delegate.repeat_title(kind),
+            None => String::new(),
+        };
+        let entries: [Option<(String, Sel)>; 9] = [
+            Some(("Start slideshow".to_owned(), sel!(startSlideshow:))),
+            None,
+            Some(("Reveal in Finder".to_owned(), sel!(revealInFinder:))),
+            None,
+            Some(("Move to…".to_owned(), sel!(moveToFolder:))),
+            Some(("Copy to…".to_owned(), sel!(copyToFolder:))),
+            Some((repeat(Transfer::Move), sel!(moveAgain:))),
+            Some((repeat(Transfer::Copy), sel!(copyAgain:))),
+            Some(("Move to trash".to_owned(), sel!(moveToTrash:))),
+        ];
+        let menu = NSMenu::new(mtm);
+        for entry in entries {
+            let Some((title, action)) = entry else {
+                menu.addItem(&NSMenuItem::separatorItem(mtm));
+                continue;
+            };
+            if action == sel!(moveToTrash:) {
+                menu.addItem(&NSMenuItem::separatorItem(mtm));
+            }
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(&title),
+                    Some(action),
+                    &NSString::from_str(""),
+                )
+            };
+            if let Some(delegate) = delegate {
+                unsafe { item.setTarget(Some(delegate)) };
+            }
+            menu.addItem(&item);
+        }
+        menu
+    }
+
     /// The files the user picked, for an action that works on them.
     pub fn selected_paths(&self) -> Vec<PathBuf> {
         let files = self.ivars().files.borrow();
@@ -759,6 +836,18 @@ impl GridView {
     }
 
     /// Test hook: set the selection directly.
+    /// Titles and enabled states of the right-click menu for one
+    /// cell, for the e2e harness. Building it runs the same selection
+    /// rule a real right-click runs.
+    pub fn e2e_context_menu(&self, index: usize) -> Vec<(String, bool)> {
+        let menu = self.context_click(index);
+        menu.update();
+        menu.itemArray()
+            .iter()
+            .map(|item| (item.title().to_string(), item.isEnabled()))
+            .collect()
+    }
+
     pub fn e2e_set_selected(&self, indices: &[usize]) {
         {
             let mut selected = self.ivars().selected.borrow_mut();

@@ -23,13 +23,13 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
     NSColor, NSControlTextEditingDelegate, NSTextFieldDelegate, NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView,
     NSSplitViewController, NSSplitViewItem, NSTextField, NSViewController, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{
-    ns_string, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString, NSTimer,
-    NSUserDefaults,
+    ns_string, NSArray, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString, NSTimer,
+    NSURL, NSUserDefaults,
 };
 use wene_core::transfer::Transfer;
 use wene_core::{Engine, Event, LruCache, Playlist, SortOrder};
@@ -386,6 +386,11 @@ define_class!(
         #[unsafe(method(moveToTrash:))]
         fn move_to_trash(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.trash_selection();
+        }
+
+        #[unsafe(method(revealInFinder:))]
+        fn reveal_in_finder(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.reveal_targets();
         }
 
         #[unsafe(method(moveToFolder:))]
@@ -1022,26 +1027,42 @@ impl AppDelegate {
         self.flash_overlay(&message);
     }
 
+    /// cmd-R: show what an action would work on in Finder, selected
+    /// inside its folder.
+    fn reveal_targets(&self) {
+        let paths = self.action_targets();
+        if paths.is_empty() {
+            return;
+        }
+        let urls: Vec<Retained<NSURL>> = paths
+            .iter()
+            .map(|path| NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())))
+            .collect();
+        NSWorkspace::sharedWorkspace()
+            .activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&urls));
+    }
+
+    /// What a repeat item is called: the verb alone until a folder has
+    /// been used, the folder's name after that.
+    pub fn repeat_title(&self, kind: Transfer) -> String {
+        let (verb, folder) = match kind {
+            Transfer::Move => ("Move", self.ivars().last_move.borrow().clone()),
+            Transfer::Copy => ("Copy", self.ivars().last_copy.borrow().clone()),
+        };
+        match folder {
+            Some(folder) => format!("{verb} again to {}", folder_label(&folder)),
+            None => format!("{verb} again"),
+        }
+    }
+
     /// Name the repeat items after their folders.
     fn sync_repeat_items(&self) {
-        for (item, folder, verb) in [
-            (
-                self.ivars().move_again_item.get(),
-                self.ivars().last_move.borrow().clone(),
-                "Move",
-            ),
-            (
-                self.ivars().copy_again_item.get(),
-                self.ivars().last_copy.borrow().clone(),
-                "Copy",
-            ),
+        for (item, kind) in [
+            (self.ivars().move_again_item.get(), Transfer::Move),
+            (self.ivars().copy_again_item.get(), Transfer::Copy),
         ] {
             let Some(item) = item else { continue };
-            let title = match folder {
-                Some(folder) => format!("{verb} again to {}", folder_label(&folder)),
-                None => format!("{verb} again"),
-            };
-            item.setTitle(&NSString::from_str(&title));
+            item.setTitle(&NSString::from_str(&self.repeat_title(kind)));
         }
     }
 
@@ -1064,6 +1085,7 @@ impl AppDelegate {
         }
         let acts_on_images = [
             sel!(moveToTrash:),
+            sel!(revealInFinder:),
             sel!(moveToFolder:),
             sel!(copyToFolder:),
             sel!(moveAgain:),
@@ -1715,6 +1737,22 @@ impl AppDelegate {
         }
     }
 
+    pub fn e2e_grid_context_menu(&self, index: usize) -> Vec<(String, bool)> {
+        self.ivars()
+            .grid
+            .get()
+            .map(|grid| grid.e2e_context_menu(index))
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_sidebar_context_menu(&self, path: &str) -> Vec<String> {
+        self.ivars()
+            .sidebar
+            .get()
+            .map(|sidebar| sidebar.e2e_context_menu(std::path::Path::new(path)))
+            .unwrap_or_default()
+    }
+
     pub fn e2e_favorite_count(&self) -> usize {
         self.ivars()
             .sidebar
@@ -2206,6 +2244,16 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         )
     };
     file_menu.addItem(&open);
+    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let reveal = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Reveal in Finder"),
+            Some(sel!(revealInFinder:)),
+            ns_string!("r"),
+        )
+    };
+    file_menu.addItem(&reveal);
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));
     // cmd-Delete, Finder's binding, in the grid and the slideshow.
     let trash = unsafe {
