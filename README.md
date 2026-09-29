@@ -99,7 +99,14 @@ the actual menu items, culls and files test copies, filters the grid, and checks
 the status bar text:
 
 ```bash
-WENE_E2E=1 cargo run -p wene -- /path/to/a/folder/with/images
+sh scripts/make-fixture.sh
+WENE_E2E=1 cargo run -p wene -- ~/wene-e2e-fixture
 ```
+
+The first line builds the folder the harness expects: four images whose names,
+sizes and dates it asserts on, made from the app icon with `sips`. Keep the
+fixture out of the Desktop and out of `/tmp` — an unsigned binary is refused
+files under the Desktop, and the folder watcher never reports a change under
+`/tmp`. The script refuses both for you.
 
 It exits 0 with a report, or 1 listing what failed.
