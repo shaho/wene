@@ -32,9 +32,12 @@ use crate::{e2e, AppDelegate};
 use wene_core::transfer::Transfer;
 
 /// Width of the sidebar pane, and the limits the split view allows.
-pub const WIDTH: f64 = 200.0;
 pub const MIN_WIDTH: f64 = 150.0;
 pub const MAX_WIDTH: f64 = 340.0;
+/// The width a window opens with: as wide as the pane is allowed to
+/// be, because folder names are long and a narrow tree truncates
+/// them.
+pub const WIDTH: f64 = MAX_WIDTH;
 
 const ROW_H: f64 = 24.0;
 

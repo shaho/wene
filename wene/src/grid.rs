@@ -25,6 +25,18 @@ use objc2_foundation::{NSArray, NSObjectProtocol, NSRect, NSString, NSURL};
 
 use crate::AppDelegate;
 
+/// What a drag may do. A drag that leaves the app copies instead of
+/// moving when the preference says so: dropping an image on the
+/// desktop should not empty it out of the folder unless that is what
+/// was asked for.
+fn drag_operation(outside: bool, copies_outside: bool) -> NSDragOperation {
+    if outside && copies_outside {
+        NSDragOperation::Copy
+    } else {
+        NSDragOperation::Move | NSDragOperation::Copy
+    }
+}
+
 pub const CELL: f64 = 160.0;
 pub const PAD: f64 = 8.0;
 const MIN_CELL: f64 = 60.0;
@@ -75,15 +87,21 @@ define_class!(
     unsafe impl NSObjectProtocol for GridView {}
 
     unsafe impl NSDraggingSource for GridView {
-        // Both inside the window and out in Finder, a drag can move
-        // or copy; the modifier the user holds picks which.
+        // Inside the window a drag can move or copy and the modifier
+        // picks. Out in Finder the same is true until the preference
+        // says a drag out never moves the original.
         #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
         fn dragging_source_operation_mask(
             &self,
             _session: &NSDraggingSession,
-            _context: NSDraggingContext,
+            context: NSDraggingContext,
         ) -> NSDragOperation {
-            NSDragOperation::Move | NSDragOperation::Copy
+            let copies = self
+                .ivars()
+                .delegate
+                .get()
+                .is_some_and(|delegate| delegate.drag_out_copies());
+            drag_operation(context == NSDraggingContext::OutsideApplication, copies)
         }
     }
 
@@ -781,11 +799,12 @@ impl GridView {
             Some(delegate) => delegate.repeat_title(kind),
             None => String::new(),
         };
-        let entries: [Option<(String, Sel)>; 11] = [
+        let entries: [Option<(String, Sel)>; 12] = [
             Some(("Start slideshow".to_owned(), sel!(startSlideshow:))),
             None,
             Some(("Reveal in Finder".to_owned(), sel!(revealInFinder:))),
             Some(("Get info".to_owned(), sel!(getInfo:))),
+            Some(("Copy".to_owned(), sel!(copyImages:))),
             Some(("Copy path".to_owned(), sel!(copyPath:))),
             None,
             Some(("Move to…".to_owned(), sel!(moveToFolder:))),
@@ -1028,5 +1047,26 @@ impl GridView {
         self.setFrameSize(CGSize::new(width, 0.0));
         self.setNeedsDisplay(true);
         self.notify_selection();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drag_operation;
+    use objc2_app_kit::NSDragOperation;
+
+    #[test]
+    fn a_drag_out_copies_only_when_the_preference_says_so() {
+        let both = NSDragOperation::Move | NSDragOperation::Copy;
+        assert_eq!(drag_operation(true, false), both, "out, preference off");
+        assert_eq!(
+            drag_operation(true, true),
+            NSDragOperation::Copy,
+            "out, preference on"
+        );
+        // Inside the app the preference changes nothing: dropping on a
+        // sidebar folder is filing, and filing moves.
+        assert_eq!(drag_operation(false, true), both, "inside, preference on");
+        assert_eq!(drag_operation(false, false), both, "inside, preference off");
     }
 }

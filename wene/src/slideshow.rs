@@ -90,7 +90,8 @@ impl SlideshowWindow {
 /// slideshow runs.
 #[derive(Clone, Copy, Default, PartialEq)]
 pub struct SlideState {
-    /// None = fit to window (never scaling up past 100%).
+    /// None = fit to window, which stops at 100% unless the
+    /// preference scales small images up.
     pub zoom: Option<f64>,
     /// Clockwise quarter turns: 0, 90, 180, 270.
     pub rotation: i32,
@@ -346,8 +347,30 @@ impl SlideView {
         };
         match self.ivars().zoom.get() {
             Some(zoom) => zoom,
-            None => (bounds.width / iw).min(bounds.height / ih).min(1.0),
+            None => {
+                let fit = (bounds.width / iw).min(bounds.height / ih);
+                // A small image is shown at its own size unless the
+                // preference says to fill the screen with it.
+                let scales_up = self
+                    .ivars()
+                    .delegate
+                    .get()
+                    .is_some_and(|delegate| delegate.scales_small_images_up());
+                if scales_up {
+                    fit
+                } else {
+                    fit.min(1.0)
+                }
+            }
         }
+    }
+
+    /// What the slide is scaled by right now, for the harness.
+    pub fn drawn_scale(&self) -> f64 {
+        let Some(image) = self.ivars().image.borrow().clone() else {
+            return 0.0;
+        };
+        self.effective_scale(image.size(), self.bounds().size)
     }
 
     pub fn rotate(&self, delta_degrees: i32) {

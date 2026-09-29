@@ -113,6 +113,13 @@ pub struct DelegateIvars {
     redo_item: OnceCell<Retained<NSMenuItem>>,
     info_window: OnceCell<Retained<NSWindow>>,
     info_label: OnceCell<Retained<NSTextField>>,
+    /// Preference: a small image fills the screen instead of sitting
+    /// at its own size in the middle of it.
+    scale_up_small: Cell<bool>,
+    /// Preference: a drag out of the app copies rather than moves,
+    /// so dropping an image on the desktop leaves the folder alone.
+    drag_out_copies: Cell<bool>,
+    scale_up_item: OnceCell<Retained<NSMenuItem>>,
     /// Default slideshow mode from prefs; ⌥ at start inverts it.
     default_windowed: Cell<bool>,
     show: RefCell<Option<Show>>,
@@ -183,6 +190,10 @@ define_class!(
         // here too via close().
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
+            // The menu bar and the Dock come back with the window.
+            NSApplication::sharedApplication(self.mtm()).setPresentationOptions(
+                objc2_app_kit::NSApplicationPresentationOptions::Default,
+            );
             if let Some(show) = self.ivars().show.borrow_mut().take() {
                 if let Some(timer) = show.timer {
                     timer.invalidate();
@@ -356,6 +367,16 @@ define_class!(
             self.save_prefs();
         }
 
+        #[unsafe(method(toggleScaleUp:))]
+        fn toggle_scale_up(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.toggle_scale_up_small();
+        }
+
+        #[unsafe(method(prefsDragCopies:))]
+        fn prefs_drag_copies(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.toggle_drag_out_copies();
+        }
+
         #[unsafe(method(prefsThumbCap:))]
         fn prefs_thumb_cap(&self, sender: Option<&objc2::runtime::AnyObject>) {
             let Some(popup) = sender.and_then(|s| s.downcast_ref::<objc2_app_kit::NSPopUpButton>())
@@ -446,6 +467,11 @@ define_class!(
             let Some(app) = item.representedObject() else { return };
             let Ok(app) = app.downcast::<NSURL>() else { return };
             self.open_targets_with(&app);
+        }
+
+        #[unsafe(method(copyImages:))]
+        fn copy_images(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.copy_images_to_clipboard();
         }
 
         #[unsafe(method(copyPath:))]
@@ -595,6 +621,9 @@ impl AppDelegate {
             redo_item: OnceCell::new(),
             info_window: OnceCell::new(),
             info_label: OnceCell::new(),
+            scale_up_small: Cell::new(false),
+            drag_out_copies: Cell::new(false),
+            scale_up_item: OnceCell::new(),
             default_windowed: Cell::new(false),
             show: RefCell::new(None),
             loop_enabled: Cell::new(false),
@@ -758,6 +787,15 @@ impl AppDelegate {
         self.ivars()
             .default_windowed
             .set(d.boolForKey(ns_string!("slideshowWindowed")));
+        self.ivars()
+            .drag_out_copies
+            .set(d.boolForKey(ns_string!("dragOutCopies")));
+        if d.boolForKey(ns_string!("scaleUpSmall")) {
+            self.ivars().scale_up_small.set(true);
+            if let Some(item) = self.ivars().scale_up_item.get() {
+                item.setState(1);
+            }
+        }
         let tenths = d.integerForKey(ns_string!("autoAdvanceTenths"));
         let seconds = (tenths > 0).then(|| tenths as f64 / 10.0);
         self.ivars().default_interval.set(seconds);
@@ -833,6 +871,8 @@ impl AppDelegate {
             4,
             self.ivars().grid.get().is_some_and(|g| g.labels_visible()),
         );
+        set_check(9, self.ivars().drag_out_copies.get());
+        set_check(10, self.ivars().scale_up_small.get());
         if let Some(view) = content.viewWithTag(6) {
             if let Some(popup) = view.downcast_ref::<objc2_app_kit::NSPopUpButton>() {
                 let tenths = self
@@ -1153,6 +1193,40 @@ impl AppDelegate {
         self.flash_overlay(&message);
     }
 
+    pub fn scales_small_images_up(&self) -> bool {
+        self.ivars().scale_up_small.get()
+    }
+
+    /// The preference and the View menu item move together, and a
+    /// slideshow already on screen redraws at the new rule.
+    fn toggle_scale_up_small(&self) {
+        let on = !self.ivars().scale_up_small.get();
+        self.ivars().scale_up_small.set(on);
+        if let Some(item) = self.ivars().scale_up_item.get() {
+            item.setState(if on { 1 } else { 0 });
+        }
+        if !e2e::enabled() {
+            NSUserDefaults::standardUserDefaults().setBool_forKey(on, ns_string!("scaleUpSmall"));
+        }
+        if let Some(show) = self.ivars().show.borrow().as_ref() {
+            show.view.setNeedsDisplay(true);
+        }
+        self.sync_prefs_controls();
+    }
+
+    pub fn drag_out_copies(&self) -> bool {
+        self.ivars().drag_out_copies.get()
+    }
+
+    fn toggle_drag_out_copies(&self) {
+        let on = !self.ivars().drag_out_copies.get();
+        self.ivars().drag_out_copies.set(on);
+        if !e2e::enabled() {
+            NSUserDefaults::standardUserDefaults().setBool_forKey(on, ns_string!("dragOutCopies"));
+        }
+        self.sync_prefs_controls();
+    }
+
     /// The grid's cells changed size: keep the slider and the saved
     /// size with it.
     pub fn thumb_size_changed(&self, size: f64) {
@@ -1397,6 +1471,32 @@ impl AppDelegate {
         );
     }
 
+    /// cmd-C: the images themselves go on the clipboard, as the files
+    /// they are, so a paste in Finder puts copies of them in that
+    /// folder.
+    fn copy_images_to_clipboard(&self) {
+        let targets = self.action_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let urls: Vec<Retained<ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>>> = targets
+            .iter()
+            .map(|path| {
+                let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+                ProtocolObject::from_retained(url)
+            })
+            .collect();
+        let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        pasteboard.writeObjects(&NSArray::from_retained_slice(&urls));
+        let message = match targets.len() {
+            1 => format!("Copied {}", file_name(&targets[0])),
+            n => format!("Copied {n} images"),
+        };
+        self.show_status_message(&message);
+        self.flash_overlay(&message);
+    }
+
     /// Put the targets on the clipboard, as plain paths or as file
     /// URLs, one per line.
     fn copy_targets(&self, as_url: bool) {
@@ -1619,6 +1719,7 @@ impl AppDelegate {
             sel!(moveToTrash:),
             sel!(revealInFinder:),
             sel!(openWith:),
+            sel!(copyImages:),
             sel!(copyPath:),
             sel!(copyFileUrl:),
             sel!(setDesktopPicture:),
@@ -1839,6 +1940,12 @@ impl AppDelegate {
         let window = if windowed {
             SlideshowWindow::windowed(mtm, screen_frame)
         } else {
+            // Full screen means the whole screen: no menu bar over
+            // the slide, no Dock under it.
+            NSApplication::sharedApplication(mtm).setPresentationOptions(
+                objc2_app_kit::NSApplicationPresentationOptions::HideMenuBar
+                    | objc2_app_kit::NSApplicationPresentationOptions::HideDock,
+            );
             SlideshowWindow::fullscreen(mtm, screen_frame)
         };
         let content_frame = window.contentRectForFrameRect(window.frame());
@@ -2340,6 +2447,44 @@ impl AppDelegate {
         clashes
     }
 
+    pub fn e2e_copy_images(&self) {
+        self.copy_images_to_clipboard();
+    }
+
+    /// The types the clipboard is carrying, for the harness.
+    pub fn e2e_pasteboard_types(&self) -> Vec<String> {
+        objc2_app_kit::NSPasteboard::generalPasteboard()
+            .types()
+            .map(|types| types.iter().map(|t| t.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_toggle_scale_up(&self) {
+        self.toggle_scale_up_small();
+    }
+
+    pub fn e2e_scale_up(&self) -> bool {
+        self.ivars().scale_up_small.get()
+    }
+
+    /// How big the slide is drawn, as a fraction of its own size.
+    pub fn e2e_slide_scale(&self) -> f64 {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|show| show.view.drawn_scale())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_toggle_drag_copies(&self) {
+        self.toggle_drag_out_copies();
+    }
+
+    pub fn e2e_drag_copies(&self) -> bool {
+        self.ivars().drag_out_copies.get()
+    }
+
     pub fn e2e_thumb_cap(&self, cap: f64) {
         self.apply_thumb_cap(cap);
     }
@@ -2825,10 +2970,10 @@ fn startup_folder_pref() -> Option<String> {
 }
 
 /// The preferences window: one plain pane, controls looked up by tag
-/// (1-5 checkboxes, 6 auto-advance popup, 7 startup folder field,
-/// 8 largest thumbnail popup). Rows are laid out from the top.
+/// (1-5 and 9 checkboxes, 6 auto-advance popup, 7 startup folder
+/// field, 8 largest thumbnail popup). Rows are laid out from the top.
 fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained<NSWindow> {
-    let frame = NSRect::new(CGPoint::new(360.0, 360.0), CGSize::new(430.0, 296.0));
+    let frame = NSRect::new(CGPoint::new(360.0, 360.0), CGSize::new(430.0, 352.0));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
@@ -2865,9 +3010,9 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
     };
 
     // Startup folder row (top).
-    label("Startup folder:", 20.0, 256.0);
+    label("Startup folder:", 20.0, 312.0);
     let field = NSTextField::labelWithString(ns_string!(""), mtm);
-    field.setFrame(NSRect::new(CGPoint::new(20.0, 236.0), CGSize::new(250.0, 18.0)));
+    field.setFrame(NSRect::new(CGPoint::new(20.0, 292.0), CGSize::new(250.0, 18.0)));
     field.setTag(7);
     field.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(11.0)));
     field.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -2884,7 +3029,7 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
                 mtm,
             )
         };
-        b.setFrame(NSRect::new(CGPoint::new(x, 230.0), CGSize::new(72.0, 28.0)));
+        b.setFrame(NSRect::new(CGPoint::new(x, 286.0), CGSize::new(72.0, 28.0)));
         content.addSubview(&b);
     }
 
@@ -2892,14 +3037,20 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
         "Start slideshows in a window",
         sel!(prefsToggleWindowed:),
         1,
-        196.0,
+        252.0,
     );
-    checkbox("Loop slideshows", sel!(toggleLoop:), 2, 168.0);
-    checkbox("Shuffle slideshows", sel!(toggleShuffle:), 3, 140.0);
+    checkbox("Loop slideshows", sel!(toggleLoop:), 2, 224.0);
+    checkbox("Shuffle slideshows", sel!(toggleShuffle:), 3, 196.0);
+    checkbox(
+        "Fill the screen with small images",
+        sel!(toggleScaleUp:),
+        10,
+        168.0,
+    );
 
-    label("Auto-advance:", 20.0, 108.0);
+    label("Auto-advance:", 20.0, 136.0);
     let popup = objc2_app_kit::NSPopUpButton::new(mtm);
-    popup.setFrame(NSRect::new(CGPoint::new(150.0, 100.0), CGSize::new(180.0, 26.0)));
+    popup.setFrame(NSRect::new(CGPoint::new(150.0, 128.0), CGSize::new(180.0, 26.0)));
     popup.setTag(6);
     for (title, tag) in [
         ("Off", 0isize),
@@ -2919,9 +3070,9 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
     }
     content.addSubview(&popup);
 
-    label("Largest thumbnail:", 20.0, 68.0);
+    label("Largest thumbnail:", 20.0, 96.0);
     let thumbs = objc2_app_kit::NSPopUpButton::new(mtm);
-    thumbs.setFrame(NSRect::new(CGPoint::new(150.0, 60.0), CGSize::new(180.0, 26.0)));
+    thumbs.setFrame(NSRect::new(CGPoint::new(150.0, 88.0), CGSize::new(180.0, 26.0)));
     thumbs.setTag(8);
     for cap in grid::CELL_CAPS {
         thumbs.addItemWithTitle(&NSString::from_str(&format!("{cap:.0} points")));
@@ -2935,7 +3086,13 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
     }
     content.addSubview(&thumbs);
 
-    checkbox("Show filenames", sel!(toggleLabels:), 4, 28.0);
+    checkbox("Show filenames", sel!(toggleLabels:), 4, 56.0);
+    checkbox(
+        "Dragging out of Wêne copies, never moves",
+        sel!(prefsDragCopies:),
+        9,
+        28.0,
+    );
 
     window.setContentView(Some(&content));
     window
@@ -3335,6 +3492,15 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
     edit_menu.addItem(&filter);
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     // Plain cmd-C stays free for a copy of the image itself later.
+    let copy_images = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Copy"),
+            Some(sel!(copyImages:)),
+            ns_string!("c"),
+        )
+    };
+    edit_menu.addItem(&copy_images);
     let copy_path = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -3525,6 +3691,17 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
     view_menu.addItem(&bigger_shifted);
     view_menu.addItem(&smaller);
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let scale_up = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Fill the screen with small images"),
+            Some(sel!(toggleScaleUp:)),
+            ns_string!("e"),
+        )
+    };
+    view_menu.addItem(&scale_up);
+    let _ = delegate.ivars().scale_up_item.set(scale_up);
+    view_menu.addItem(&NSMenuItem::separatorItem(mtm));
     let sidebar_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -3703,6 +3880,19 @@ fn main() {
     let sidebar_pane = NSSplitViewItem::sidebarWithViewController(&sidebar_vc);
     sidebar_pane.setMinimumThickness(sidebar::MIN_WIDTH);
     sidebar_pane.setMaximumThickness(sidebar::MAX_WIDTH);
+    // AppKit remembers the divider under a name of its own, which
+    // would hand an old window its old width and hide this default.
+    // A name of ours, never used before, starts everyone at the new
+    // width and still keeps whatever they drag it to. The harness
+    // gets no name at all: a restored divider is one more thing
+    // arriving late in a run that measures the window.
+    if !e2e::enabled() {
+        unsafe {
+            split
+                .splitView()
+                .setAutosaveName(Some(ns_string!("sidebarWidth2")))
+        };
+    }
     split.addSplitViewItem(&sidebar_pane);
     split.addSplitViewItem(&NSSplitViewItem::splitViewItemWithViewController(&content_vc));
     window.setContentViewController(Some(&split));

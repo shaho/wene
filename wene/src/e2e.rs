@@ -1193,6 +1193,74 @@ pub fn run_step(delegate: &AppDelegate) {
             }
             check(state, clashes.is_empty(), "every menu shortcut is bound once");
         }
+        75 => {
+            // The preference that keeps a drag onto the desktop from
+            // emptying the folder.
+            check(
+                state,
+                !delegate.e2e_drag_copies(),
+                "a drag out moves by default, the way Finder does",
+            );
+            delegate.e2e_toggle_drag_copies();
+            check(
+                state,
+                delegate.e2e_drag_copies(),
+                "the setting turns a drag out into a copy",
+            );
+            delegate.e2e_toggle_drag_copies();
+            check(state, !delegate.e2e_drag_copies(), "and back again");
+        }
+        76 => {
+            // A small image sits at its own size until the preference
+            // says to fill the screen with it.
+            delegate.e2e_select(&[0]);
+            delegate.start_slideshow(0, true);
+        }
+        77 => {
+            check(
+                state,
+                delegate.e2e_slide_scale() <= 1.0,
+                "a small slide is drawn no larger than itself",
+            );
+            delegate.e2e_toggle_scale_up();
+            check(
+                state,
+                delegate.e2e_scale_up() && delegate.e2e_slide_scale() > 1.0,
+                "the setting fills the window with it",
+            );
+            delegate.e2e_toggle_scale_up();
+            check(
+                state,
+                delegate.e2e_slide_scale() <= 1.0,
+                "and turning it off puts it back",
+            );
+            delegate.end_slideshow();
+        }
+        78 => {
+            // Copy puts the files themselves on the clipboard, which
+            // is what Finder pastes.
+            delegate.e2e_select(&[0, 1]);
+            delegate.e2e_copy_images();
+            let types = delegate.e2e_pasteboard_types();
+            check(
+                state,
+                types.iter().any(|t| t == "public.file-url"),
+                "copy puts file URLs on the clipboard, the way Finder does",
+            );
+            check(
+                state,
+                delegate.e2e_status_text() == "Copied 2 images",
+                "the status bar counts what was copied",
+            );
+            delegate.e2e_select(&[0]);
+            delegate.e2e_copy_images();
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("Copied ")
+                    && delegate.e2e_status_text().ends_with(".heic"),
+                "one image is named instead of counted",
+            );
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {
