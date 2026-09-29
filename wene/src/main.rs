@@ -17,12 +17,13 @@ use dispatch2::{DispatchQueue, MainThreadBound};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{
-    define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
+    define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadMarker,
+    MainThreadOnly,
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
     NSColor, NSControlTextEditingDelegate, NSFont, NSTextFieldDelegate, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView,
-    NSSplitViewController, NSSplitViewItem, NSTextField, NSViewController, NSWindow,
+    NSSplitViewController, NSSplitViewItem, NSTextField, NSTextView, NSViewController, NSWindow,
     NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
@@ -31,6 +32,7 @@ use objc2_foundation::{
     ns_string, NSArray, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString, NSTimer,
     NSURL, NSUserDefaults,
 };
+use wene_core::history::{Entry, History, Step};
 use wene_core::transfer::Transfer;
 use wene_core::{Engine, Event, LruCache, Playlist, SortOrder};
 
@@ -102,6 +104,10 @@ pub struct DelegateIvars {
     /// of it and scribble over its progress line.
     transfer_busy: Cell<bool>,
     prefs_window: OnceCell<Retained<NSWindow>>,
+    /// What the app did to files, so cmd-Z can take it back.
+    history: RefCell<History>,
+    undo_item: OnceCell<Retained<NSMenuItem>>,
+    redo_item: OnceCell<Retained<NSMenuItem>>,
     info_window: OnceCell<Retained<NSWindow>>,
     info_label: OnceCell<Retained<NSTextField>>,
     /// Default slideshow mode from prefs; ⌥ at start inverts it.
@@ -406,6 +412,16 @@ define_class!(
             self.trash_selection();
         }
 
+        #[unsafe(method(undoLast:))]
+        fn undo_action(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.take_back(true);
+        }
+
+        #[unsafe(method(redoLast:))]
+        fn redo_action(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.take_back(false);
+        }
+
         #[unsafe(method(openWith:))]
         fn open_with(&self, sender: Option<&objc2::runtime::AnyObject>) {
             let Some(item) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) else { return };
@@ -555,6 +571,9 @@ impl AppDelegate {
             copy_again_item: OnceCell::new(),
             transfer_busy: Cell::new(false),
             prefs_window: OnceCell::new(),
+            history: RefCell::new(History::default()),
+            undo_item: OnceCell::new(),
+            redo_item: OnceCell::new(),
             info_window: OnceCell::new(),
             info_label: OnceCell::new(),
             default_windowed: Cell::new(false),
@@ -1069,6 +1088,21 @@ impl AppDelegate {
         failed: usize,
     ) {
         self.ivars().transfer_busy.set(false);
+        let touched: Vec<PathBuf> = done
+            .iter()
+            .flat_map(|(from, to)| [from.clone(), to.clone()])
+            .collect();
+        self.notice_files(&touched);
+        let step = match kind {
+            Transfer::Move => Step::Moved(done.clone()),
+            Transfer::Copy => Step::Copied(done.iter().map(|(_, to)| to.clone()).collect()),
+        };
+        let label = match kind {
+            Transfer::Move => "move",
+            Transfer::Copy => "copy",
+        };
+        self.ivars().history.borrow_mut().record(label, step);
+        self.refresh_history_items();
         if !done.is_empty() {
             // Only a folder that took files is worth repeating to.
             let slot = match kind {
@@ -1081,6 +1115,153 @@ impl AppDelegate {
         let message = transfer_message(kind, &done, &folder, renamed, failed);
         self.show_status_message(&message);
         self.flash_overlay(&message);
+    }
+
+    /// Tell the engine about files the app itself moved, so its list
+    /// matches the disk before the watcher gets there. Only files the
+    /// grid is showing count: a file that landed in another folder is
+    /// none of this folder's business.
+    fn notice_files(&self, paths: &[PathBuf]) {
+        let Some(engine) = self.ivars().engine.get() else { return };
+        let scan = self.ivars().current_scan.borrow().clone();
+        let Some((root, recursive)) = scan else { return };
+        let ours: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| {
+                if recursive {
+                    path.starts_with(&root)
+                } else {
+                    path.parent() == Some(root.as_path())
+                }
+            })
+            .cloned()
+            .collect();
+        if !ours.is_empty() {
+            engine.notice(&ours);
+        }
+    }
+
+    /// cmd-Z and shift-cmd-Z.    /// cmd-Z and shift-cmd-Z. Undo reverses the last batch; redo
+    /// performs it again. Both end in the same place: a list of files
+    /// to move, and a batch recorded on the other stack.
+    fn take_back(&self, undoing: bool) {
+        if self.ivars().transfer_busy.get() {
+            return;
+        }
+        let entry = {
+            let mut history = self.ivars().history.borrow_mut();
+            if undoing {
+                history.take_undo()
+            } else {
+                history.take_redo()
+            }
+        };
+        let Some(entry) = entry else { return };
+
+        let (moves, next_step) = match (&entry.step, undoing) {
+            // Undoing a move or a cull walks the files back.
+            (Step::Moved(items), true) => (
+                items.iter().map(|(from, to)| (to.clone(), from.clone())).collect::<Vec<_>>(),
+                Step::Moved(items.clone()),
+            ),
+            // Redoing one walks them forward again.
+            (Step::Moved(items), false) => (items.clone(), Step::Moved(items.clone())),
+            // Undoing a copy trashes the copies. Where they land in
+            // the trash becomes the way back, so a redo can fetch
+            // them out again.
+            (Step::Copied(copies), true) => {
+                let trashed = trash::move_to_trash(copies);
+                let back: Vec<(PathBuf, PathBuf)> = trashed
+                    .moved
+                    .iter()
+                    .filter(|(_, landed)| !landed.as_os_str().is_empty())
+                    .map(|(copy, landed)| (landed.clone(), copy.clone()))
+                    .collect();
+                let gone: Vec<PathBuf> = trashed.moved.iter().map(|(copy, _)| copy.clone()).collect();
+                self.after_take_back(&gone, &[], entry.label.clone(), Step::Moved(back), undoing);
+                return;
+            }
+            // A copy is never redone by copying again: the files are
+            // sitting in the trash, so they are fetched back.
+            (Step::Copied(copies), false) => (Vec::new(), Step::Copied(copies.clone())),
+        };
+
+        let mut arrived: Vec<PathBuf> = Vec::new();
+        let mut left: Vec<PathBuf> = Vec::new();
+        let mut failed = 0usize;
+        for (from, to) in &moves {
+            if let Some(parent) = to.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::rename(from, to).or_else(|_| copy_then_delete(from, to)) {
+                Ok(()) => {
+                    arrived.push(to.clone());
+                    left.push(from.clone());
+                }
+                Err(error) => {
+                    eprintln!("undo failed: {} -> {}: {error}", from.display(), to.display());
+                    failed += 1;
+                }
+            }
+        }
+        if failed > 0 {
+            let message = format!("{failed} of {} could not be put back", moves.len());
+            self.show_status_message(&message);
+            self.flash_overlay(&message);
+        }
+        self.after_take_back(&left, &arrived, entry.label.clone(), next_step, undoing);
+    }
+
+    /// Tidy up after a batch went back or forward: rows that left the
+    /// folder go, the other stack gets the batch, and the menu says
+    /// what is next.
+    fn after_take_back(
+        &self,
+        left: &[PathBuf],
+        arrived: &[PathBuf],
+        label: String,
+        step: Step,
+        undoing: bool,
+    ) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.remove_and_advance(left);
+        }
+        self.drop_from_slideshow(left);
+        // The app is the authority for its own changes, here as well:
+        // the rows come back now rather than whenever the watcher
+        // gets to it.
+        let touched: Vec<PathBuf> = left.iter().chain(arrived.iter()).cloned().collect();
+        self.notice_files(&touched);
+        {
+            let mut history = self.ivars().history.borrow_mut();
+            let entry = Entry { label: label.clone(), step };
+            if undoing {
+                history.push_undone(entry);
+            } else {
+                history.push_done(entry);
+            }
+        }
+        self.refresh_history_items();
+        let count = arrived.len().max(left.len());
+        let what = if undoing { "Undid" } else { "Redid" };
+        let message = match count {
+            0 => format!("Nothing to take back for the {label}"),
+            1 => format!("{what} the {label}"),
+            n => format!("{what} the {label} of {n} images"),
+        };
+        self.show_status_message(&message);
+        self.flash_overlay(&message);
+    }
+
+    /// Keep the Edit menu honest about what cmd-Z would do next.
+    fn refresh_history_items(&self) {
+        let history = self.ivars().history.borrow();
+        if let Some(item) = self.ivars().undo_item.get() {
+            item.setTitle(&NSString::from_str(&history.undo_title()));
+        }
+        if let Some(item) = self.ivars().redo_item.get() {
+            item.setTitle(&NSString::from_str(&history.redo_title()));
+        }
     }
 
     /// The apps that can open the first target, as a submenu. Built
@@ -1333,6 +1514,25 @@ impl AppDelegate {
             .prefs_window
             .get()
             .is_some_and(|window| window.isKeyWindow());
+        if action == Some(sel!(undoLast:)) || action == Some(sel!(redoLast:)) {
+            // A text field brings its own undo, and cmd-Z belongs to
+            // whatever is being typed while one is being edited.
+            let editing = self
+                .ivars()
+                .window
+                .get()
+                .and_then(|window| window.firstResponder())
+                .is_some_and(|responder| responder.isKindOfClass(NSTextView::class()));
+            if editing || prefs_key {
+                return false;
+            }
+            let history = self.ivars().history.borrow();
+            return if action == Some(sel!(undoLast:)) {
+                history.can_undo()
+            } else {
+                history.can_redo()
+            };
+        }
         // Selecting and filtering belong to the grid, so they go
         // grey during a slideshow and in the preferences window.
         if action == Some(sel!(selectAll:)) || action == Some(sel!(showFilter:)) {
@@ -1394,12 +1594,20 @@ impl AppDelegate {
             return;
         }
 
-        let failed = trash::move_to_trash(&paths);
-        let moved: Vec<PathBuf> = paths
+        let trashed = trash::move_to_trash(&paths);
+        let moved: Vec<PathBuf> = trashed.moved.iter().map(|(from, _)| from.clone()).collect();
+        // Only files the trash could point at can come back.
+        let restorable: Vec<(PathBuf, PathBuf)> = trashed
+            .moved
             .iter()
-            .filter(|path| !failed.contains(path))
+            .filter(|(_, landed)| !landed.as_os_str().is_empty())
             .cloned()
             .collect();
+        self.ivars()
+            .history
+            .borrow_mut()
+            .record("move to trash", Step::Moved(restorable));
+        self.refresh_history_items();
 
         // The app's delete is the authority. The rows go now, so the
         // watcher's echo a moment later finds nothing and does
@@ -1408,8 +1616,12 @@ impl AppDelegate {
             grid.remove_and_advance(&moved);
         }
         self.drop_from_slideshow(&moved);
+        // Tell the engine too, so its list matches the disk at once.
+        // Without this an undo a second later finds the path still
+        // listed and no row comes back.
+        self.notice_files(&moved);
 
-        let message = trash_message(&moved, failed.len());
+        let message = trash_message(&moved, trashed.failed.len());
         self.show_status_message(&message);
         self.flash_overlay(&message);
     }
@@ -2141,6 +2353,22 @@ impl AppDelegate {
         self.toggle_help_overlay();
     }
 
+    pub fn e2e_undo(&self) {
+        self.take_back(true);
+    }
+
+    pub fn e2e_redo(&self) {
+        self.take_back(false);
+    }
+
+    pub fn e2e_undo_title(&self) -> String {
+        self.ivars().history.borrow().undo_title()
+    }
+
+    pub fn e2e_redo_title(&self) -> String {
+        self.ivars().history.borrow().redo_title()
+    }
+
     pub fn e2e_copy_path(&self, as_url: bool) {
         self.copy_targets(as_url);
     }
@@ -2622,6 +2850,13 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// rename(2) refuses to cross disks, so an undo that crosses one
+/// copies and then deletes, the way a move does.
+fn copy_then_delete(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::copy(from, to)?;
+    std::fs::remove_file(from)
+}
+
 /// The cheat sheet, shown over the slide by h or ?. It is written by
 /// hand, so it has to be kept honest against the key handler in
 /// slideshow.rs.
@@ -2867,6 +3102,30 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
             ns_string!("a"),
         )
     };
+    let undo = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Undo"),
+            Some(sel!(undoLast:)),
+            ns_string!("z"),
+        )
+    };
+    edit_menu.addItem(&undo);
+    let _ = delegate.ivars().undo_item.set(undo);
+    let redo = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Redo"),
+            Some(sel!(redoLast:)),
+            ns_string!("z"),
+        )
+    };
+    redo.setKeyEquivalentModifierMask(
+        objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Shift,
+    );
+    edit_menu.addItem(&redo);
+    let _ = delegate.ivars().redo_item.set(redo);
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     edit_menu.addItem(&select_all);
     let filter = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(

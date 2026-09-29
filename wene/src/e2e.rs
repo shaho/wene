@@ -114,6 +114,12 @@ fn open_folder() -> String {
         .into_owned()
 }
 
+/// The file the undo steps push around, named so it sorts last and
+/// cannot collide with another run.
+fn undo_name() -> String {
+    format!("zzz-undo-{}.heic", std::process::id())
+}
+
 fn transfer_name() -> String {
     format!("zzz-transfer-{}.heic", std::process::id())
 }
@@ -1065,6 +1071,81 @@ pub fn run_step(delegate: &AppDelegate) {
                 copied.lines().count() == 2 && copied.starts_with("file:"),
                 "several images copy as one file URL per line",
             );
+        }
+        68 => {
+            // Undo, on a file of our own so the fixture survives.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let _ = std::fs::copy(
+                format!("{root}/img2.heic"),
+                format!("{root}/{}", undo_name()),
+            );
+        }
+        69 => {
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            check(state, delegate.e2e_file_count() == 5, "watcher saw the undo test file");
+            // Name order puts zzz-undo last.
+            delegate.e2e_select(&[4]);
+            check(
+                state,
+                perform_menu_item("File", "Move to trash"),
+                "menu item 'Move to trash' fired",
+            );
+            check(
+                state,
+                delegate.e2e_undo_title() == "Undo move to trash",
+                "the Edit menu names what cmd-Z would take back",
+            );
+            check(
+                state,
+                !std::path::Path::new(&format!("{root}/{}", undo_name())).exists(),
+                "the trashed file left the folder",
+            );
+            delegate.e2e_undo();
+            check(
+                state,
+                std::path::Path::new(&format!("{root}/{}", undo_name())).exists(),
+                "undo brought the culled file back",
+            );
+            check(
+                state,
+                delegate.e2e_redo_title() == "Redo move to trash",
+                "and the batch is waiting to be redone",
+            );
+        }
+        70 => {
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            check(state, delegate.e2e_file_count() == 5, "the restored file is in the grid");
+            delegate.e2e_redo();
+            check(
+                state,
+                !std::path::Path::new(&format!("{root}/{}", undo_name())).exists(),
+                "redo culled it again",
+            );
+            // Undo once more, then move it away and undo that too.
+            delegate.e2e_undo();
+        }
+        71 => {
+            let _ = std::fs::create_dir_all(transfer_folder());
+            delegate.e2e_select(&[4]);
+            delegate.e2e_transfer(&transfer_folder(), true);
+        }
+        72 => {
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            check(
+                state,
+                std::path::Path::new(&format!("{}/{}", transfer_folder(), undo_name())).exists(),
+                "the file moved to the target folder",
+            );
+            delegate.e2e_undo();
+            check(
+                state,
+                std::path::Path::new(&format!("{root}/{}", undo_name())).exists()
+                    && !std::path::Path::new(&format!("{}/{}", transfer_folder(), undo_name()))
+                        .exists(),
+                "undo walked the move back",
+            );
+            let _ = std::fs::remove_file(format!("{root}/{}", undo_name()));
+            let _ = std::fs::remove_dir_all(transfer_folder());
         }
         _ => {
             let failures = state.borrow().failures.clone();

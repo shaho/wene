@@ -215,6 +215,19 @@ impl<I: Send + 'static> Engine<I> {
         )
     }
 
+    /// Tell the engine a file appeared or vanished, without waiting
+    /// for the watcher to notice. An undo brings a file back within
+    /// the same breath as the delete that took it away, and the
+    /// watcher can still be carrying the delete; going through the
+    /// same code the watcher uses keeps one list and one order, and
+    /// the watcher's own event a moment later then finds nothing to
+    /// do.
+    pub fn notice(&self, paths: &[PathBuf]) {
+        for path in paths {
+            apply_fs_change(path, &self.files, &self.events_tx, &self.wakeup, &self.dates);
+        }
+    }
+
     /// Walk `root` on a fresh thread, recursively or one level deep.
     /// Batches of found files stream out as FilesInserted events with
     /// sorted-insert indices; the shell mirrors the inserts to keep
@@ -568,6 +581,7 @@ mod tests {
     }
 }
 
+pub mod history;
 pub mod cache;
 pub mod playlist;
 pub mod transfer;
