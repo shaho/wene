@@ -110,6 +110,13 @@ pub struct DelegateIvars {
     loop_enabled: Cell<bool>,
     shuffle_enabled: Cell<bool>,
     overlay_visible: Cell<bool>,
+    /// Extra overlay blocks: the file's own EXIF (shift-I) and its
+    /// full path (p).
+    overlay_exif: Cell<bool>,
+    overlay_path: Cell<bool>,
+    /// The cheat sheet (h or ?), which takes the overlay over while
+    /// it is up.
+    overlay_help: Cell<bool>,
     status: OnceCell<Retained<NSTextField>>,
     loop_item: OnceCell<Retained<NSMenuItem>>,
     shuffle_item: OnceCell<Retained<NSMenuItem>>,
@@ -523,6 +530,9 @@ impl AppDelegate {
             loop_enabled: Cell::new(false),
             shuffle_enabled: Cell::new(false),
             overlay_visible: Cell::new(false),
+            overlay_exif: Cell::new(false),
+            overlay_path: Cell::new(false),
+            overlay_help: Cell::new(false),
             status: OnceCell::new(),
             loop_item: OnceCell::new(),
             shuffle_item: OnceCell::new(),
@@ -1404,6 +1414,10 @@ impl AppDelegate {
             objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
                 | objc2_app_kit::NSAutoresizingMaskOptions::ViewMaxYMargin,
         );
+        overlay.setUsesSingleLineMode(false);
+        // Monospaced, so the EXIF block and the cheat sheet line up
+        // in columns instead of drifting.
+        overlay.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(12.0, 0.0)));
         overlay.setHidden(!self.ivars().overlay_visible.get());
         view.addSubview(&overlay);
 
@@ -1454,6 +1468,17 @@ impl AppDelegate {
     }
 
     /// Option-arrow: step the original sorted order while shuffled.
+    /// Page up and page down: a jump that stops at the ends.
+    pub fn jump_slideshow(&self, delta: i64) {
+        let moved = match self.ivars().show.borrow_mut().as_mut() {
+            Some(show) => show.playlist.jump(delta),
+            None => return,
+        };
+        if moved {
+            self.show_current();
+        }
+    }
+
     pub fn step_slideshow_original(&self, delta: i64) {
         let stepped = match self.ivars().show.borrow_mut().as_mut() {
             Some(show) => show.playlist.step_original(delta),
@@ -1571,6 +1596,40 @@ impl AppDelegate {
         self.update_overlay();
     }
 
+    /// shift-I: the file's own EXIF under the usual line.
+    pub fn toggle_exif_overlay(&self) {
+        let on = !self.ivars().overlay_exif.get();
+        self.ivars().overlay_exif.set(on);
+        self.show_overlay_for_extra(on);
+    }
+
+    /// p: the full path under the usual line.
+    pub fn toggle_path_overlay(&self) {
+        let on = !self.ivars().overlay_path.get();
+        self.ivars().overlay_path.set(on);
+        self.show_overlay_for_extra(on);
+    }
+
+    /// h or ?: the cheat sheet, which replaces the line while it is up.
+    pub fn toggle_help_overlay(&self) {
+        let on = !self.ivars().overlay_help.get();
+        self.ivars().overlay_help.set(on);
+        self.show_overlay_for_extra(on);
+    }
+
+    /// An extra block is useless behind a hidden overlay, so turning
+    /// one on turns the overlay on with it. Turning the last one off
+    /// leaves the overlay where the user had it.
+    fn show_overlay_for_extra(&self, on: bool) {
+        if on && !self.ivars().overlay_visible.get() {
+            self.ivars().overlay_visible.set(true);
+            if let Some(show) = self.ivars().show.borrow().as_ref() {
+                show.overlay.setHidden(false);
+            }
+        }
+        self.update_overlay();
+    }
+
     pub fn toggle_overlay(&self) {
         let visible = !self.ivars().overlay_visible.get();
         self.ivars().overlay_visible.set(visible);
@@ -1628,9 +1687,54 @@ impl AppDelegate {
             (show.overlay.clone(), show.window.clone(), name, text)
             }
         };
+        let text = if self.ivars().overlay_help.get() {
+            SLIDESHOW_HELP.to_owned()
+        } else {
+            self.with_overlay_extras(text)
+        };
         overlay.setStringValue(&NSString::from_str(&text));
+        // The block grows downward from a fixed bottom-left corner,
+        // so a long EXIF list never walks off the screen.
+        let bottom_left = overlay.frame().origin;
+        overlay.sizeToFit();
+        let mut frame = overlay.frame();
+        frame.origin = bottom_left;
+        overlay.setFrame(frame);
         // Visible as the title bar in windowed mode.
         window.setTitle(&NSString::from_str(&name));
+    }
+
+    /// The usual line, plus whatever extra blocks are switched on.
+    fn with_overlay_extras(&self, line: String) -> String {
+        let want_exif = self.ivars().overlay_exif.get();
+        let want_path = self.ivars().overlay_path.get();
+        if !want_exif && !want_path {
+            return line;
+        }
+        let Some(path) = self
+            .ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .and_then(|show| show.playlist.current().cloned())
+        else {
+            return line;
+        };
+        let mut text = line;
+        if want_path {
+            text.push('\n');
+            text.push_str(&path.to_string_lossy());
+        }
+        if want_exif {
+            let rows = decoder::image_info(&path);
+            if rows.is_empty() {
+                text.push_str("\nNo EXIF in this file.");
+            } else {
+                text.push('\n');
+                text.push_str(&rows_text(&rows));
+            }
+        }
+        text
     }
 
     /// Display the current slide from cache or request it, and
@@ -1865,6 +1969,18 @@ impl AppDelegate {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn e2e_toggle_exif_overlay(&self) {
+        self.toggle_exif_overlay();
+    }
+
+    pub fn e2e_toggle_path_overlay(&self) {
+        self.toggle_path_overlay();
+    }
+
+    pub fn e2e_toggle_help_overlay(&self) {
+        self.toggle_help_overlay();
     }
 
     pub fn e2e_info_text(&self) -> String {
@@ -2326,6 +2442,27 @@ fn format_bytes(bytes: u64) -> String {
         format!("{value:.1} {}", UNITS[unit])
     }
 }
+
+/// The cheat sheet, shown over the slide by h or ?. It is written by
+/// hand, so it has to be kept honest against the key handler in
+/// slideshow.rs.
+const SLIDESHOW_HELP: &str = "\
+Slideshow keys
+
+→ ↓ l      next slide          ← ↑ j      previous slide
+space      next, or pause      ⌥ + arrow  step in sorted order
+page up    back ten            page down  on ten
+home       first slide         end        last slide
+1 to 9     advance every n s   0          advance off
+!          every half second   @          every 1.5 seconds
++ -        zoom in and out     =          actual size
+*          reset the view      r R f      rotate, rotate back, flip
+i          this line           ⇧I         EXIF
+p          full path           h or ?     this sheet
+⌘⌫         move to trash       ⌘I         info panel
+click      next slide          right-click  previous
+scroll     step slides         drag       pan a zoomed image
+esc or q   end the slideshow";
 
 /// Label and value, one pair per line, labels padded so the values
 /// line up in the panel's fixed-width layout.

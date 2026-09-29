@@ -114,6 +114,24 @@ impl Playlist {
         }
     }
 
+    /// Jump by `delta`, stopping at the ends instead of refusing to
+    /// move. A page key that does nothing near the end reads as a
+    /// broken key, so it lands on the last slide instead. With loop
+    /// on it wraps, like every other move.
+    pub fn jump(&mut self, delta: i64) -> bool {
+        let len = self.files.len() as i64;
+        if len == 0 {
+            return false;
+        }
+        if self.looping {
+            return self.step(delta);
+        }
+        let target = (self.position as i64 + delta).clamp(0, len - 1) as usize;
+        let moved = target != self.position;
+        self.position = target;
+        moved
+    }
+
     pub fn jump_first(&mut self) {
         self.position = 0;
     }
@@ -220,6 +238,21 @@ mod tests {
 
     fn name(p: &PathBuf) -> String {
         p.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn page_jumps_stop_at_the_ends() {
+        let mut pl = playlist(4);
+        assert!(pl.jump(10));
+        assert_eq!(pl.current_index(), 3, "a long jump lands on the last slide");
+        assert!(!pl.jump(10), "already there, so nothing moves");
+        assert!(pl.jump(-10));
+        assert_eq!(pl.current_index(), 0, "and back on the first");
+        // With loop on, a jump wraps the way a step does.
+        let mut pl = playlist(4);
+        pl.looping = true;
+        assert!(pl.jump(5));
+        assert_eq!(pl.current_index(), 1);
     }
 
     #[test]

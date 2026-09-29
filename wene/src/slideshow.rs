@@ -14,6 +14,14 @@ use objc2_foundation::NSRect;
 
 use crate::AppDelegate;
 
+/// How far page up and page down jump, as in the original app.
+const PAGE: i64 = 10;
+/// A wheel tick smaller than this is noise from a trackpad glide.
+const SCROLL_SLOP: f64 = 0.5;
+/// How long the wheel waits before it can move another slide.
+const SCROLL_GATE: std::time::Duration = std::time::Duration::from_millis(120);
+
+
 /// Half-powers-of-two zoom ladder, same shape as the original.
 const ZOOM_LADDER: &[f64] = &[
     0.125, 0.1875, 0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0,
@@ -100,6 +108,12 @@ pub struct SlideViewIvars {
     rotation: Cell<i32>,
     flipped: Cell<bool>,
     offset: Cell<(f64, f64)>,
+    /// True once a press has moved, so the release pans instead of
+    /// stepping to the next slide.
+    dragged: Cell<bool>,
+    /// When the wheel last moved a slide, so one flick does not run
+    /// through the folder.
+    last_scroll: Cell<Option<std::time::Instant>>,
     pub delegate: OnceCell<Retained<AppDelegate>>,
 }
 
@@ -166,13 +180,70 @@ define_class!(
             objc2_core_graphics::CGContext::restore_g_state(cg);
         }
 
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {
+            self.ivars().dragged.set(false);
+        }
+
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
+            self.ivars().dragged.set(true);
             let (dx, dy) = self.ivars().offset.get();
             let (ex, ey) = (event.deltaX(), event.deltaY());
             // deltaY is flipped relative to the non-flipped view.
             self.ivars().offset.set((dx + ex, dy - ey));
             self.notify_state_change();
+        }
+
+        // A click moves on, the way it does in the original app. A
+        // drag pans instead, and a double-click ends the show.
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            if self.ivars().dragged.get() {
+                return;
+            }
+            let Some(delegate) = self.ivars().delegate.get() else { return };
+            if event.clickCount() >= 2 {
+                delegate.end_slideshow();
+            } else {
+                delegate.step_slideshow(1);
+            }
+        }
+
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, _event: &NSEvent) {
+            if let Some(delegate) = self.ivars().delegate.get() {
+                delegate.step_slideshow(-1);
+            }
+        }
+
+        // The wheel steps slides while the image fits, and pans it
+        // once it is zoomed in, where panning is what a wheel is for.
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            let (dx, dy) = (event.deltaX(), event.deltaY());
+            if self.ivars().zoom.get().is_some() {
+                let (ox, oy) = self.ivars().offset.get();
+                self.ivars().offset.set((ox + dx, oy - dy));
+                self.notify_state_change();
+                return;
+            }
+            let step = if dy.abs() >= dx.abs() { -dy } else { -dx };
+            if step.abs() < SCROLL_SLOP {
+                return;
+            }
+            // One flick on a trackpad is dozens of events. Without a
+            // gate a single swipe would run through the whole folder.
+            let now = std::time::Instant::now();
+            if let Some(last) = self.ivars().last_scroll.get() {
+                if now.duration_since(last) < SCROLL_GATE {
+                    return;
+                }
+            }
+            self.ivars().last_scroll.set(Some(now));
+            if let Some(delegate) = self.ivars().delegate.get() {
+                delegate.step_slideshow(if step > 0.0 { 1 } else { -1 });
+            }
         }
 
         #[unsafe(method(advanceFrame:))]
@@ -211,6 +282,8 @@ define_class!(
                 124 | 125 => return delegate.step_slideshow(1),  // right, down
                 115 => return delegate.jump_slideshow_start(),   // home
                 119 => return delegate.jump_slideshow_end(),     // end
+                116 => return delegate.jump_slideshow(-PAGE),    // page up
+                121 => return delegate.jump_slideshow(PAGE),     // page down
                 _ => {}
             }
             match chars.as_str() {
@@ -222,6 +295,9 @@ define_class!(
                 "R" => self.rotate(-90),
                 "f" => self.flip(),
                 "i" => delegate.toggle_overlay(),
+                "I" => delegate.toggle_exif_overlay(),
+                "p" => delegate.toggle_path_overlay(),
+                "h" | "?" => delegate.toggle_help_overlay(),
                 "0" => delegate.set_auto_advance(None),
                 "!" => delegate.set_auto_advance(Some(0.5)),
                 "@" => delegate.set_auto_advance(Some(1.5)),
@@ -254,6 +330,8 @@ impl SlideView {
             rotation: Cell::new(0),
             flipped: Cell::new(false),
             offset: Cell::new((0.0, 0.0)),
+            dragged: Cell::new(false),
+            last_scroll: Cell::new(None),
             delegate: OnceCell::new(),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }

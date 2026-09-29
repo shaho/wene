@@ -990,6 +990,51 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.e2e_toggle_info();
             check(state, !delegate.e2e_info_open(), "a second cmd-I puts it away");
         }
+        65 => {
+            // The overlay's extra blocks, on top of a running show.
+            delegate.e2e_select(&[0]);
+            delegate.start_slideshow(0, true);
+        }
+        66 => {
+            delegate.e2e_toggle_path_overlay();
+            let text = delegate.e2e_overlay_text().unwrap_or_default();
+            check(
+                state,
+                text.lines().count() >= 2 && text.contains("wene-e2e-fixture"),
+                "p adds the full path under the usual line",
+            );
+            delegate.e2e_toggle_exif_overlay();
+            let text = delegate.e2e_overlay_text().unwrap_or_default();
+            check(
+                state,
+                text.contains("Dimensions"),
+                "shift-I adds what the file header holds",
+            );
+            delegate.e2e_toggle_help_overlay();
+            let text = delegate.e2e_overlay_text().unwrap_or_default();
+            check(
+                state,
+                text.starts_with("Slideshow keys"),
+                "h takes the overlay over with the cheat sheet",
+            );
+            delegate.e2e_toggle_help_overlay();
+            delegate.e2e_toggle_exif_overlay();
+            delegate.e2e_toggle_path_overlay();
+            let text = delegate.e2e_overlay_text().unwrap_or_default();
+            check(
+                state,
+                text.lines().count() == 1 && text.contains("/"),
+                "turning the blocks off leaves the usual line alone",
+            );
+            // Page down walks ten slides, or as far as the folder goes.
+            delegate.jump_slideshow(10);
+            check(
+                state,
+                delegate.e2e_current_index() == Some(3),
+                "a page jump stops at the last slide",
+            );
+            delegate.end_slideshow();
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {
