@@ -742,10 +742,12 @@ impl GridView {
             Some(delegate) => delegate.repeat_title(kind),
             None => String::new(),
         };
-        let entries: [Option<(String, Sel)>; 9] = [
+        let entries: [Option<(String, Sel)>; 11] = [
             Some(("Start slideshow".to_owned(), sel!(startSlideshow:))),
             None,
             Some(("Reveal in Finder".to_owned(), sel!(revealInFinder:))),
+            Some(("Get info".to_owned(), sel!(getInfo:))),
+            Some(("Copy path".to_owned(), sel!(copyPath:))),
             None,
             Some(("Move to…".to_owned(), sel!(moveToFolder:))),
             Some(("Copy to…".to_owned(), sel!(copyToFolder:))),
@@ -774,6 +776,15 @@ impl GridView {
                 unsafe { item.setTarget(Some(delegate)) };
             }
             menu.addItem(&item);
+            // "Open with" sits under Reveal, where Finder keeps it.
+            if action == sel!(revealInFinder:) {
+                if let Some(delegate) = delegate {
+                    let open_with = NSMenuItem::new(mtm);
+                    open_with.setTitle(&NSString::from_str("Open with"));
+                    open_with.setSubmenu(Some(&delegate.open_with_menu(mtm)));
+                    menu.addItem(&open_with);
+                }
+            }
         }
         menu
     }

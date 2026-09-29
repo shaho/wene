@@ -1035,6 +1035,37 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             delegate.end_slideshow();
         }
+        67 => {
+            // Handing an image to something else: the app list, and
+            // the clipboard.
+            delegate.e2e_select(&[0]);
+            let apps = delegate.e2e_open_with_names();
+            check(
+                state,
+                !apps.is_empty(),
+                "the open with menu lists the apps that can open the image",
+            );
+            delegate.e2e_copy_path(false);
+            let copied = delegate.e2e_pasteboard_text();
+            check(
+                state,
+                copied.contains("wene-e2e-fixture") && !copied.starts_with("file:"),
+                "copy path puts the plain path on the clipboard",
+            );
+            check(
+                state,
+                delegate.e2e_status_text().starts_with("Copied the path"),
+                "the status bar says what was copied",
+            );
+            delegate.e2e_select(&[0, 1]);
+            delegate.e2e_copy_path(true);
+            let copied = delegate.e2e_pasteboard_text();
+            check(
+                state,
+                copied.lines().count() == 2 && copied.starts_with("file:"),
+                "several images copy as one file URL per line",
+            );
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {

@@ -21,7 +21,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSColor, NSControlTextEditingDelegate, NSFont, NSTextFieldDelegate, NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView,
+    NSColor, NSControlTextEditingDelegate, NSFont, NSTextFieldDelegate, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView,
     NSSplitViewController, NSSplitViewItem, NSTextField, NSViewController, NSWindow,
     NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
@@ -156,6 +156,15 @@ define_class!(
             command: objc2::runtime::Sel,
         ) -> bool {
             self.filter_field_command(command)
+        }
+    }
+
+    // The only menu the delegate owns is "Open with", which has to
+    // be rebuilt from the selection every time it opens.
+    unsafe impl NSMenuDelegate for AppDelegate {
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, menu: &NSMenu) {
+            self.fill_open_with(menu);
         }
     }
 
@@ -395,6 +404,29 @@ define_class!(
         #[unsafe(method(moveToTrash:))]
         fn move_to_trash(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.trash_selection();
+        }
+
+        #[unsafe(method(openWith:))]
+        fn open_with(&self, sender: Option<&objc2::runtime::AnyObject>) {
+            let Some(item) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) else { return };
+            let Some(app) = item.representedObject() else { return };
+            let Ok(app) = app.downcast::<NSURL>() else { return };
+            self.open_targets_with(&app);
+        }
+
+        #[unsafe(method(copyPath:))]
+        fn copy_path(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.copy_targets(false);
+        }
+
+        #[unsafe(method(copyFileUrl:))]
+        fn copy_file_url(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.copy_targets(true);
+        }
+
+        #[unsafe(method(setDesktopPicture:))]
+        fn set_desktop_picture_action(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.use_as_desktop_picture();
         }
 
         #[unsafe(method(getInfo:))]
@@ -1051,6 +1083,128 @@ impl AppDelegate {
         self.flash_overlay(&message);
     }
 
+    /// The apps that can open the first target, as a submenu. Built
+    /// fresh every time it opens, because the selection moves.
+    pub fn open_with_menu(&self, mtm: MainThreadMarker) -> Retained<NSMenu> {
+        let menu = NSMenu::new(mtm);
+        self.fill_open_with(&menu);
+        menu
+    }
+
+    /// Fill a menu with the apps that can open the first target. The
+    /// File menu's submenu is refilled every time it opens; the
+    /// right-click menu is built fresh anyway.
+    fn fill_open_with(&self, menu: &NSMenu) {
+        let mtm = self.mtm();
+        menu.removeAllItems();
+        let targets = self.action_targets();
+        let Some(first) = targets.first() else { return };
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&first.to_string_lossy()));
+        let workspace = NSWorkspace::sharedWorkspace();
+        for app in workspace.URLsForApplicationsToOpenURL(&url).iter() {
+            let Some(path) = app.path() else { continue };
+            let name = objc2_foundation::NSFileManager::defaultManager()
+                .displayNameAtPath(&path);
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &name,
+                    Some(sel!(openWith:)),
+                    ns_string!(""),
+                )
+            };
+            unsafe {
+                item.setTarget(Some(self));
+                item.setRepresentedObject(Some(&app));
+            }
+            menu.addItem(&item);
+        }
+    }
+
+    fn open_targets_with(&self, app: &NSURL) {
+        let targets = self.action_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let urls: Vec<Retained<NSURL>> = targets
+            .iter()
+            .map(|path| NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())))
+            .collect();
+        let configuration = objc2_app_kit::NSWorkspaceOpenConfiguration::configuration();
+        NSWorkspace::sharedWorkspace().openURLs_withApplicationAtURL_configuration_completionHandler(
+            &NSArray::from_retained_slice(&urls),
+            app,
+            &configuration,
+            None,
+        );
+    }
+
+    /// Put the targets on the clipboard, as plain paths or as file
+    /// URLs, one per line.
+    fn copy_targets(&self, as_url: bool) {
+        let targets = self.action_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let text = targets
+            .iter()
+            .map(|path| {
+                if as_url {
+                    NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
+                        .absoluteString()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                } else {
+                    path.to_string_lossy().into_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        unsafe {
+            pasteboard.setString_forType(
+                &NSString::from_str(&text),
+                objc2_app_kit::NSPasteboardTypeString,
+            )
+        };
+        let what = if as_url { "file URL" } else { "path" };
+        let message = match targets.len() {
+            1 => format!("Copied the {what}"),
+            n => format!("Copied {n} {what}s"),
+        };
+        self.show_status_message(&message);
+        self.flash_overlay(&message);
+    }
+
+    /// cmd-D: the current image becomes the desktop picture, on the
+    /// screen the window is on.
+    fn use_as_desktop_picture(&self) {
+        let targets = self.action_targets();
+        let Some(path) = targets.first() else { return };
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let screen = self
+            .ivars()
+            .window
+            .get()
+            .and_then(|window| window.screen())
+            .or_else(|| NSScreen::mainScreen(self.mtm()));
+        let Some(screen) = screen else { return };
+        let message = match unsafe {
+            NSWorkspace::sharedWorkspace()
+                .setDesktopImageURL_forScreen_options_error(
+                    &url,
+                    &screen,
+                    &objc2_foundation::NSDictionary::new(),
+                )
+        } {
+            Ok(()) => format!("Desktop picture: {}", file_name(path)),
+            Err(_) => "Could not set the desktop picture".to_owned(),
+        };
+        self.show_status_message(&message);
+        self.flash_overlay(&message);
+    }
+
     /// cmd-I: the info panel, a floating window that follows whatever
     /// an action would work on. A second press puts it away.
     fn toggle_info(&self) {
@@ -1187,6 +1341,10 @@ impl AppDelegate {
         let acts_on_images = [
             sel!(moveToTrash:),
             sel!(revealInFinder:),
+            sel!(openWith:),
+            sel!(copyPath:),
+            sel!(copyFileUrl:),
+            sel!(setDesktopPicture:),
             sel!(moveToFolder:),
             sel!(copyToFolder:),
             sel!(moveAgain:),
@@ -1983,6 +2141,27 @@ impl AppDelegate {
         self.toggle_help_overlay();
     }
 
+    pub fn e2e_copy_path(&self, as_url: bool) {
+        self.copy_targets(as_url);
+    }
+
+    pub fn e2e_pasteboard_text(&self) -> String {
+        unsafe {
+            objc2_app_kit::NSPasteboard::generalPasteboard()
+                .stringForType(objc2_app_kit::NSPasteboardTypeString)
+        }
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+    }
+
+    pub fn e2e_open_with_names(&self) -> Vec<String> {
+        self.open_with_menu(self.mtm())
+            .itemArray()
+            .iter()
+            .map(|item| item.title().to_string())
+            .collect()
+    }
+
     pub fn e2e_info_text(&self) -> String {
         self.info_text()
     }
@@ -2618,6 +2797,21 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         )
     };
     file_menu.addItem(&info);
+    let open_with = NSMenuItem::new(mtm);
+    open_with.setTitle(ns_string!("Open with"));
+    let open_with_menu = delegate.open_with_menu(mtm);
+    open_with_menu.setDelegate(Some(ProtocolObject::from_ref(delegate)));
+    open_with.setSubmenu(Some(&open_with_menu));
+    file_menu.addItem(&open_with);
+    let desktop = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Set as desktop picture"),
+            Some(sel!(setDesktopPicture:)),
+            ns_string!("d"),
+        )
+    };
+    file_menu.addItem(&desktop);
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));
     // cmd-Delete, Finder's binding, in the grid and the slideshow.
     let trash = unsafe {
@@ -2683,6 +2877,29 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         )
     };
     edit_menu.addItem(&filter);
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Plain cmd-C stays free for a copy of the image itself later.
+    let copy_path = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Copy path"),
+            Some(sel!(copyPath:)),
+            ns_string!("c"),
+        )
+    };
+    copy_path.setKeyEquivalentModifierMask(
+        objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Option,
+    );
+    edit_menu.addItem(&copy_path);
+    let copy_url = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Copy file URL"),
+            Some(sel!(copyFileUrl:)),
+            ns_string!(""),
+        )
+    };
+    edit_menu.addItem(&copy_url);
     edit_item.setSubmenu(Some(&edit_menu));
     menubar.addItem(&edit_item);
 
