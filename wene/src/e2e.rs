@@ -1147,6 +1147,52 @@ pub fn run_step(delegate: &AppDelegate) {
             let _ = std::fs::remove_file(format!("{root}/{}", undo_name()));
             let _ = std::fs::remove_dir_all(transfer_folder());
         }
+        73 => {
+            // Thumbnail size: the ceiling holds, and the slider reads
+            // what the grid settled on.
+            delegate.e2e_thumb_cap(160.0);
+            delegate.e2e_scale_cells(4.0);
+            check(
+                state,
+                delegate.e2e_thumb_size() == 160.0,
+                "cells stop at the size the preference allows",
+            );
+            check(
+                state,
+                delegate.e2e_slider_value() == delegate.e2e_thumb_size(),
+                "the slider reads what the grid settled on",
+            );
+            delegate.e2e_thumb_cap(512.0);
+            delegate.e2e_scale_cells(4.0);
+            check(
+                state,
+                delegate.e2e_thumb_size() > 160.0,
+                "raising the ceiling lets them grow again",
+            );
+            delegate.e2e_thumb_cap(160.0);
+            check(
+                state,
+                delegate.e2e_thumb_size() == 160.0,
+                "lowering it brings oversized cells back down",
+            );
+            delegate.e2e_thumb_cap(320.0);
+            delegate.e2e_scale_cells(0.001);
+            check(
+                state,
+                delegate.e2e_thumb_size() == 60.0,
+                "and they stop at the small end too",
+            );
+        }
+        74 => {
+            // No shortcut may be bound twice.
+            let clashes = delegate.e2e_menu_conflicts();
+            if !clashes.is_empty() {
+                for clash in &clashes {
+                    println!("e2e menu clash: {clash}");
+                }
+            }
+            check(state, clashes.is_empty(), "every menu shortcut is bound once");
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {

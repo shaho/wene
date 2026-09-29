@@ -104,6 +104,9 @@ pub struct DelegateIvars {
     /// of it and scribble over its progress line.
     transfer_busy: Cell<bool>,
     prefs_window: OnceCell<Retained<NSWindow>>,
+    /// The slider in the status bar, and the ceiling the preference
+    /// sets for it.
+    thumb_slider: OnceCell<Retained<objc2_app_kit::NSSlider>>,
     /// What the app did to files, so cmd-Z can take it back.
     history: RefCell<History>,
     undo_item: OnceCell<Retained<NSMenuItem>>,
@@ -353,6 +356,16 @@ define_class!(
             self.save_prefs();
         }
 
+        #[unsafe(method(prefsThumbCap:))]
+        fn prefs_thumb_cap(&self, sender: Option<&objc2::runtime::AnyObject>) {
+            let Some(popup) = sender.and_then(|s| s.downcast_ref::<objc2_app_kit::NSPopUpButton>())
+            else {
+                return;
+            };
+            let cap = popup.selectedItem().map(|item| item.tag()).unwrap_or(320) as f64;
+            self.apply_thumb_cap(cap);
+        }
+
         #[unsafe(method(prefsAutoAdvance:))]
         fn prefs_auto_advance(&self, sender: Option<&objc2::runtime::AnyObject>) {
             let tag = sender
@@ -410,6 +423,11 @@ define_class!(
         #[unsafe(method(moveToTrash:))]
         fn move_to_trash(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.trash_selection();
+        }
+
+        #[unsafe(method(thumbSliderMoved:))]
+        fn thumb_slider_moved_action(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.thumb_slider_moved();
         }
 
         #[unsafe(method(undoLast:))]
@@ -571,6 +589,7 @@ impl AppDelegate {
             copy_again_item: OnceCell::new(),
             transfer_busy: Cell::new(false),
             prefs_window: OnceCell::new(),
+            thumb_slider: OnceCell::new(),
             history: RefCell::new(History::default()),
             undo_item: OnceCell::new(),
             redo_item: OnceCell::new(),
@@ -714,6 +733,12 @@ impl AppDelegate {
     /// Apply saved settings at launch. Skipped in e2e runs so the
     /// harness starts from a known state.
     fn load_prefs(&self) {
+        // The thumbnail size is the one preference the harness also
+        // wants, because the grid is laid out from it.
+        self.apply_thumb_cap(thumb_cap_pref());
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.set_cell_size(thumb_size_pref());
+        }
         if e2e::enabled() {
             return;
         }
@@ -817,6 +842,17 @@ impl AppDelegate {
                     .map(|s| (s * 10.0) as isize)
                     .unwrap_or(0);
                 popup.selectItemWithTag(tenths);
+            }
+        }
+        if let Some(view) = content.viewWithTag(8) {
+            if let Some(popup) = view.downcast_ref::<objc2_app_kit::NSPopUpButton>() {
+                let cap = self
+                    .ivars()
+                    .grid
+                    .get()
+                    .map(|grid| grid.cell_cap())
+                    .unwrap_or(grid::CELL_CAPS[1]);
+                popup.selectItemWithTag(cap as isize);
             }
         }
         if let Some(view) = content.viewWithTag(7) {
@@ -1115,6 +1151,47 @@ impl AppDelegate {
         let message = transfer_message(kind, &done, &folder, renamed, failed);
         self.show_status_message(&message);
         self.flash_overlay(&message);
+    }
+
+    /// The grid's cells changed size: keep the slider and the saved
+    /// size with it.
+    pub fn thumb_size_changed(&self, size: f64) {
+        if let Some(slider) = self.ivars().thumb_slider.get() {
+            slider.setDoubleValue(size);
+        }
+        if !e2e::enabled() {
+            NSUserDefaults::standardUserDefaults()
+                .setDouble_forKey(size, ns_string!("thumbSize"));
+        }
+    }
+
+    /// The slider moved.
+    fn thumb_slider_moved(&self) {
+        let (Some(slider), Some(grid)) = (self.ivars().thumb_slider.get(), self.ivars().grid.get())
+        else {
+            return;
+        };
+        grid.set_cell_size(slider.doubleValue());
+    }
+
+    /// The preference moved: the ceiling for the slider, the cells,
+    /// and the size thumbnails are decoded at.
+    fn apply_thumb_cap(&self, cap: f64) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.set_cell_cap(cap);
+            if let Some(slider) = self.ivars().thumb_slider.get() {
+                slider.setMaxValue(cap);
+                slider.setDoubleValue(grid.cell_size());
+            }
+        }
+        if let Some(engine) = self.ivars().engine.get() {
+            // Retina: a cell is drawn at twice its points.
+            engine.set_max_thumb_px((cap * 2.0) as i32);
+        }
+        if !e2e::enabled() {
+            NSUserDefaults::standardUserDefaults()
+                .setDouble_forKey(cap, ns_string!("thumbCap"));
+        }
     }
 
     /// Tell the engine about files the app itself moved, so its list
@@ -2226,6 +2303,59 @@ impl AppDelegate {
             .unwrap_or(0.0)
     }
 
+    /// Every key equivalent in the menu bar that two items share.
+    /// A shortcut bound twice is a shortcut that does the wrong thing
+    /// half the time, and it is the kind of mistake that arrives with
+    /// the next menu item rather than this one.
+    pub fn e2e_menu_conflicts(&self) -> Vec<String> {
+        fn walk(menu: &NSMenu, seen: &mut HashMap<(String, usize), String>, clashes: &mut Vec<String>) {
+            for item in menu.itemArray() {
+                let key = item.keyEquivalent().to_string();
+                if !key.is_empty() {
+                    let mask = item.keyEquivalentModifierMask().bits() as usize;
+                    let title = item.title().to_string();
+                    match seen.get(&(key.clone(), mask)) {
+                        // The same entry twice is one shortcut, not a
+                        // clash: a hidden twin catches the shifted
+                        // press of the same key.
+                        Some(held) if *held == title => {}
+                        Some(held) => clashes.push(format!("{key} ({mask}): {held} and {title}")),
+                        None => {
+                            seen.insert((key, mask), title);
+                        }
+                    }
+                }
+                if let Some(submenu) = item.submenu() {
+                    walk(&submenu, seen, clashes);
+                }
+            }
+        }
+        let mtm = self.mtm();
+        let Some(menubar) = NSApplication::sharedApplication(mtm).mainMenu() else {
+            return Vec::new();
+        };
+        let mut seen = HashMap::new();
+        let mut clashes = Vec::new();
+        walk(&menubar, &mut seen, &mut clashes);
+        clashes
+    }
+
+    pub fn e2e_thumb_cap(&self, cap: f64) {
+        self.apply_thumb_cap(cap);
+    }
+
+    pub fn e2e_thumb_size(&self) -> f64 {
+        self.ivars().grid.get().map(|grid| grid.cell_size()).unwrap_or_default()
+    }
+
+    pub fn e2e_slider_value(&self) -> f64 {
+        self.ivars()
+            .thumb_slider
+            .get()
+            .map(|slider| slider.doubleValue())
+            .unwrap_or_default()
+    }
+
     pub fn e2e_scale_cells(&self, factor: f64) {
         if let Some(grid) = self.ivars().grid.get() {
             grid.scale_cells(factor);
@@ -2656,6 +2786,34 @@ fn save_last_folder(root: &std::path::Path) {
     }
 }
 
+/// How wide the thumbnail slider is, and the two preferences behind
+/// it: the ceiling the popup sets, and the size last left behind.
+const THUMB_SLIDER_W: f64 = 110.0;
+
+fn thumb_cap_pref() -> f64 {
+    if e2e::enabled() {
+        return grid::CELL_CAPS[1];
+    }
+    let stored = NSUserDefaults::standardUserDefaults().doubleForKey(ns_string!("thumbCap"));
+    if grid::CELL_CAPS.contains(&stored) {
+        stored
+    } else {
+        grid::CELL_CAPS[1]
+    }
+}
+
+fn thumb_size_pref() -> f64 {
+    if e2e::enabled() {
+        return grid::CELL;
+    }
+    let stored = NSUserDefaults::standardUserDefaults().doubleForKey(ns_string!("thumbSize"));
+    if stored >= 60.0 {
+        stored.min(thumb_cap_pref())
+    } else {
+        grid::CELL
+    }
+}
+
 fn startup_folder_pref() -> Option<String> {
     if e2e::enabled() {
         return None;
@@ -2667,9 +2825,10 @@ fn startup_folder_pref() -> Option<String> {
 }
 
 /// The preferences window: one plain pane, controls looked up by tag
-/// (1-5 checkboxes, 6 auto-advance popup, 7 startup folder field).
+/// (1-5 checkboxes, 6 auto-advance popup, 7 startup folder field,
+/// 8 largest thumbnail popup). Rows are laid out from the top.
 fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained<NSWindow> {
-    let frame = NSRect::new(CGPoint::new(360.0, 360.0), CGSize::new(430.0, 264.0));
+    let frame = NSRect::new(CGPoint::new(360.0, 360.0), CGSize::new(430.0, 296.0));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
@@ -2706,9 +2865,9 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
     };
 
     // Startup folder row (top).
-    label("Startup folder:", 20.0, 224.0);
+    label("Startup folder:", 20.0, 256.0);
     let field = NSTextField::labelWithString(ns_string!(""), mtm);
-    field.setFrame(NSRect::new(CGPoint::new(20.0, 200.0), CGSize::new(250.0, 18.0)));
+    field.setFrame(NSRect::new(CGPoint::new(20.0, 236.0), CGSize::new(250.0, 18.0)));
     field.setTag(7);
     field.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(11.0)));
     field.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -2725,7 +2884,7 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
                 mtm,
             )
         };
-        b.setFrame(NSRect::new(CGPoint::new(x, 194.0), CGSize::new(72.0, 28.0)));
+        b.setFrame(NSRect::new(CGPoint::new(x, 230.0), CGSize::new(72.0, 28.0)));
         content.addSubview(&b);
     }
 
@@ -2733,14 +2892,14 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
         "Start slideshows in a window",
         sel!(prefsToggleWindowed:),
         1,
-        160.0,
+        196.0,
     );
-    checkbox("Loop slideshows", sel!(toggleLoop:), 2, 132.0);
-    checkbox("Shuffle slideshows", sel!(toggleShuffle:), 3, 104.0);
+    checkbox("Loop slideshows", sel!(toggleLoop:), 2, 168.0);
+    checkbox("Shuffle slideshows", sel!(toggleShuffle:), 3, 140.0);
 
-    label("Auto-advance:", 20.0, 72.0);
+    label("Auto-advance:", 20.0, 108.0);
     let popup = objc2_app_kit::NSPopUpButton::new(mtm);
-    popup.setFrame(NSRect::new(CGPoint::new(150.0, 64.0), CGSize::new(180.0, 26.0)));
+    popup.setFrame(NSRect::new(CGPoint::new(150.0, 100.0), CGSize::new(180.0, 26.0)));
     popup.setTag(6);
     for (title, tag) in [
         ("Off", 0isize),
@@ -2759,6 +2918,22 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
         popup.setAction(Some(sel!(prefsAutoAdvance:)));
     }
     content.addSubview(&popup);
+
+    label("Largest thumbnail:", 20.0, 68.0);
+    let thumbs = objc2_app_kit::NSPopUpButton::new(mtm);
+    thumbs.setFrame(NSRect::new(CGPoint::new(150.0, 60.0), CGSize::new(180.0, 26.0)));
+    thumbs.setTag(8);
+    for cap in grid::CELL_CAPS {
+        thumbs.addItemWithTitle(&NSString::from_str(&format!("{cap:.0} points")));
+        if let Some(item) = thumbs.lastItem() {
+            item.setTag(cap as isize);
+        }
+    }
+    unsafe {
+        thumbs.setTarget(Some(delegate));
+        thumbs.setAction(Some(sel!(prefsThumbCap:)));
+    }
+    content.addSubview(&thumbs);
 
     checkbox("Show filenames", sel!(toggleLabels:), 4, 28.0);
 
@@ -2990,6 +3165,28 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
     };
     app_menu.addItem(&prefs);
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    for (title, action, key, alternate) in [
+        ("Hide Wêne", sel!(hide:), "h", false),
+        ("Hide others", sel!(hideOtherApplications:), "h", true),
+        ("Show all", sel!(unhideAllApplications:), "", false),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        if alternate {
+            item.setKeyEquivalentModifierMask(
+                objc2_app_kit::NSEventModifierFlags::Command
+                    | objc2_app_kit::NSEventModifierFlags::Option,
+            );
+        }
+        app_menu.addItem(&item);
+    }
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     let quit = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -3162,6 +3359,28 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
     edit_item.setSubmenu(Some(&edit_menu));
     menubar.addItem(&edit_item);
 
+    let window_item = NSMenuItem::new(mtm);
+    let window_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Window"));
+    for (title, action, key) in [
+        ("Close", sel!(performClose:), "w"),
+        ("Minimise", sel!(performMiniaturize:), "m"),
+        ("Zoom", sel!(performZoom:), ""),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        window_menu.addItem(&item);
+    }
+    window_item.setSubmenu(Some(&window_menu));
+    // Telling AppKit which menu this is keeps its own window and tab
+    // entries out of View, where they landed before.
+    app.setWindowsMenu(Some(&window_menu));
+
     let show_item = NSMenuItem::new(mtm);
     let show_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Slideshow"));
     let start = unsafe {
@@ -3271,14 +3490,29 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         view_menu.addItem(&item);
     }
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // cmd-plus is really shift-cmd-equals, and a key equivalent of
+    // "+" matches nothing a keyboard can send. The key under the plus
+    // is the one to bind, with a hidden twin for the shifted press.
     let bigger = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
             ns_string!("Bigger thumbnails"),
             Some(sel!(biggerThumbs:)),
-            ns_string!("+"),
+            ns_string!("="),
         )
     };
+    let bigger_shifted = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Bigger thumbnails"),
+            Some(sel!(biggerThumbs:)),
+            ns_string!("="),
+        )
+    };
+    bigger_shifted.setKeyEquivalentModifierMask(
+        objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Shift,
+    );
+    bigger_shifted.setHidden(true);
     let smaller = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -3288,6 +3522,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         )
     };
     view_menu.addItem(&bigger);
+    view_menu.addItem(&bigger_shifted);
     view_menu.addItem(&smaller);
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
     let sidebar_item = unsafe {
@@ -3317,6 +3552,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
     let _ = delegate.ivars().labels_item.set(labels_item);
     view_item.setSubmenu(Some(&view_menu));
     menubar.addItem(&view_item);
+    menubar.addItem(&window_item);
     let _ = delegate.ivars().sort_menu.set(view_menu);
 
     let _ = delegate.ivars().loop_item.set(loop_item);
@@ -3397,6 +3633,33 @@ fn main() {
             | objc2_app_kit::NSAutoresizingMaskOptions::ViewMaxYMargin,
     );
 
+    // Thumbnail size, where the original app keeps it: the right end
+    // of the status bar.
+    let slider = objc2_app_kit::NSSlider::initWithFrame(
+        objc2_app_kit::NSSlider::alloc(mtm),
+        NSRect::new(
+            CGPoint::new(content_size.width - THUMB_SLIDER_W - 8.0, 2.0),
+            CGSize::new(THUMB_SLIDER_W, 20.0),
+        ),
+    );
+    slider.setMinValue(60.0);
+    slider.setMaxValue(thumb_cap_pref());
+    slider.setDoubleValue(thumb_size_pref());
+    slider.setAutoresizingMask(
+        objc2_app_kit::NSAutoresizingMaskOptions::ViewMinXMargin
+            | objc2_app_kit::NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    unsafe {
+        slider.setTarget(Some(&*delegate));
+        slider.setAction(Some(sel!(thumbSliderMoved:)));
+    }
+    let _ = delegate.ivars().thumb_slider.set(slider.clone());
+    // The status text stops where the slider starts.
+    status.setFrame(NSRect::new(
+        CGPoint::new(8.0, 4.0),
+        CGSize::new(content_size.width - THUMB_SLIDER_W - 24.0, 16.0),
+    ));
+
     // Filter bar, above the grid and hidden until cmd-F.
     let filter_bar = objc2_app_kit::NSView::initWithFrame(
         objc2_app_kit::NSView::alloc(mtm),
@@ -3429,6 +3692,7 @@ fn main() {
     content.addSubview(&filter_bar);
     content.addSubview(&scroll);
     content.addSubview(&status);
+    content.addSubview(&slider);
 
     let sidebar_vc = NSViewController::new(mtm);
     sidebar_vc.setView(&sidebar_scroll);

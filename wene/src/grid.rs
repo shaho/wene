@@ -28,7 +28,8 @@ use crate::AppDelegate;
 pub const CELL: f64 = 160.0;
 pub const PAD: f64 = 8.0;
 const MIN_CELL: f64 = 60.0;
-const MAX_CELL: f64 = 400.0;
+/// The sizes the preference offers as the ceiling for a cell.
+pub const CELL_CAPS: [f64; 3] = [160.0, 320.0, 512.0];
 /// How far the pointer travels before a press becomes a drag.
 const DRAG_SLOP: f64 = 4.0;
 /// Height of the filename strip under a cell when labels are on.
@@ -45,6 +46,8 @@ pub struct GridIvars {
     /// Lower-cased substring of the filename. Empty means no filter.
     filter: RefCell<String>,
     cell: Cell<f64>,
+    /// The largest a cell may be, from the preference.
+    cell_cap: Cell<f64>,
     labels: Cell<bool>,
     thumbs: RefCell<LruCache<PathBuf, Retained<NSImage>>>,
     requested: RefCell<HashSet<PathBuf>>,
@@ -402,6 +405,7 @@ impl GridView {
             all: RefCell::new(Vec::new()),
             filter: RefCell::new(String::new()),
             cell: Cell::new(CELL),
+            cell_cap: Cell::new(CELL_CAPS[1]),
             labels: Cell::new(false),
             thumbs: RefCell::new(LruCache::new(THUMB_CACHE_BYTES)),
             requested: RefCell::new(HashSet::new()),
@@ -477,8 +481,43 @@ impl GridView {
 
     /// Grow or shrink cells by a factor, clamped, relayout.
     pub fn scale_cells(&self, factor: f64) {
-        let next = (self.ivars().cell.get() * factor).clamp(MIN_CELL, MAX_CELL);
+        self.set_cell_size(self.ivars().cell.get() * factor);
+    }
+
+    pub fn cell_size(&self) -> f64 {
+        self.ivars().cell.get()
+    }
+
+    pub fn cell_cap(&self) -> f64 {
+        self.ivars().cell_cap.get()
+    }
+
+    /// Set the cell size, within the preference's ceiling. Returns
+    /// what it settled on, which is what the slider should read.
+    pub fn set_cell_size(&self, size: f64) -> f64 {
+        let next = size.clamp(MIN_CELL, self.ivars().cell_cap.get());
+        if next == self.ivars().cell.get() {
+            return next;
+        }
         self.ivars().cell.set(next);
+        let width = self.frame().size.width;
+        self.setFrameSize(CGSize::new(width, 0.0));
+        self.setNeedsDisplay(true);
+        if let Some(delegate) = self.ivars().delegate.get() {
+            delegate.thumb_size_changed(next);
+        }
+        next
+    }
+
+    /// The preference moved. Cells larger than the new ceiling come
+    /// down to it, and the thumbnails already drawn are dropped so
+    /// they come back at the size they are now shown at.
+    pub fn set_cell_cap(&self, cap: f64) {
+        self.ivars().cell_cap.set(cap.max(MIN_CELL));
+        self.ivars().thumbs.borrow_mut().clear();
+        self.ivars().requested.borrow_mut().clear();
+        let cell = self.ivars().cell.get().min(cap);
+        self.ivars().cell.set(cell);
         let width = self.frame().size.width;
         self.setFrameSize(CGSize::new(width, 0.0));
         self.setNeedsDisplay(true);

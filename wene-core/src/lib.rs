@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
@@ -154,7 +155,9 @@ pub struct Engine<I> {
     slide_tx: Sender<Job>,
     events_tx: Sender<Event<I>>,
     wakeup: Arc<dyn Fn() + Send + Sync>,
-    max_thumb_px: i32,
+    /// The longest edge a thumbnail is decoded to. Shared with the
+    /// workers so the preference can change it while the app runs.
+    max_thumb_px: Arc<AtomicI32>,
     /// Canonical name-sorted list; shared by the scan walk and the
     /// file watcher so insert indices stay consistent.
     files: Arc<Mutex<Vec<FileInfo>>>,
@@ -177,13 +180,15 @@ impl<I: Send + 'static> Engine<I> {
         let wakeup: Arc<dyn Fn() + Send + Sync> = Arc::new(wakeup);
         let (events_tx, events_rx) = channel::<Event<I>>();
 
+        let max_thumb_px = Arc::new(AtomicI32::new(max_thumb_px));
+
         let (thumb_tx, thumb_rx) = channel::<Job>();
         let thumb_rx = Arc::new(Mutex::new(thumb_rx));
         for _ in 0..2 {
             spawn_decode_worker(
                 Arc::clone(&thumb_rx),
                 Arc::clone(&decoder),
-                max_thumb_px,
+                Arc::clone(&max_thumb_px),
                 max_slide_px,
                 events_tx.clone(),
                 Arc::clone(&wakeup),
@@ -194,7 +199,7 @@ impl<I: Send + 'static> Engine<I> {
         spawn_decode_worker(
             Arc::new(Mutex::new(slide_rx)),
             Arc::clone(&decoder),
-            max_thumb_px,
+            Arc::clone(&max_thumb_px),
             max_slide_px,
             events_tx.clone(),
             Arc::clone(&wakeup),
@@ -327,7 +332,13 @@ impl<I: Send + 'static> Engine<I> {
     }
 
     pub fn max_thumb_px(&self) -> i32 {
-        self.max_thumb_px
+        self.max_thumb_px.load(Ordering::Relaxed)
+    }
+
+    /// Change the size thumbnails are decoded to. Thumbnails already
+    /// decoded stay as they are until something asks for them again.
+    pub fn set_max_thumb_px(&self, pixels: i32) {
+        self.max_thumb_px.store(pixels.max(1), Ordering::Relaxed);
     }
 }
 
@@ -422,7 +433,7 @@ fn apply_fs_change<I>(
 fn spawn_decode_worker<I: Send + 'static, D: ImageDecoder<Image = I>>(
     jobs: Arc<Mutex<Receiver<Job>>>,
     decoder: Arc<D>,
-    max_thumb_px: i32,
+    max_thumb_px: Arc<AtomicI32>,
     max_slide_px: i32,
     events_tx: Sender<Event<I>>,
     wakeup: Arc<dyn Fn() + Send + Sync>,
@@ -434,7 +445,9 @@ fn spawn_decode_worker<I: Send + 'static, D: ImageDecoder<Image = I>>(
         };
         let Ok(job) = job else { return };
         let event = match job {
-            Job::Thumb(path) => match decoder.decode_thumb(&path, max_thumb_px) {
+            Job::Thumb(path) => match decoder
+                .decode_thumb(&path, max_thumb_px.load(Ordering::Relaxed))
+            {
                 Some(image) => Event::ThumbReady { path, image },
                 None => Event::DecodeFailed { path },
             },
