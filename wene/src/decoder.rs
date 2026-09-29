@@ -8,7 +8,14 @@ use std::time::SystemTime;
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL};
 use objc2_core_graphics::CGImage;
 use objc2_image_io::{
+    kCGImagePropertyColorModel, kCGImagePropertyExifApertureValue,
     kCGImagePropertyExifDateTimeOriginal, kCGImagePropertyExifDictionary,
+    kCGImagePropertyExifExposureTime, kCGImagePropertyExifFNumber,
+    kCGImagePropertyExifFocalLength, kCGImagePropertyExifISOSpeedRatings,
+    kCGImagePropertyExifLensModel, kCGImagePropertyGPSDictionary, kCGImagePropertyGPSLatitude,
+    kCGImagePropertyGPSLatitudeRef, kCGImagePropertyGPSLongitude, kCGImagePropertyGPSLongitudeRef,
+    kCGImagePropertyProfileName, kCGImagePropertyTIFFDictionary, kCGImagePropertyTIFFMake,
+    kCGImagePropertyTIFFModel,
     kCGImagePropertyGIFDelayTime, kCGImagePropertyGIFDictionary,
     kCGImagePropertyGIFUnclampedDelayTime, kCGImagePropertyPixelHeight,
     kCGImagePropertyPixelWidth, kCGImagePropertyWebPDelayTime, kCGImagePropertyWebPDictionary,
@@ -35,6 +42,140 @@ pub fn image_dimensions(path: &Path) -> Option<(i64, i64)> {
         };
         Some((dim(kCGImagePropertyPixelWidth)?, dim(kCGImagePropertyPixelHeight)?))
     }
+}
+
+/// Everything the file header can say about one image, as ordered
+/// label and value pairs, for the info panel. An empty list means the
+/// file gave nothing up.
+pub fn image_info(path: &Path) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let Some(url) = CFURL::from_file_path(path) else { return rows };
+    unsafe {
+        let Some(src) = CGImageSource::with_url(&url, None) else { return rows };
+        let Some(props) = src.properties_at_index(src.primary_image_index(), None) else {
+            return rows;
+        };
+        let props: CFRetained<CFDictionary<CFString, CFType>> = CFRetained::cast_unchecked(props);
+
+        let width = number(&props, kCGImagePropertyPixelWidth).and_then(|n| n.as_i64());
+        let height = number(&props, kCGImagePropertyPixelHeight).and_then(|n| n.as_i64());
+        if let (Some(width), Some(height)) = (width, height) {
+            rows.push(("Dimensions".into(), format!("{width} × {height}")));
+        }
+        if let Some(model) = text(&props, kCGImagePropertyColorModel) {
+            rows.push(("Colour model".into(), model));
+        }
+        if let Some(profile) = text(&props, kCGImagePropertyProfileName) {
+            rows.push(("Colour profile".into(), profile));
+        }
+
+        if let Some(tiff) = sub_dictionary(&props, kCGImagePropertyTIFFDictionary) {
+            let make = text(&tiff, kCGImagePropertyTIFFMake);
+            let model = text(&tiff, kCGImagePropertyTIFFModel);
+            let camera = match (make, model) {
+                // Most makers repeat themselves in the model field.
+                (Some(make), Some(model)) if model.starts_with(&make) => model,
+                (Some(make), Some(model)) => format!("{make} {model}"),
+                (Some(make), None) => make,
+                (None, Some(model)) => model,
+                (None, None) => String::new(),
+            };
+            if !camera.is_empty() {
+                rows.push(("Camera".into(), camera));
+            }
+        }
+
+        if let Some(exif) = sub_dictionary(&props, kCGImagePropertyExifDictionary) {
+            if let Some(lens) = text(&exif, kCGImagePropertyExifLensModel) {
+                rows.push(("Lens".into(), lens));
+            }
+            if let Some(taken) = text(&exif, kCGImagePropertyExifDateTimeOriginal) {
+                // EXIF writes "2026:01:02 15:04:05"; nobody reads
+                // dates that way.
+                let shown = crate::exif_date_text(&taken).unwrap_or(taken);
+                rows.push(("Taken".into(), shown));
+            }
+            if let Some(seconds) = number(&exif, kCGImagePropertyExifExposureTime)
+                .and_then(|n| n.as_f64())
+            {
+                rows.push(("Exposure".into(), exposure(seconds)));
+            }
+            let aperture = number(&exif, kCGImagePropertyExifFNumber)
+                .or_else(|| number(&exif, kCGImagePropertyExifApertureValue))
+                .and_then(|n| n.as_f64());
+            if let Some(aperture) = aperture {
+                rows.push(("Aperture".into(), format!("f/{aperture:.1}")));
+            }
+            if let Some(iso) = first_number(&exif, kCGImagePropertyExifISOSpeedRatings) {
+                rows.push(("ISO".into(), format!("{iso}")));
+            }
+            if let Some(focal) = number(&exif, kCGImagePropertyExifFocalLength)
+                .and_then(|n| n.as_f64())
+            {
+                rows.push(("Focal length".into(), format!("{focal:.0} mm")));
+            }
+        }
+
+        if let Some(gps) = sub_dictionary(&props, kCGImagePropertyGPSDictionary) {
+            let lat = number(&gps, kCGImagePropertyGPSLatitude).and_then(|n| n.as_f64());
+            let lon = number(&gps, kCGImagePropertyGPSLongitude).and_then(|n| n.as_f64());
+            if let (Some(lat), Some(lon)) = (lat, lon) {
+                let lat_ref = text(&gps, kCGImagePropertyGPSLatitudeRef).unwrap_or_default();
+                let lon_ref = text(&gps, kCGImagePropertyGPSLongitudeRef).unwrap_or_default();
+                rows.push((
+                    "Place".into(),
+                    format!("{lat:.5}° {lat_ref}, {lon:.5}° {lon_ref}"),
+                ));
+            }
+        }
+    }
+    rows
+}
+
+/// A shutter speed the way a camera says it: a fraction under a
+/// second, plain seconds above.
+fn exposure(seconds: f64) -> String {
+    if seconds <= 0.0 {
+        return String::new();
+    }
+    if seconds >= 1.0 {
+        format!("{seconds:.1} s")
+    } else {
+        format!("1/{:.0} s", 1.0 / seconds)
+    }
+}
+
+fn text(dict: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<String> {
+    let value = dict.get(key)?.downcast::<CFString>().ok()?.to_string();
+    (!value.trim().is_empty()).then_some(value)
+}
+
+fn number(dict: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<CFRetained<CFNumber>> {
+    dict.get(key)?.downcast::<CFNumber>().ok()
+}
+
+/// ISO arrives as an array of one number.
+fn first_number(dict: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<i64> {
+    let value = dict.get(key)?;
+    if let Ok(number) = value.clone().downcast::<CFNumber>() {
+        return number.as_i64();
+    }
+    let array = value.downcast::<objc2_core_foundation::CFArray>().ok()?;
+    let array: CFRetained<objc2_core_foundation::CFArray<CFType>> =
+        unsafe { CFRetained::cast_unchecked(array) };
+    array
+        .iter()
+        .next()
+        .and_then(|first| first.downcast::<CFNumber>().ok())
+        .and_then(|number| number.as_i64())
+}
+
+fn sub_dictionary(
+    dict: &CFDictionary<CFString, CFType>,
+    key: &CFString,
+) -> Option<CFRetained<CFDictionary<CFString, CFType>>> {
+    let value = dict.get(key)?.downcast::<CFDictionary>().ok()?;
+    Some(unsafe { CFRetained::cast_unchecked(value) })
 }
 
 pub struct ImageIoDecoder;

@@ -351,7 +351,7 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wene"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "dispatch2",
  "objc2",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "wene-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "lexical-sort",
  "notify",

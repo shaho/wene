@@ -962,6 +962,34 @@ pub fn run_step(delegate: &AppDelegate) {
                 "Favorites is back to what it was",
             );
         }
+        64 => {
+            // The info panel reads the same images an action would
+            // work on, and says so in full for one image.
+            delegate.e2e_select(&[0]);
+            let text = delegate.e2e_info_text();
+            let name = delegate.e2e_selected_name().unwrap_or_default();
+            check(
+                state,
+                text.contains(&name) && text.contains("Dimensions") && text.contains("Size"),
+                "the info panel names the one selected image and its dimensions",
+            );
+            delegate.e2e_select(&[0, 1]);
+            check(
+                state,
+                delegate.e2e_info_text().contains("2 images"),
+                "several selected images come back as a count",
+            );
+            delegate.e2e_select(&[]);
+            check(
+                state,
+                delegate.e2e_info_text() == "No image selected.",
+                "nothing selected says so",
+            );
+            delegate.e2e_toggle_info();
+            check(state, delegate.e2e_info_open(), "cmd-I opens the panel");
+            delegate.e2e_toggle_info();
+            check(state, !delegate.e2e_info_open(), "a second cmd-I puts it away");
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {

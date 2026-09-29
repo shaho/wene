@@ -21,7 +21,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSColor, NSControlTextEditingDelegate, NSTextFieldDelegate, NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView,
+    NSColor, NSControlTextEditingDelegate, NSFont, NSTextFieldDelegate, NSImage, NSMenu, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView,
     NSSplitViewController, NSSplitViewItem, NSTextField, NSViewController, NSWindow,
     NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
@@ -102,6 +102,8 @@ pub struct DelegateIvars {
     /// of it and scribble over its progress line.
     transfer_busy: Cell<bool>,
     prefs_window: OnceCell<Retained<NSWindow>>,
+    info_window: OnceCell<Retained<NSWindow>>,
+    info_label: OnceCell<Retained<NSTextField>>,
     /// Default slideshow mode from prefs; ⌥ at start inverts it.
     default_windowed: Cell<bool>,
     show: RefCell<Option<Show>>,
@@ -388,6 +390,11 @@ define_class!(
             self.trash_selection();
         }
 
+        #[unsafe(method(getInfo:))]
+        fn get_info(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.toggle_info();
+        }
+
         #[unsafe(method(revealInFinder:))]
         fn reveal_in_finder(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.reveal_targets();
@@ -509,6 +516,8 @@ impl AppDelegate {
             copy_again_item: OnceCell::new(),
             transfer_busy: Cell::new(false),
             prefs_window: OnceCell::new(),
+            info_window: OnceCell::new(),
+            info_label: OnceCell::new(),
             default_windowed: Cell::new(false),
             show: RefCell::new(None),
             loop_enabled: Cell::new(false),
@@ -1032,6 +1041,83 @@ impl AppDelegate {
         self.flash_overlay(&message);
     }
 
+    /// cmd-I: the info panel, a floating window that follows whatever
+    /// an action would work on. A second press puts it away.
+    fn toggle_info(&self) {
+        let mtm = self.mtm();
+        let window = self.ivars().info_window.get().cloned().unwrap_or_else(|| {
+            let (window, label) = build_info_window(mtm);
+            let _ = self.ivars().info_window.set(window.clone());
+            let _ = self.ivars().info_label.set(label);
+            window
+        });
+        if window.isVisible() {
+            window.orderOut(None);
+            return;
+        }
+        // Show it first: the refresh fills only a panel that is up,
+        // so filling it before would leave it blank.
+        window.makeKeyAndOrderFront(None);
+        self.refresh_info();
+    }
+
+    /// Fill the panel, if it is up. Cheap enough to run on every
+    /// selection change: the header read is not a decode.
+    fn refresh_info(&self) {
+        let Some(window) = self.ivars().info_window.get() else { return };
+        let Some(label) = self.ivars().info_label.get() else { return };
+        if !window.isVisible() {
+            return;
+        }
+        label.setStringValue(&NSString::from_str(&self.info_text()));
+        label.sizeToFit();
+    }
+
+    /// What the panel says: one image in full, several as a summary,
+    /// none as a line saying so.
+    fn info_text(&self) -> String {
+        let paths = self.action_targets();
+        match paths.as_slice() {
+            [] => "No image selected.".to_owned(),
+            [path] => {
+                let mut rows = vec![("Name".to_owned(), file_name(path))];
+                if let Some(kind) = path.extension() {
+                    rows.push((
+                        "Kind".to_owned(),
+                        format!("{} image", kind.to_string_lossy().to_uppercase()),
+                    ));
+                }
+                if let Ok(meta) = std::fs::metadata(path) {
+                    rows.push(("Size".to_owned(), format_bytes(meta.len())));
+                    if let Ok(modified) = meta.modified() {
+                        rows.push(("Modified".to_owned(), date_text(modified)));
+                    }
+                }
+                rows.extend(decoder::image_info(path));
+                if let Some(folder) = path.parent() {
+                    rows.push(("Folder".to_owned(), folder.to_string_lossy().into_owned()));
+                }
+                rows_text(&rows)
+            }
+            many => {
+                let bytes: u64 = many
+                    .iter()
+                    .filter_map(|path| std::fs::metadata(path).ok())
+                    .map(|meta| meta.len())
+                    .sum();
+                let folder = many[0]
+                    .parent()
+                    .map(|folder| folder.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                rows_text(&[
+                    ("Selected".to_owned(), format!("{} images", many.len())),
+                    ("Size".to_owned(), format_bytes(bytes)),
+                    ("Folder".to_owned(), folder),
+                ])
+            }
+        }
+    }
+
     /// cmd-R: show what an action would work on in Finder, selected
     /// inside its folder.
     fn reveal_targets(&self) {
@@ -1228,6 +1314,7 @@ impl AppDelegate {
     /// The grid calls this after any selection or file-list change.
     pub fn selection_changed(&self) {
         self.update_status();
+        self.refresh_info();
     }
 
     /// Count plus name, dimensions, and size of the selection, like
@@ -1494,6 +1581,7 @@ impl AppDelegate {
     }
 
     fn update_overlay(&self) {
+        self.refresh_info();
         // Build the text and release the borrow BEFORE touching
         // AppKit: setStringValue may re-enter delegate code.
         let (overlay, window, name, text) = {
@@ -1777,6 +1865,21 @@ impl AppDelegate {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn e2e_info_text(&self) -> String {
+        self.info_text()
+    }
+
+    pub fn e2e_toggle_info(&self) {
+        self.toggle_info();
+    }
+
+    pub fn e2e_info_open(&self) -> bool {
+        self.ivars()
+            .info_window
+            .get()
+            .is_some_and(|window| window.isVisible())
     }
 
     pub fn e2e_favorite_count(&self) -> usize {
@@ -2224,6 +2327,95 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Label and value, one pair per line, labels padded so the values
+/// line up in the panel's fixed-width layout.
+fn rows_text(rows: &[(String, String)]) -> String {
+    let width = rows.iter().map(|(label, _)| label.chars().count()).max().unwrap_or(0);
+    rows.iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(label, value)| format!("{label:<width$}   {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// A date the way the user's own settings write it.
+pub fn date_text(time: std::time::SystemTime) -> String {
+    let Ok(since) = time.duration_since(std::time::UNIX_EPOCH) else {
+        return String::new();
+    };
+    let date = objc2_foundation::NSDate::dateWithTimeIntervalSince1970(since.as_secs_f64());
+    objc2_foundation::NSDateFormatter::localizedStringFromDate_dateStyle_timeStyle(
+        &date,
+        objc2_foundation::NSDateFormatterStyle::MediumStyle,
+        objc2_foundation::NSDateFormatterStyle::ShortStyle,
+    )
+    .to_string()
+}
+
+/// An EXIF capture time, printed the way the user's settings write
+/// dates. EXIF holds the camera's own local time with no zone, so it
+/// is read in the local zone and written back in it: the two cancel
+/// and the digits stay the ones the camera recorded.
+pub fn exif_date_text(raw: &str) -> Option<String> {
+    let formatter = objc2_foundation::NSDateFormatter::new();
+    formatter.setDateFormat(Some(ns_string!("yyyy:MM:dd HH:mm:ss")));
+    let date = formatter.dateFromString(&NSString::from_str(raw))?;
+    Some(
+        objc2_foundation::NSDateFormatter::localizedStringFromDate_dateStyle_timeStyle(
+            &date,
+            objc2_foundation::NSDateFormatterStyle::MediumStyle,
+            objc2_foundation::NSDateFormatterStyle::ShortStyle,
+        )
+        .to_string(),
+    )
+}
+
+/// The info panel: a floating utility window holding one label. It
+/// floats so it can sit beside a full-screen slideshow.
+fn build_info_window(mtm: MainThreadMarker) -> (Retained<NSWindow>, Retained<NSTextField>) {
+    let frame = NSRect::new(CGPoint::new(120.0, 400.0), CGSize::new(380.0, 360.0));
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            frame,
+            NSWindowStyleMask::Titled
+                | NSWindowStyleMask::Closable
+                | NSWindowStyleMask::UtilityWindow
+                | NSWindowStyleMask::Resizable,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    window.setTitle(ns_string!("Info"));
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setLevel(objc2_app_kit::NSFloatingWindowLevel as isize);
+
+    let label = NSTextField::labelWithString(ns_string!(""), mtm);
+    label.setSelectable(true);
+    label.setUsesSingleLineMode(false);
+    label.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(11.0, 0.0)));
+    label.setFrame(NSRect::new(
+        CGPoint::new(0.0, 0.0),
+        CGSize::new(frame.size.width - 24.0, frame.size.height - 24.0),
+    ));
+
+    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), NSRect::new(
+        CGPoint::new(12.0, 12.0),
+        CGSize::new(frame.size.width - 24.0, frame.size.height - 24.0),
+    ));
+    scroll.setHasVerticalScroller(true);
+    scroll.setDrawsBackground(false);
+    scroll.setDocumentView(Some(&label));
+    window.setContentView(Some(&scroll));
+    (window, label)
+}
+
 fn drain_events(mtm: MainThreadMarker) {
     let delegate = DELEGATE.get().unwrap().get(mtm);
     let rx = EVENTS.get().unwrap().lock().unwrap();
@@ -2280,6 +2472,15 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         )
     };
     file_menu.addItem(&reveal);
+    let info = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Get info"),
+            Some(sel!(getInfo:)),
+            ns_string!("i"),
+        )
+    };
+    file_menu.addItem(&info);
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));
     // cmd-Delete, Finder's binding, in the grid and the slideshow.
     let trash = unsafe {
