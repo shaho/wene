@@ -265,6 +265,39 @@ pub fn run_step(delegate: &AppDelegate) {
                 view.rotate(90);
                 check(state, view.state().rotation == 90, "rotate key turns 90");
             }
+            // Right-click on a slide: the grid's menu, less the entry
+            // that would start the show it is already in.
+            let titles: Vec<String> = delegate
+                .e2e_slide_context_menu()
+                .into_iter()
+                .map(|(title, _)| title)
+                .collect();
+            check(
+                state,
+                titles.iter().any(|t| t == "Move to trash")
+                    && titles.iter().any(|t| t == "Reveal in Finder")
+                    && titles.iter().any(|t| t.starts_with("Copy to"))
+                    && !titles.iter().any(|t| t == "Start slideshow")
+                    && titles.first().is_some_and(|t| !t.is_empty()),
+                "a slide's menu matches the grid's, without 'Start slideshow'",
+            );
+            // The info panel floats over a full-screen slide; the
+            // slide window is at the normal level, the panel above it.
+            delegate.e2e_toggle_info();
+            let windows = delegate.e2e_window_order();
+            let info = windows.iter().find(|(title, _, _)| title == "Info");
+            let slide = windows.iter().find(|(title, _, _)| title == "apple.heic");
+            check(
+                state,
+                match (info, slide) {
+                    (Some((_, info_level, info_order)), Some((_, slide_level, slide_order))) => {
+                        info_level > slide_level && info_order < slide_order
+                    }
+                    _ => false,
+                },
+                "the info panel sits over a full-screen slide",
+            );
+            delegate.e2e_toggle_info();
             delegate.step_slideshow(1);
         }
         16 => {

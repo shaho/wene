@@ -420,7 +420,7 @@ define_class!(
             let panel = NSOpenPanel::openPanel(mtm);
             panel.setCanChooseDirectories(true);
             panel.setCanChooseFiles(false);
-            if panel.runModal() != objc2_app_kit::NSModalResponseOK {
+            if !self.run_panel(&panel) {
                 return;
             }
             let Some(path) = panel.URL().and_then(|u| u.path()) else { return };
@@ -678,7 +678,7 @@ impl AppDelegate {
         panel.setCanChooseFiles(false);
         panel.setAllowsMultipleSelection(false);
         panel.setPrompt(Some(ns_string!("Browse")));
-        let ok = panel.runModal() == objc2_app_kit::NSModalResponseOK;
+        let ok = self.run_panel(&panel);
         if !ok {
             return;
         }
@@ -1098,6 +1098,18 @@ impl AppDelegate {
 
     // ---- move and copy ----
 
+    /// Run a panel modally. When it closes, AppKit hands the key
+    /// window back to the browse window, which buries a slideshow
+    /// still on screen, so the slide takes the key back.
+    fn run_panel(&self, panel: &NSOpenPanel) -> bool {
+        let ok = panel.runModal() == objc2_app_kit::NSModalResponseOK;
+        let slide = self.ivars().show.borrow().as_ref().map(|show| show.window.clone());
+        if let Some(window) = slide {
+            window.makeKeyAndOrderFront(None);
+        }
+        ok
+    }
+
     /// Ask for the target folder. Cancel returns None.
     fn choose_folder(&self, kind: Transfer) -> Option<PathBuf> {
         let mtm = self.mtm();
@@ -1112,7 +1124,7 @@ impl AppDelegate {
             Transfer::Move => "Move",
             Transfer::Copy => "Copy",
         })));
-        if panel.runModal() != objc2_app_kit::NSModalResponseOK {
+        if !self.run_panel(&panel) {
             return None;
         }
         let path = panel.URL()?.path()?;
@@ -2610,6 +2622,38 @@ impl AppDelegate {
         if let Some(sidebar) = self.ivars().sidebar.get() {
             sidebar.remove_favorite(std::path::Path::new(path));
         }
+    }
+
+    /// The menu a right-click on a slide opens: the grid's own menu,
+    /// which already acts on the slide on screen during a show.
+    pub fn slide_context_menu(&self) -> Option<Retained<NSMenu>> {
+        self.ivars().grid.get().map(|grid| grid.context_menu(true))
+    }
+
+    /// Titles, levels and front-to-back order of the app's windows,
+    /// so the harness can see what covers what.
+    pub fn e2e_window_order(&self) -> Vec<(String, isize, isize)> {
+        NSApplication::sharedApplication(self.mtm())
+            .windows()
+            .iter()
+            .filter(|window| window.isVisible())
+            .map(|window| {
+                (
+                    window.title().to_string(),
+                    window.level(),
+                    window.orderedIndex(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn e2e_slide_context_menu(&self) -> Vec<(String, bool)> {
+        let Some(menu) = self.slide_context_menu() else { return Vec::new() };
+        menu.update();
+        menu.itemArray()
+            .iter()
+            .map(|item| (item.title().to_string(), item.isEnabled()))
+            .collect()
     }
 
     pub fn e2e_grid_context_menu(&self, index: usize) -> Vec<(String, bool)> {

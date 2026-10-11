@@ -6,7 +6,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSEvent, NSGraphicsContext, NSImage, NSView, NSWindow,
+    NSBackingStoreType, NSColor, NSEvent, NSGraphicsContext, NSImage, NSMenu, NSView, NSWindow,
     NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -211,11 +211,13 @@ define_class!(
             }
         }
 
-        #[unsafe(method(rightMouseUp:))]
-        fn right_mouse_up(&self, _event: &NSEvent) {
-            if let Some(delegate) = self.ivars().delegate.get() {
-                delegate.step_slideshow(-1);
-            }
+        // Right-click opens the same menu a thumbnail does, aimed at
+        // the slide on screen.
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            let Some(delegate) = self.ivars().delegate.get() else { return };
+            let Some(menu) = delegate.slide_context_menu() else { return };
+            NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
         }
 
         // The wheel steps slides while the image fits, and pans it

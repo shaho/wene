@@ -786,13 +786,14 @@ impl GridView {
             self.setNeedsDisplay(true);
             self.notify_selection();
         }
-        self.context_menu()
+        self.context_menu(false)
     }
 
     /// The grid's right-click menu. Every entry is a menu bar action
     /// already, aimed at the delegate, so validation and behaviour
-    /// stay in one place.
-    fn context_menu(&self) -> Retained<NSMenu> {
+    /// stay in one place. A slideshow shows the same menu, less the
+    /// entry that would start the show it is already in.
+    pub fn context_menu(&self, in_show: bool) -> Retained<NSMenu> {
         let mtm = self.mtm();
         let delegate = self.ivars().delegate.get();
         let repeat = |kind: Transfer| match delegate {
@@ -814,7 +815,10 @@ impl GridView {
             Some(("Move to trash".to_owned(), sel!(moveToTrash:))),
         ];
         let menu = NSMenu::new(mtm);
-        for entry in entries {
+        // Both the entry and the separator under it go, so the menu
+        // does not open on a stray line.
+        let skip = usize::from(in_show) * 2;
+        for entry in entries.into_iter().skip(skip) {
             let Some((title, action)) = entry else {
                 menu.addItem(&NSMenuItem::separatorItem(mtm));
                 continue;
