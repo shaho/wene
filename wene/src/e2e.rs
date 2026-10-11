@@ -289,6 +289,11 @@ pub fn run_step(delegate: &AppDelegate) {
         }
         18 => {
             check(state, !delegate.e2e_show_active(), "fullscreen show closed");
+            check(
+                state,
+                delegate.e2e_selected_name().as_deref() == Some("apple.heic"),
+                "the last slide is the active thumbnail",
+            );
             // Windowed slideshow.
             delegate.start_slideshow(0, true);
         }
@@ -801,8 +806,9 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             check(
                 state,
-                !delegate.e2e_show_active(),
-                "opening an image ends the slideshow instead of starting one",
+                delegate.e2e_show_active()
+                    && delegate.e2e_slide_name().as_deref() == Some("img2.heic"),
+                "an opened image goes straight to full screen",
             );
             check(
                 state,

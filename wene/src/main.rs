@@ -87,6 +87,9 @@ pub struct DelegateIvars {
     /// Images Finder asked for, waiting for their folder to finish
     /// scanning so they can be selected.
     pending_open: RefCell<Vec<PathBuf>>,
+    /// The waiting images came from a Finder open of files, so they
+    /// go straight to full screen once the grid holds them.
+    pending_fullscreen: Cell<bool>,
     /// True once Finder has handed the app something to open, so
     /// launch does not go off and restore the last folder instead.
     opened_from_finder: Cell<bool>,
@@ -194,7 +197,9 @@ define_class!(
             NSApplication::sharedApplication(self.mtm()).setPresentationOptions(
                 objc2_app_kit::NSApplicationPresentationOptions::Default,
             );
+            let mut last_slide = None;
             if let Some(show) = self.ivars().show.borrow_mut().take() {
+                last_slide = show.playlist.current().cloned();
                 if let Some(timer) = show.timer {
                     timer.invalidate();
                 }
@@ -204,6 +209,14 @@ define_class!(
             }
             if let Some(window) = self.ivars().window.get() {
                 window.makeKeyAndOrderFront(None);
+            }
+            // The grid picks up where the slideshow stopped, so the
+            // slide that was on screen is the active thumbnail.
+            if let (Some(path), Some(grid)) = (last_slide, self.ivars().grid.get()) {
+                if grid.holds_all(std::slice::from_ref(&path)) {
+                    grid.select_paths(std::slice::from_ref(&path));
+                    self.focus_grid();
+                }
             }
         }
     }
@@ -606,6 +619,7 @@ impl AppDelegate {
             filter_bar: OnceCell::new(),
             filter_field: OnceCell::new(),
             pending_open: RefCell::new(Vec::new()),
+            pending_fullscreen: Cell::new(false),
             opened_from_finder: Cell::new(false),
             current_scan: RefCell::new(None),
             sidebar_item: OnceCell::new(),
@@ -932,6 +946,8 @@ impl AppDelegate {
             return;
         };
         self.ivars().opened_from_finder.set(true);
+        // Opening an image means looking at it, not at its folder.
+        self.ivars().pending_fullscreen.set(true);
         // Calls can arrive one after another, so they add up rather
         // than replace each other.
         self.ivars().pending_open.borrow_mut().extend(files);
@@ -960,6 +976,9 @@ impl AppDelegate {
         grid.select_paths(&pending);
         self.ivars().pending_open.borrow_mut().clear();
         self.focus_grid();
+        if self.ivars().pending_fullscreen.replace(false) {
+            self.start_from_grid(false);
+        }
         true
     }
 
@@ -2367,6 +2386,15 @@ impl AppDelegate {
             .map(|s| s.playlist.current_index())
     }
 
+    pub fn e2e_slide_name(&self) -> Option<String> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.playlist.current().cloned())
+            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+    }
+
     pub fn e2e_slide_has_image(&self) -> bool {
         self.ivars()
             .show
@@ -2825,6 +2853,7 @@ impl AppDelegate {
                     && theirs == self.current_scan().map(|(root, _)| root)
                 {
                     self.ivars().pending_open.borrow_mut().clear();
+                    self.ivars().pending_fullscreen.set(false);
                 }
                 self.update_status();
                 if e2e::enabled() && !self.ivars().e2e.borrow().started {
