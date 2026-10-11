@@ -47,9 +47,10 @@ GIFs.
 ### Opening from Finder
 
 Once the app is on your disk, wêne shows up under "Open with" for JPEG, PNG,
-HEIC, GIF, WebP, and TIFF, and Get Info ▸ Open with ▸ Change All makes it the
-default. Opening images shows their folder with them selected; opening a folder
-shows that folder. No slideshow starts on its own.
+HEIC, HEIF, GIF, WebP, TIFF, BMP, AVIF, and JPEG XL, and Get Info ▸ Open with
+▸ Change All makes it the default. Opening an image shows it full screen,
+with the rest of its folder behind it as the slideshow; opening a folder shows
+that folder's grid.
 
 ## Run it
 

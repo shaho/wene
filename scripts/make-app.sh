@@ -60,6 +60,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
         <string>com.compuserve.gif</string>
         <string>org.webmproject.webp</string>
         <string>public.tiff</string>
+        <string>public.heif</string>
+        <string>com.microsoft.bmp</string>
+        <string>public.avif</string>
+        <string>public.jpeg-xl</string>
       </array>
     </dict>
     <dict>

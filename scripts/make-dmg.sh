@@ -14,6 +14,6 @@ mkdir -p "$STAGE"
 cp -R target/wene.app "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 
-hdiutil create -volname "Wêne $VERSION" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+diskutil image create from --format UDZO --volumeName "Wêne $VERSION" "$STAGE" "$DMG"
 rm -rf "$STAGE"
 echo "built $DMG"

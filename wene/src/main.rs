@@ -209,6 +209,11 @@ define_class!(
             }
             if let Some(window) = self.ivars().window.get() {
                 window.makeKeyAndOrderFront(None);
+                // A full-screen slide launched straight from Finder
+                // leaves Finder the active app underneath, so it takes
+                // the focus back when the slide closes. Ask for it.
+                #[allow(deprecated)]
+                NSApplication::sharedApplication(self.mtm()).activateIgnoringOtherApps(true);
             }
             // The grid picks up where the slideshow stopped, so the
             // slide that was on screen is the active thumbnail.
@@ -3916,11 +3921,9 @@ fn main() {
     // gets no name at all: a restored divider is one more thing
     // arriving late in a run that measures the window.
     if !e2e::enabled() {
-        unsafe {
-            split
-                .splitView()
-                .setAutosaveName(Some(ns_string!("sidebarWidth2")))
-        };
+        split
+            .splitView()
+            .setAutosaveName(Some(ns_string!("sidebarWidth2")));
     }
     split.addSplitViewItem(&sidebar_pane);
     split.addSplitViewItem(&NSSplitViewItem::splitViewItemWithViewController(&content_vc));
