@@ -1023,6 +1023,11 @@ impl GridView {
     }
 
     pub fn e2e_set_selected(&self, indices: &[usize]) {
+        // An index past the end would panic at the next draw. A late
+        // watcher can leave the grid shorter than the harness thinks,
+        // and that must fail a check, not crash the run.
+        let count = self.ivars().files.borrow().len();
+        let indices: Vec<usize> = indices.iter().copied().filter(|&i| i < count).collect();
         {
             let mut selected = self.ivars().selected.borrow_mut();
             selected.clear();

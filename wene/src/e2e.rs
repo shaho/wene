@@ -62,6 +62,19 @@ fn hold(state: &RefCell<E2eState>, tries: u32) -> bool {
     false
 }
 
+/// The folder watcher reports a file the harness wrote or deleted in
+/// its own time, sometimes more than one tick later. True holds the
+/// step, for up to four ticks, until the grid shows `count` images.
+fn wait_for_count(state: &RefCell<E2eState>, delegate: &AppDelegate, count: usize) -> bool {
+    delegate.e2e_file_count() != count && hold(state, 4)
+}
+
+/// A move or copy batch runs on its own thread. True holds the step,
+/// for up to four ticks, until it is done.
+fn wait_for_transfer(state: &RefCell<E2eState>, delegate: &AppDelegate) -> bool {
+    delegate.e2e_transfer_busy() && hold(state, 4)
+}
+
 fn check(state: &RefCell<E2eState>, ok: bool, what: &str) {
     let mut state = state.borrow_mut();
     let step = state.step;
@@ -274,6 +287,9 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, copied, "test file copied");
         }
         12 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 5,
@@ -283,6 +299,9 @@ pub fn run_step(delegate: &AppDelegate) {
             let _ = std::fs::remove_file(format!("{root}/zzz-watcher-test.heic"));
         }
         13 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 4,
@@ -501,8 +520,7 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, written, "animated gif written");
         }
         29 => {
-            // The watcher can take more than one tick to report it.
-            if delegate.e2e_file_count() != 5 && hold(state, 3) {
+            if wait_for_count(state, delegate, 5) {
                 return;
             }
             check(
@@ -525,6 +543,9 @@ pub fn run_step(delegate: &AppDelegate) {
             let _ = std::fs::remove_file(format!("{root}/zzz-anim.gif"));
         }
         31 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 4,
@@ -622,6 +643,9 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, copied, "cull test file copied");
         }
         36 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 5,
@@ -669,6 +693,9 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, copied, "second cull test file copied");
         }
         38 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 5,
@@ -701,6 +728,9 @@ pub fn run_step(delegate: &AppDelegate) {
             empty_from_trash(&cull_name("b"));
         }
         39 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 4,
@@ -720,6 +750,9 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, made && copied, "transfer test folder and file ready");
         }
         41 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 5,
@@ -730,6 +763,9 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.e2e_transfer(&transfer_folder(), true);
         }
         42 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
             check(state, !delegate.e2e_transfer_busy(), "the batch finished");
             check(
                 state,
@@ -770,6 +806,9 @@ pub fn run_step(delegate: &AppDelegate) {
             );
         }
         43 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 5,
@@ -783,6 +822,9 @@ pub fn run_step(delegate: &AppDelegate) {
             );
         }
         44 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 4,
@@ -808,6 +850,9 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.e2e_transfer(&transfer_folder(), false);
         }
         45 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 4,
@@ -836,6 +881,9 @@ pub fn run_step(delegate: &AppDelegate) {
             }
         }
         46 => {
+            if wait_for_count(state, delegate, 6) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 6,
@@ -845,6 +893,9 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.e2e_transfer(&transfer_folder(), true);
         }
         47 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
             check(
                 state,
                 !delegate.e2e_transfer_busy(),
@@ -958,6 +1009,9 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, matching && other, "two more files copied in");
         }
         54 => {
+            if wait_for_count(state, delegate, 3) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 3,
@@ -975,6 +1029,9 @@ pub fn run_step(delegate: &AppDelegate) {
             let _ = std::fs::remove_file(format!("{root}/zzz-hidden-{pid}.heic"));
         }
         55 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 4,
@@ -1030,6 +1087,9 @@ pub fn run_step(delegate: &AppDelegate) {
             ))]);
         }
         58 => {
+            if wait_for_count(state, delegate, 1) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 1,
@@ -1287,6 +1347,9 @@ pub fn run_step(delegate: &AppDelegate) {
             );
         }
         69 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
             let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
             check(
                 state,
