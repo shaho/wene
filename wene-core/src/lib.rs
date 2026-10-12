@@ -341,7 +341,10 @@ impl<I: Send + 'static> Engine<I> {
                     if hidden {
                         continue;
                     }
-                    if path.is_dir() {
+                    // file_type does not follow a symlink, so a link to
+                    // a folder is not walked: a link back to a parent
+                    // would walk the same tree again and again.
+                    if entry.file_type().is_ok_and(|t| t.is_dir()) {
                         if recursive {
                             stack.push(path);
                         }
@@ -850,6 +853,28 @@ mod tests {
             .map(|f| f.path.clone())
             .collect();
         assert_eq!(listed, expected);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_recursive_scan_does_not_follow_a_link_to_a_folder() {
+        let root = std::env::temp_dir().join(format!("wene-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.jpg"), "").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+        let (engine, events) = Engine::start(SlowDates, 100, 100, || {});
+
+        engine.scan(root.clone(), true);
+        let total = loop {
+            match events.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::ScanDone { total, .. }) => break total,
+                Ok(_) => {}
+                Err(error) => panic!("the scan did not finish: {error}"),
+            }
+        };
+
+        assert_eq!(total, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
