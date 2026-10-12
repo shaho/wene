@@ -5,9 +5,9 @@
 //! a share with no trash, permissions) stays exactly where it is and
 //! is reported back to the caller.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use objc2_foundation::{NSFileManager, NSString, NSURL};
+use objc2_foundation::{NSFileManager, NSURL};
 
 /// What one run of the trash did: where each file landed inside the
 /// trash, and which files would not go.
@@ -27,13 +27,14 @@ pub fn move_to_trash(paths: &[PathBuf]) -> Trashed {
         failed: Vec::new(),
     };
     for path in paths {
-        let url = url_for(path);
+        let Some(url) = NSURL::from_file_path(path) else {
+            result.failed.push(path.clone());
+            continue;
+        };
         let mut landed: Option<objc2::rc::Retained<NSURL>> = None;
         match manager.trashItemAtURL_resultingItemURL_error(&url, Some(&mut landed)) {
             Ok(()) => {
-                let landed = landed
-                    .and_then(|url| url.path())
-                    .map(|path| PathBuf::from(path.to_string()));
+                let landed = landed.and_then(|url| url.to_file_path());
                 match landed {
                     Some(landed) => result.moved.push((path.clone(), landed)),
                     // Trashed, but nowhere we can point at; it counts
@@ -52,8 +53,4 @@ pub fn move_to_trash(paths: &[PathBuf]) -> Trashed {
         }
     }
     result
-}
-
-fn url_for(path: &Path) -> objc2::rc::Retained<NSURL> {
-    NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
 }

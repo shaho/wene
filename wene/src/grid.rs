@@ -879,7 +879,9 @@ impl GridView {
             else {
                 continue;
             };
-            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+            let Some(url) = NSURL::from_file_path(&path) else {
+                continue;
+            };
             let entry = NSPasteboardItem::new();
             unsafe {
                 entry.setString_forType(

@@ -478,9 +478,9 @@ impl Sidebar {
     }
 
     fn open_in_finder(&self, index: usize) {
-        let url =
-            NSURL::fileURLWithPath(&NSString::from_str(&self.path_of(index).to_string_lossy()));
-        NSWorkspace::sharedWorkspace().openURL(&url);
+        if let Some(url) = NSURL::from_directory_path(self.path_of(index)) {
+            NSWorkspace::sharedWorkspace().openURL(&url);
+        }
     }
 
     /// File the dropped images into the row's folder. A plain drop
@@ -526,7 +526,7 @@ impl Sidebar {
         item: &AnyObject,
     ) -> Option<Retained<ProtocolObject<dyn NSPasteboardWriting>>> {
         let path = self.drop_target(Some(item))?;
-        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let url = NSURL::from_directory_path(&path)?;
         let entry = NSPasteboardItem::new();
         unsafe {
             entry.setString_forType(

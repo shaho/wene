@@ -217,8 +217,8 @@ fn exif_date(path: &Path) -> Option<SystemTime> {
 
 /// When the file landed in its folder (Finder's "date added").
 fn date_added(path: &Path) -> Option<SystemTime> {
-    use objc2_foundation::{NSArray, NSString, NSURLAddedToDirectoryDateKey, NSURL};
-    let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str()?));
+    use objc2_foundation::{NSArray, NSURLAddedToDirectoryDateKey, NSURL};
+    let url = NSURL::from_file_path(path)?;
     let keys = NSArray::from_slice(&[unsafe { NSURLAddedToDirectoryDateKey }]);
     let values = url.resourceValuesForKeys_error(&keys).ok()?;
     let date = values.objectForKey(unsafe { NSURLAddedToDirectoryDateKey })?;

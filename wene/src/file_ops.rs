@@ -304,8 +304,9 @@ impl AppDelegate {
         let mtm = self.mtm();
         menu.removeAllItems();
         let targets = self.action_targets();
-        let Some(first) = targets.first() else { return };
-        let url = NSURL::fileURLWithPath(&NSString::from_str(&first.to_string_lossy()));
+        let Some(url) = targets.first().and_then(NSURL::from_file_path) else {
+            return;
+        };
         let workspace = NSWorkspace::sharedWorkspace();
         for app in workspace.URLsForApplicationsToOpenURL(&url).iter() {
             let Some(path) = app.path() else { continue };
@@ -331,10 +332,7 @@ impl AppDelegate {
         if targets.is_empty() {
             return;
         }
-        let urls: Vec<Retained<NSURL>> = targets
-            .iter()
-            .map(|path| NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())))
-            .collect();
+        let urls: Vec<Retained<NSURL>> = targets.iter().filter_map(NSURL::from_file_path).collect();
         let configuration = objc2_app_kit::NSWorkspaceOpenConfiguration::configuration();
         NSWorkspace::sharedWorkspace()
             .openURLs_withApplicationAtURL_configuration_completionHandler(
@@ -355,10 +353,8 @@ impl AppDelegate {
         }
         let urls: Vec<Retained<ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>>> = targets
             .iter()
-            .map(|path| {
-                let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-                ProtocolObject::from_retained(url)
-            })
+            .filter_map(NSURL::from_file_path)
+            .map(ProtocolObject::from_retained)
             .collect();
         let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
         pasteboard.clearContents();
@@ -382,8 +378,8 @@ impl AppDelegate {
             .iter()
             .map(|path| {
                 if as_url {
-                    NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
-                        .absoluteString()
+                    NSURL::from_file_path(path)
+                        .and_then(|url| url.absoluteString())
                         .map(|s| s.to_string())
                         .unwrap_or_default()
                 } else {
@@ -414,7 +410,9 @@ impl AppDelegate {
     pub(crate) fn use_as_desktop_picture(&self) {
         let targets = self.action_targets();
         let Some(path) = targets.first() else { return };
-        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let Some(url) = NSURL::from_file_path(path) else {
+            return;
+        };
         let screen = self
             .ivars()
             .window
@@ -443,10 +441,7 @@ impl AppDelegate {
         if paths.is_empty() {
             return;
         }
-        let urls: Vec<Retained<NSURL>> = paths
-            .iter()
-            .map(|path| NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())))
-            .collect();
+        let urls: Vec<Retained<NSURL>> = paths.iter().filter_map(NSURL::from_file_path).collect();
         NSWorkspace::sharedWorkspace()
             .activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&urls));
     }

@@ -1355,6 +1355,16 @@ pub fn run_step(delegate: &AppDelegate) {
                 copied.lines().count() == 2 && copied.starts_with("file:"),
                 "several images copy as one file URL per line",
             );
+            let back: Vec<std::path::PathBuf> = copied
+                .lines()
+                .filter_map(|line| NSURL::URLWithString(&NSString::from_str(line)))
+                .filter_map(|url| url.to_file_path())
+                .collect();
+            check(
+                state,
+                back == delegate.action_targets(),
+                "each file URL leads back to its image",
+            );
         }
         68 => {
             // Undo, on a file of our own so the fixture survives.
