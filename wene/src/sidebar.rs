@@ -734,8 +734,12 @@ impl Sidebar {
     }
 
     /// The row to start walking from: the favorite or the volume that
-    /// holds `target`, taking the deepest match.
+    /// holds `target`, taking the deepest match. Only the target is
+    /// resolved on disk. The rows are compared as written, because
+    /// resolving a network share that has gone away can hang the
+    /// main thread.
     fn best_root(&self, target: &Path) -> Option<(usize, PathBuf)> {
+        let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
         let mut best: Option<(usize, PathBuf)> = None;
         for section in [
             self.ivars().favorites_root.get(),
@@ -747,18 +751,15 @@ impl Sidebar {
                 .unwrap_or_default();
             for child in children {
                 let path = self.path_of(child);
-                let Ok(real) = std::fs::canonicalize(&path) else {
-                    continue;
-                };
-                if !target.starts_with(&real) {
+                if !target.starts_with(&path) {
                     continue;
                 }
                 let deeper = best
                     .as_ref()
-                    .map(|(_, current)| real.components().count() > current.components().count())
+                    .map(|(_, current)| path.components().count() > current.components().count())
                     .unwrap_or(true);
                 if deeper {
-                    best = Some((child, real));
+                    best = Some((child, path));
                 }
             }
         }
@@ -928,25 +929,36 @@ fn load_favorites() -> Vec<PathBuf> {
 }
 
 /// Mounted volumes, each with its name. The startup disk keeps the
-/// path `/` so file paths match it, and shows its volume name.
+/// path `/` so file paths match it, and shows its volume name. It is
+/// the link to `/` in /Volumes. Nothing here looks inside a mount
+/// point, because a network share that has gone away can hang there.
 fn volumes() -> Vec<(PathBuf, Option<String>)> {
     let Ok(entries) = std::fs::read_dir("/Volumes") else {
         return vec![(PathBuf::from("/"), Some("Macintosh HD".to_string()))];
     };
-    let mut names: Vec<String> = entries
+    let mut found: Vec<(String, bool)> = entries
         .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| !n.starts_with('.'))
-        .filter(|n| Path::new("/Volumes").join(n).is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                return None;
+            }
+            let kind = e.file_type().ok()?;
+            let startup = kind.is_symlink()
+                && std::fs::read_link(e.path()).is_ok_and(|to| to == Path::new("/"));
+            (kind.is_dir() || startup).then_some((name, startup))
+        })
         .collect();
-    names.sort_by(|a, b| wene_core::natural_str_cmp(a, b));
-    let mut volumes: Vec<(PathBuf, Option<String>)> = Vec::with_capacity(names.len());
+    found.sort_by(|a, b| wene_core::natural_str_cmp(&a.0, &b.0));
+    let mut volumes: Vec<(PathBuf, Option<String>)> = Vec::with_capacity(found.len());
     let mut has_startup = false;
-    for name in names {
-        let mounted = PathBuf::from("/Volumes").join(&name);
-        let startup = std::fs::canonicalize(&mounted).is_ok_and(|real| real == Path::new("/"));
+    for (name, startup) in found {
         has_startup |= startup;
-        let path = if startup { PathBuf::from("/") } else { mounted };
+        let path = if startup {
+            PathBuf::from("/")
+        } else {
+            PathBuf::from("/Volumes").join(&name)
+        };
         volumes.push((path, Some(name)));
     }
     if !has_startup {
@@ -962,12 +974,9 @@ fn subfolders(path: &Path) -> Vec<PathBuf> {
     };
     let mut folders: Vec<PathBuf> = entries
         .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .filter(is_folder)
         .map(|e| e.path())
-        .filter(|p| {
-            !p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-        })
-        .filter(|p| p.is_dir())
         .filter(|p| !is_package(p))
         .collect();
     folders.sort_by(|a, b| {
@@ -992,15 +1001,24 @@ fn has_subfolder(path: &Path) -> bool {
         return false;
     };
     entries.flatten().any(|e| {
-        !e.file_name().to_string_lossy().starts_with('.')
-            && e.path().is_dir()
-            && !is_package(&e.path())
+        !e.file_name().to_string_lossy().starts_with('.') && is_folder(&e) && !is_package(&e.path())
     })
+}
+
+/// Whether a listed entry is a folder, a link to one included. The
+/// listing already carries each entry's own type, so only a link
+/// costs a stat.
+fn is_folder(entry: &std::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(kind) if kind.is_dir() => true,
+        Ok(kind) if kind.is_symlink() => entry.path().is_dir(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{drop_allowed, reorder};
+    use super::{drop_allowed, has_subfolder, reorder, subfolders, volumes};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1051,5 +1069,35 @@ mod tests {
         assert!(!drop_allowed(target, &[]));
         assert!(drop_allowed(target, &outside));
         assert!(drop_allowed(target, &mixed));
+    }
+
+    #[test]
+    fn subfolders_come_from_the_listing() {
+        let root = std::env::temp_dir().join(format!("wene-sidebar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("b"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("a.txt"), root.join("file-link")).unwrap();
+
+        // A folder and a link to one, not a file, a link to a file,
+        // or a hidden folder.
+        assert_eq!(subfolders(&root), vec![root.join("b"), root.join("link")]);
+        assert!(has_subfolder(&root));
+        assert!(!has_subfolder(&root.join("b")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_startup_disk_is_the_link_to_root() {
+        let found = volumes();
+        assert_eq!(
+            found
+                .iter()
+                .filter(|(path, _)| path == std::path::Path::new("/"))
+                .count(),
+            1
+        );
     }
 }
