@@ -26,6 +26,34 @@ const ZOOM_LADDER: &[f64] = &[
     0.125, 0.1875, 0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0,
 ];
 
+/// The zoom a wanted scale settles on, None meaning fit. The floor is
+/// the fitting scale when that is below the ladder: a panorama or a
+/// big scan fits at less than 0.125, and a floor of 0.125 would make
+/// zooming out zoom in.
+fn settle_zoom(next: f64, fit: f64) -> Option<f64> {
+    let next = next.clamp(ZOOM_LADDER[0].min(fit), ZOOM_LADDER[ZOOM_LADDER.len() - 1]);
+    (next > fit).then_some(next)
+}
+
+/// The next rung up or down from `current`. Below the lowest rung is
+/// 0, which settles on fit.
+fn ladder_step(current: f64, direction: i32) -> f64 {
+    if direction > 0 {
+        ZOOM_LADDER
+            .iter()
+            .find(|&&z| z > current * 1.001)
+            .copied()
+            .unwrap_or(ZOOM_LADDER[ZOOM_LADDER.len() - 1])
+    } else {
+        ZOOM_LADDER
+            .iter()
+            .rev()
+            .find(|&&z| z < current * 0.999)
+            .copied()
+            .unwrap_or(0.0)
+    }
+}
+
 define_class!(
     #[unsafe(super(NSWindow))]
     #[thread_kind = MainThreadOnly]
@@ -475,11 +503,10 @@ impl SlideView {
         if current <= 0.0 {
             return;
         }
-        let next = next.clamp(ZOOM_LADDER[0], ZOOM_LADDER[ZOOM_LADDER.len() - 1]);
-        if next <= self.fit_scale(bounds.size) {
+        let Some(next) = settle_zoom(next, self.fit_scale(bounds.size)) else {
             self.set_zoom(None);
             return;
-        }
+        };
         // The image point under the anchor stays under it when the
         // pan moves by the same factor the scale grew by.
         let factor = next / current;
@@ -516,21 +543,7 @@ impl SlideView {
             return;
         }
         let current = self.effective_scale(self.bounds().size);
-        let next = if direction > 0 {
-            ZOOM_LADDER
-                .iter()
-                .find(|&&z| z > current * 1.001)
-                .copied()
-                .unwrap_or(*ZOOM_LADDER.last().unwrap())
-        } else {
-            ZOOM_LADDER
-                .iter()
-                .rev()
-                .find(|&&z| z < current * 0.999)
-                .copied()
-                .unwrap_or(*ZOOM_LADDER.first().unwrap())
-        };
-        self.zoom_to(next, self.pointer());
+        self.zoom_to(ladder_step(current, direction), self.pointer());
     }
 
     pub fn has_image(&self) -> bool {
@@ -598,5 +611,30 @@ impl SlideView {
 
     pub fn is_animating(&self) -> bool {
         self.ivars().frames.borrow().len() >= 2 && self.ivars().anim_timer.borrow().is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zooming_out_of_a_big_image_never_zooms_in() {
+        // A panorama that fits at 0.05: minus at fit stays at fit.
+        assert_eq!(settle_zoom(ladder_step(0.05, -1), 0.05), None);
+        // Zoomed to 0.1, under the ladder: minus goes back to fit.
+        assert_eq!(settle_zoom(ladder_step(0.1, -1), 0.05), None);
+        // A pinch may stop between fit and the lowest rung.
+        assert_eq!(settle_zoom(0.08, 0.05), Some(0.08));
+        // Plus from fit takes the first rung above it.
+        assert_eq!(settle_zoom(ladder_step(0.05, 1), 0.05), Some(0.125));
+    }
+
+    #[test]
+    fn an_ordinary_image_keeps_the_ladder() {
+        // Fits at 0.5: minus from 1.0 lands on 0.75, and below fit is fit.
+        assert_eq!(settle_zoom(ladder_step(1.0, -1), 0.5), Some(0.75));
+        assert_eq!(settle_zoom(ladder_step(0.5, -1), 0.5), None);
+        assert_eq!(settle_zoom(100.0, 0.5), Some(16.0));
     }
 }
