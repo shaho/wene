@@ -185,7 +185,7 @@ define_class!(
                     )
                 };
             }
-            drop_kind()
+            drop_kind(&target, &paths)
         }
 
         #[unsafe(method(outlineView:acceptDrop:item:childIndex:))]
@@ -476,8 +476,8 @@ impl Sidebar {
         }
     }
 
-    /// File the dropped images into the row's folder. A plain drop
-    /// moves, the way Finder does inside one disk; option copies.
+    /// File the dropped images into the row's folder, by Finder's
+    /// rule: see `drop_transfer`.
     fn take_drop(
         &self,
         info: &ProtocolObject<dyn NSDraggingInfo>,
@@ -504,7 +504,7 @@ impl Sidebar {
         if paths.is_empty() {
             return false;
         }
-        let kind = if drop_kind() == NSDragOperation::Copy {
+        let kind = if drop_kind(&target, &paths) == NSDragOperation::Copy {
             Transfer::Copy
         } else {
             Transfer::Move
@@ -828,14 +828,42 @@ fn drop_allowed(target: &Path, paths: &[PathBuf]) -> bool {
     paths.iter().any(|path| path.parent() != Some(target))
 }
 
-/// A drop moves, the way dragging inside one disk does in Finder, and
-/// copies while the option key is down.
-fn drop_kind() -> NSDragOperation {
+/// What a drop of `paths` onto `target` does, by Finder's rule. The
+/// first file stands for the drag, so a drag of many files costs two
+/// stats, not one per file.
+fn drop_kind(target: &Path, paths: &[PathBuf]) -> NSDragOperation {
     let held = NSEvent::modifierFlags_class();
-    if held.contains(NSEventModifierFlags::Option) {
-        NSDragOperation::Copy
+    let same_disk = paths.first().is_some_and(|path| same_disk(path, target));
+    match drop_transfer(
+        held.contains(NSEventModifierFlags::Option),
+        held.contains(NSEventModifierFlags::Command),
+        same_disk,
+    ) {
+        Transfer::Copy => NSDragOperation::Copy,
+        Transfer::Move => NSDragOperation::Move,
+    }
+}
+
+/// Finder's rule: inside one disk a drop moves, onto another disk it
+/// copies, so a drag off a USB stick never empties it. Option always
+/// copies, and command always moves.
+fn drop_transfer(option: bool, command: bool, same_disk: bool) -> Transfer {
+    if option {
+        Transfer::Copy
+    } else if command || same_disk {
+        Transfer::Move
     } else {
-        NSDragOperation::Move
+        Transfer::Copy
+    }
+}
+
+/// Whether two paths are on the same disk. One that cannot be read
+/// counts as another disk, so the drop copies and loses nothing.
+fn same_disk(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev(),
+        _ => false,
     }
 }
 
@@ -1011,8 +1039,11 @@ fn is_folder(entry: &std::fs::DirEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{drop_allowed, has_subfolder, reorder, subfolders, volumes};
+    use super::{
+        drop_allowed, drop_transfer, has_subfolder, reorder, same_disk, subfolders, volumes,
+    };
     use std::path::{Path, PathBuf};
+    use wene_core::transfer::Transfer;
 
     #[test]
     fn a_folder_lands_where_it_was_dropped() {
@@ -1080,6 +1111,25 @@ mod tests {
         assert!(has_subfolder(&root));
         assert!(!has_subfolder(&root.join("b")));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_drop_moves_inside_a_disk_and_copies_across() {
+        // option, command, same disk
+        assert!(drop_transfer(false, false, true) == Transfer::Move);
+        assert!(drop_transfer(false, false, false) == Transfer::Copy);
+        assert!(drop_transfer(true, false, true) == Transfer::Copy);
+        assert!(drop_transfer(false, true, false) == Transfer::Move);
+        assert!(drop_transfer(true, true, false) == Transfer::Copy);
+    }
+
+    #[test]
+    fn a_folder_is_on_its_own_disk_and_dev_is_not() {
+        let here = std::env::temp_dir();
+        assert!(same_disk(&here, &here.join(".")));
+        // /dev is its own file system.
+        assert!(!same_disk(&here, std::path::Path::new("/dev")));
+        assert!(!same_disk(&here.join("no-such-file"), &here));
     }
 
     #[test]
