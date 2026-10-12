@@ -2,6 +2,25 @@
 
 use super::*;
 
+/// One menu item. AppKit sends `action` up the responder chain, so it
+/// must name a method that something in the chain answers: the app
+/// delegate's action table, or AppKit's own.
+pub(crate) fn menu_item(
+    mtm: MainThreadMarker,
+    title: &NSString,
+    action: objc2::runtime::Sel,
+    key: &NSString,
+) -> Retained<NSMenuItem> {
+    unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            title,
+            Some(action),
+            key,
+        )
+    }
+}
+
 impl AppDelegate {
     /// Items that act on images need something to act on: the
     /// slideshow's slide or the grid's selection. The repeat items
@@ -80,14 +99,12 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
 
     let app_item = NSMenuItem::new(mtm);
     let app_menu = NSMenu::new(mtm);
-    let prefs = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Preferences…"),
-            Some(sel!(showPrefs:)),
-            ns_string!(","),
-        )
-    };
+    let prefs = menu_item(
+        mtm,
+        ns_string!("Preferences…"),
+        sel!(showPrefs:),
+        ns_string!(","),
+    );
     app_menu.addItem(&prefs);
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     for (title, action, key, alternate) in [
@@ -95,14 +112,12 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
         ("Hide others", sel!(hideOtherApplications:), "h", true),
         ("Show all", sel!(unhideAllApplications:), "", false),
     ] {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                Some(action),
-                &NSString::from_str(key),
-            )
-        };
+        let item = menu_item(
+            mtm,
+            &NSString::from_str(title),
+            action,
+            &NSString::from_str(key),
+        );
         if alternate {
             item.setKeyEquivalentModifierMask(
                 objc2_app_kit::NSEventModifierFlags::Command
@@ -112,47 +127,34 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
         app_menu.addItem(&item);
     }
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let quit = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Quit Wêne"),
-            Some(sel!(terminate:)),
-            ns_string!("q"),
-        )
-    };
+    let quit = menu_item(
+        mtm,
+        ns_string!("Quit Wêne"),
+        sel!(terminate:),
+        ns_string!("q"),
+    );
     app_menu.addItem(&quit);
     app_item.setSubmenu(Some(&app_menu));
     menubar.addItem(&app_item);
 
     let file_item = NSMenuItem::new(mtm);
     let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("File"));
-    let open = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Open folder…"),
-            Some(sel!(openDocument:)),
-            ns_string!("o"),
-        )
-    };
+    let open = menu_item(
+        mtm,
+        ns_string!("Open folder…"),
+        sel!(openDocument:),
+        ns_string!("o"),
+    );
     file_menu.addItem(&open);
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let reveal = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Reveal in Finder"),
-            Some(sel!(revealInFinder:)),
-            ns_string!("r"),
-        )
-    };
+    let reveal = menu_item(
+        mtm,
+        ns_string!("Reveal in Finder"),
+        sel!(revealInFinder:),
+        ns_string!("r"),
+    );
     file_menu.addItem(&reveal);
-    let info = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Get info"),
-            Some(sel!(getInfo:)),
-            ns_string!("i"),
-        )
-    };
+    let info = menu_item(mtm, ns_string!("Get info"), sel!(getInfo:), ns_string!("i"));
     file_menu.addItem(&info);
     let open_with = NSMenuItem::new(mtm);
     open_with.setTitle(ns_string!("Open with"));
@@ -160,25 +162,21 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
     open_with_menu.setDelegate(Some(ProtocolObject::from_ref(delegate)));
     open_with.setSubmenu(Some(&open_with_menu));
     file_menu.addItem(&open_with);
-    let desktop = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Set as desktop picture"),
-            Some(sel!(setDesktopPicture:)),
-            ns_string!("d"),
-        )
-    };
+    let desktop = menu_item(
+        mtm,
+        ns_string!("Set as desktop picture"),
+        sel!(setDesktopPicture:),
+        ns_string!("d"),
+    );
     file_menu.addItem(&desktop);
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));
     // cmd-Delete, Finder's binding, in the grid and the slideshow.
-    let trash = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Move to trash"),
-            Some(sel!(moveToTrash:)),
-            &NSString::from_str("\u{8}"),
-        )
-    };
+    let trash = menu_item(
+        mtm,
+        ns_string!("Move to trash"),
+        sel!(moveToTrash:),
+        &NSString::from_str("\u{8}"),
+    );
     file_menu.addItem(&trash);
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));
     // Plain cmd-M is the system minimize, and cmd-C stays free for a
@@ -189,14 +187,12 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
         ("Move again", sel!(moveAgain:), "m", false),
         ("Copy again", sel!(copyAgain:), "c", false),
     ] {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                Some(action),
-                &NSString::from_str(key),
-            )
-        };
+        let item = menu_item(
+            mtm,
+            &NSString::from_str(title),
+            action,
+            &NSString::from_str(key),
+        );
         item.setKeyEquivalentModifierMask(if shift {
             objc2_app_kit::NSEventModifierFlags::Command
                 | objc2_app_kit::NSEventModifierFlags::Shift
@@ -216,32 +212,16 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
 
     let edit_item = NSMenuItem::new(mtm);
     let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
-    let select_all = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Select all"),
-            Some(sel!(selectAll:)),
-            ns_string!("a"),
-        )
-    };
-    let undo = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Undo"),
-            Some(sel!(undoLast:)),
-            ns_string!("z"),
-        )
-    };
+    let select_all = menu_item(
+        mtm,
+        ns_string!("Select all"),
+        sel!(selectAll:),
+        ns_string!("a"),
+    );
+    let undo = menu_item(mtm, ns_string!("Undo"), sel!(undoLast:), ns_string!("z"));
     edit_menu.addItem(&undo);
     let _ = delegate.ivars().undo_item.set(undo);
-    let redo = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Redo"),
-            Some(sel!(redoLast:)),
-            ns_string!("z"),
-        )
-    };
+    let redo = menu_item(mtm, ns_string!("Redo"), sel!(redoLast:), ns_string!("z"));
     redo.setKeyEquivalentModifierMask(
         objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Shift,
     );
@@ -249,46 +229,33 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
     let _ = delegate.ivars().redo_item.set(redo);
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     edit_menu.addItem(&select_all);
-    let filter = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Filter by name"),
-            Some(sel!(showFilter:)),
-            ns_string!("f"),
-        )
-    };
+    let filter = menu_item(
+        mtm,
+        ns_string!("Filter by name"),
+        sel!(showFilter:),
+        ns_string!("f"),
+    );
     edit_menu.addItem(&filter);
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     // Plain cmd-C stays free for a copy of the image itself later.
-    let copy_images = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Copy"),
-            Some(sel!(copyImages:)),
-            ns_string!("c"),
-        )
-    };
+    let copy_images = menu_item(mtm, ns_string!("Copy"), sel!(copyImages:), ns_string!("c"));
     edit_menu.addItem(&copy_images);
-    let copy_path = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Copy path"),
-            Some(sel!(copyPath:)),
-            ns_string!("c"),
-        )
-    };
+    let copy_path = menu_item(
+        mtm,
+        ns_string!("Copy path"),
+        sel!(copyPath:),
+        ns_string!("c"),
+    );
     copy_path.setKeyEquivalentModifierMask(
         objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Option,
     );
     edit_menu.addItem(&copy_path);
-    let copy_url = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Copy file URL"),
-            Some(sel!(copyFileUrl:)),
-            ns_string!(""),
-        )
-    };
+    let copy_url = menu_item(
+        mtm,
+        ns_string!("Copy file URL"),
+        sel!(copyFileUrl:),
+        ns_string!(""),
+    );
     edit_menu.addItem(&copy_url);
     edit_item.setSubmenu(Some(&edit_menu));
     menubar.addItem(&edit_item);
@@ -300,14 +267,12 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
         ("Minimise", sel!(performMiniaturize:), "m"),
         ("Zoom", sel!(performZoom:), ""),
     ] {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                Some(action),
-                &NSString::from_str(key),
-            )
-        };
+        let item = menu_item(
+            mtm,
+            &NSString::from_str(title),
+            action,
+            &NSString::from_str(key),
+        );
         window_menu.addItem(&item);
     }
     window_item.setSubmenu(Some(&window_menu));
@@ -317,44 +282,31 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
 
     let show_item = NSMenuItem::new(mtm);
     let show_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Slideshow"));
-    let start = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Start slideshow"),
-            Some(sel!(startSlideshow:)),
-            ns_string!("y"),
-        )
-    };
-    let start_windowed = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Start slideshow in window"),
-            Some(sel!(startSlideshowWindowed:)),
-            ns_string!("y"),
-        )
-    };
+    let start = menu_item(
+        mtm,
+        ns_string!("Start slideshow"),
+        sel!(startSlideshow:),
+        ns_string!("y"),
+    );
+    let start_windowed = menu_item(
+        mtm,
+        ns_string!("Start slideshow in window"),
+        sel!(startSlideshowWindowed:),
+        ns_string!("y"),
+    );
     start_windowed.setKeyEquivalentModifierMask(
         objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Option,
     );
     show_menu.addItem(&start);
     show_menu.addItem(&start_windowed);
     show_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let loop_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Loop"),
-            Some(sel!(toggleLoop:)),
-            ns_string!("l"),
-        )
-    };
-    let shuffle_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Shuffle"),
-            Some(sel!(toggleShuffle:)),
-            ns_string!("r"),
-        )
-    };
+    let loop_item = menu_item(mtm, ns_string!("Loop"), sel!(toggleLoop:), ns_string!("l"));
+    let shuffle_item = menu_item(
+        mtm,
+        ns_string!("Shuffle"),
+        sel!(toggleShuffle:),
+        ns_string!("r"),
+    );
     shuffle_item.setKeyEquivalentModifierMask(
         objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Option,
     );
@@ -372,14 +324,12 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
         ("Every 5 seconds", 50),
         ("Every 10 seconds", 100),
     ] {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                Some(sel!(setAutoAdvanceMenu:)),
-                ns_string!(""),
-            )
-        };
+        let item = menu_item(
+            mtm,
+            &NSString::from_str(title),
+            sel!(setAutoAdvanceMenu:),
+            ns_string!(""),
+        );
         item.setTag(tag);
         if tag == 0 {
             item.setState(1);
@@ -405,14 +355,12 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
         ("Sort by EXIF date", 5, "5"),
         ("Sort by date added", 6, "6"),
     ] {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                Some(sel!(setSortMenu:)),
-                &NSString::from_str(key),
-            )
-        };
+        let item = menu_item(
+            mtm,
+            &NSString::from_str(title),
+            sel!(setSortMenu:),
+            &NSString::from_str(key),
+        );
         item.setKeyEquivalentModifierMask(
             objc2_app_kit::NSEventModifierFlags::Command
                 | objc2_app_kit::NSEventModifierFlags::Control,
@@ -427,71 +375,59 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
     // cmd-plus is really shift-cmd-equals, and a key equivalent of
     // "+" matches nothing a keyboard can send. The key under the plus
     // is the one to bind, with a hidden twin for the shifted press.
-    let bigger = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Bigger thumbnails"),
-            Some(sel!(biggerThumbs:)),
-            ns_string!("="),
-        )
-    };
-    let bigger_shifted = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Bigger thumbnails"),
-            Some(sel!(biggerThumbs:)),
-            ns_string!("="),
-        )
-    };
+    let bigger = menu_item(
+        mtm,
+        ns_string!("Bigger thumbnails"),
+        sel!(biggerThumbs:),
+        ns_string!("="),
+    );
+    let bigger_shifted = menu_item(
+        mtm,
+        ns_string!("Bigger thumbnails"),
+        sel!(biggerThumbs:),
+        ns_string!("="),
+    );
     bigger_shifted.setKeyEquivalentModifierMask(
         objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Shift,
     );
     bigger_shifted.setHidden(true);
-    let smaller = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Smaller thumbnails"),
-            Some(sel!(smallerThumbs:)),
-            ns_string!("-"),
-        )
-    };
+    let smaller = menu_item(
+        mtm,
+        ns_string!("Smaller thumbnails"),
+        sel!(smallerThumbs:),
+        ns_string!("-"),
+    );
     view_menu.addItem(&bigger);
     view_menu.addItem(&bigger_shifted);
     view_menu.addItem(&smaller);
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let scale_up = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Fill the screen with small images"),
-            Some(sel!(toggleScaleUp:)),
-            ns_string!("e"),
-        )
-    };
+    let scale_up = menu_item(
+        mtm,
+        ns_string!("Fill the screen with small images"),
+        sel!(toggleScaleUp:),
+        ns_string!("e"),
+    );
     view_menu.addItem(&scale_up);
     let _ = delegate.ivars().scale_up_item.set(scale_up);
     view_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let sidebar_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Show sidebar"),
-            Some(sel!(toggleSidebarMenu:)),
-            ns_string!("s"),
-        )
-    };
+    let sidebar_item = menu_item(
+        mtm,
+        ns_string!("Show sidebar"),
+        sel!(toggleSidebarMenu:),
+        ns_string!("s"),
+    );
     sidebar_item.setKeyEquivalentModifierMask(
         objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Control,
     );
     sidebar_item.setState(1);
     view_menu.addItem(&sidebar_item);
     let _ = delegate.ivars().sidebar_item.set(sidebar_item);
-    let labels_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            ns_string!("Show filenames"),
-            Some(sel!(toggleLabels:)),
-            ns_string!(""),
-        )
-    };
+    let labels_item = menu_item(
+        mtm,
+        ns_string!("Show filenames"),
+        sel!(toggleLabels:),
+        ns_string!(""),
+    );
     view_menu.addItem(&labels_item);
     let _ = delegate.ivars().labels_item.set(labels_item);
     view_item.setSubmenu(Some(&view_menu));

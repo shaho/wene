@@ -48,7 +48,7 @@ use wene_core::transfer::{self, Transfer};
 use wene_core::{Engine, Event, LruCache, Playlist, SortOrder};
 
 use info::{exif_date_text, file_name, rows_text};
-use menu::build_menu;
+use menu::{build_menu, menu_item};
 use prefs::{
     last_folder_pref, save_last_folder, startup_folder_pref, thumb_cap_pref, thumb_size_pref,
     THUMB_SLIDER_W,

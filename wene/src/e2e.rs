@@ -1786,14 +1786,7 @@ impl AppDelegate {
 
     /// Whether the menu would enable an item with this action.
     pub fn e2e_menu_enabled(&self, action: objc2::runtime::Sel) -> bool {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(self.mtm()),
-                ns_string!(""),
-                Some(action),
-                ns_string!(""),
-            )
-        };
+        let item = menu_item(self.mtm(), ns_string!(""), action, ns_string!(""));
         self.menu_item_enabled(&item)
     }
 

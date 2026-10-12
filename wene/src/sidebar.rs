@@ -28,7 +28,7 @@ use objc2_foundation::{
     NSObjectProtocol, NSRect, NSString, NSUserDefaults, NSURL,
 };
 
-use crate::{e2e, AppDelegate};
+use crate::{e2e, menu_item, AppDelegate};
 use wene_core::transfer::Transfer;
 
 /// Width of the sidebar pane, and the limits the split view allows.
@@ -455,14 +455,7 @@ impl Sidebar {
                 menu.addItem(&NSMenuItem::separatorItem(mtm));
                 continue;
             };
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(title),
-                    Some(action),
-                    ns_string!(""),
-                )
-            };
+            let item = menu_item(mtm, &NSString::from_str(title), action, ns_string!(""));
             unsafe { item.setTarget(Some(self)) };
             menu.addItem(&item);
         }

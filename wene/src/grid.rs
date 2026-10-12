@@ -23,7 +23,7 @@ use objc2_app_kit::{
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSArray, NSObjectProtocol, NSRect, NSString, NSURL};
 
-use crate::AppDelegate;
+use crate::{menu_item, AppDelegate};
 
 /// What a drag may do. A drag that leaves the app copies instead of
 /// moving when the preference says so: dropping an image on the
@@ -837,14 +837,12 @@ impl GridView {
             if action == sel!(moveToTrash:) {
                 menu.addItem(&NSMenuItem::separatorItem(mtm));
             }
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(&title),
-                    Some(action),
-                    &NSString::from_str(""),
-                )
-            };
+            let item = menu_item(
+                mtm,
+                &NSString::from_str(&title),
+                action,
+                &NSString::from_str(""),
+            );
             if let Some(delegate) = delegate {
                 unsafe { item.setTarget(Some(delegate)) };
             }

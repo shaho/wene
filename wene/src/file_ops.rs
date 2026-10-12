@@ -311,14 +311,7 @@ impl AppDelegate {
         for app in workspace.URLsForApplicationsToOpenURL(&url).iter() {
             let Some(path) = app.path() else { continue };
             let name = objc2_foundation::NSFileManager::defaultManager().displayNameAtPath(&path);
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &name,
-                    Some(sel!(openWith:)),
-                    ns_string!(""),
-                )
-            };
+            let item = menu_item(mtm, &name, sel!(openWith:), ns_string!(""));
             unsafe {
                 item.setTarget(Some(self));
                 item.setRepresentedObject(Some(&app));
