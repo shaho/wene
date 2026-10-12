@@ -78,7 +78,8 @@ To build a disk image, named after the version in `wene/Cargo.toml`
 ```
 
 Opening files from Finder needs the bundle, not `cargo run`: a bare binary has
-no Info.plist, so macOS never offers it. The app is not signed or notarized yet.
+no Info.plist, so macOS never offers it. The bundle is signed ad hoc, not with a
+Developer ID, and it is not notarized.
 
 Needs macOS 11.5 or later and a Rust toolchain.
 

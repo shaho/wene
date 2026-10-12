@@ -80,6 +80,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# Seal the whole bundle with an ad-hoc signature. The linker signs
+# only the binary, so Info.plist and the icon were not covered, and
+# Gatekeeper calls a downloaded copy of such a bundle "damaged". Ad
+# hoc is not a Developer ID: another Mac still asks before the first
+# open, but it can open the app.
+codesign --force --sign - "$APP"
+codesign --verify --strict "$APP"
+
 # Launch Services keeps the old document types until it re-reads the
 # bundle, so force it during development.
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
