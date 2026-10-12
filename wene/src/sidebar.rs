@@ -17,15 +17,15 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent, NSEventModifierFlags,
-    NSImage, NSImageView, NSMenu, NSMenuDelegate, NSMenuItem, NSOutlineView, NSOutlineViewDataSource,
-    NSOutlineViewDelegate, NSOutlineViewDropOnItemIndex, NSPasteboardItem, NSPasteboardTypeFileURL,
-    NSPasteboardWriting, NSScrollView, NSTableCellView, NSTableColumn, NSTableViewRowSizeStyle,
-    NSTableViewStyle, NSTextField, NSView, NSWorkspace,
+    NSImage, NSImageView, NSMenu, NSMenuDelegate, NSMenuItem, NSOutlineView,
+    NSOutlineViewDataSource, NSOutlineViewDelegate, NSOutlineViewDropOnItemIndex, NSPasteboardItem,
+    NSPasteboardTypeFileURL, NSPasteboardWriting, NSScrollView, NSTableCellView, NSTableColumn,
+    NSTableViewRowSizeStyle, NSTableViewStyle, NSTextField, NSView, NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGSize};
 use objc2_foundation::{
     ns_string, NSArray, NSIndexSet, NSInteger, NSNotification, NSNumber, NSObject,
-    NSObjectProtocol, NSRect, NSString, NSURL, NSUserDefaults,
+    NSObjectProtocol, NSRect, NSString, NSUserDefaults, NSURL,
 };
 
 use crate::{e2e, AppDelegate};
@@ -310,7 +310,8 @@ impl Sidebar {
 
         let frame = NSRect::new(CGPoint::new(0.0, 0.0), CGSize::new(WIDTH, 400.0));
         let outline = NSOutlineView::initWithFrame(NSOutlineView::alloc(mtm), frame);
-        let column = NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("name"));
+        let column =
+            NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("name"));
         column.setWidth(WIDTH);
         outline.addTableColumn(&column);
         unsafe { outline.setOutlineTableColumn(Some(&column)) };
@@ -373,7 +374,9 @@ impl Sidebar {
     /// Whether a row gets a disclosure triangle. Sections always do;
     /// a folder only when it really holds a sub-folder.
     fn expandable(&self, item: &AnyObject) -> bool {
-        let Some(index) = index_of(Some(item)) else { return false };
+        let Some(index) = index_of(Some(item)) else {
+            return false;
+        };
         if self.with_node(index, |node| node.section) {
             return true;
         }
@@ -396,8 +399,12 @@ impl Sidebar {
     /// lists that folder only; cmd-O stays recursive, so clicking the
     /// folder cmd-O opened narrows it back to one level.
     fn open_selected(&self) {
-        let Some(path) = self.selected_path() else { return };
-        let Some(delegate) = self.ivars().delegate.get() else { return };
+        let Some(path) = self.selected_path() else {
+            return;
+        };
+        let Some(delegate) = self.ivars().delegate.get() else {
+            return;
+        };
         if delegate.current_scan() == Some((path.clone(), false)) {
             return;
         }
@@ -471,9 +478,8 @@ impl Sidebar {
     }
 
     fn open_in_finder(&self, index: usize) {
-        let url = NSURL::fileURLWithPath(&NSString::from_str(
-            &self.path_of(index).to_string_lossy(),
-        ));
+        let url =
+            NSURL::fileURLWithPath(&NSString::from_str(&self.path_of(index).to_string_lossy()));
         NSWorkspace::sharedWorkspace().openURL(&url);
     }
 
@@ -487,15 +493,21 @@ impl Sidebar {
     ) -> bool {
         let paths = dropped_paths(info);
         if !paths.is_empty() && paths.iter().all(|path| path.is_dir()) {
-            let Some(slot) = self.favorites_slot(item, index) else { return false };
+            let Some(slot) = self.favorites_slot(item, index) else {
+                return false;
+            };
             // Dropped together, they keep the order they were in.
             for (offset, path) in paths.iter().enumerate() {
                 self.insert_favorite(path, slot + offset);
             }
             return true;
         }
-        let Some(target) = self.drop_target(item) else { return false };
-        let Some(delegate) = self.ivars().delegate.get() else { return false };
+        let Some(target) = self.drop_target(item) else {
+            return false;
+        };
+        let Some(delegate) = self.ivars().delegate.get() else {
+            return false;
+        };
         if paths.is_empty() {
             return false;
         }
@@ -532,7 +544,9 @@ impl Sidebar {
     fn favorites_slot(&self, item: Option<&AnyObject>, index: NSInteger) -> Option<usize> {
         let root = self.ivars().favorites_root.get();
         let target = index_of(item)?;
-        let children = self.with_node(root, |node| node.children.clone()).unwrap_or_default();
+        let children = self
+            .with_node(root, |node| node.children.clone())
+            .unwrap_or_default();
         if target == root {
             return Some(if index < 0 {
                 children.len()
@@ -599,10 +613,7 @@ impl Sidebar {
         let icon = NSWorkspace::sharedWorkspace()
             .iconForFile(&NSString::from_str(&path.to_string_lossy()));
         icon.setSize(CGSize::new(16.0, 16.0));
-        self.ivars()
-            .icons
-            .borrow_mut()
-            .insert(path, icon.clone());
+        self.ivars().icons.borrow_mut().insert(path, icon.clone());
         icon
     }
 
@@ -696,10 +707,12 @@ impl Sidebar {
                 let name = component.as_os_str();
                 unsafe { self.outline().expandItem(Some(&item_for(index))) };
                 self.load_children(index);
-                let next = self.with_node(index, |node| node.children.clone()).and_then(|kids| {
-                    kids.into_iter()
-                        .find(|kid| self.with_node(*kid, |n| n.path.file_name() == Some(name)))
-                });
+                let next = self
+                    .with_node(index, |node| node.children.clone())
+                    .and_then(|kids| {
+                        kids.into_iter()
+                            .find(|kid| self.with_node(*kid, |n| n.path.file_name() == Some(name)))
+                    });
                 match next {
                     Some(next) => index = next,
                     // The tree leaves out dot-folders and packages, so
@@ -713,8 +726,10 @@ impl Sidebar {
         if row < 0 {
             return unsafe { self.outline().deselectAll(None) };
         }
-        self.outline()
-            .selectRowIndexes_byExtendingSelection(&NSIndexSet::indexSetWithIndex(row as usize), false);
+        self.outline().selectRowIndexes_byExtendingSelection(
+            &NSIndexSet::indexSetWithIndex(row as usize),
+            false,
+        );
         self.outline().scrollRowToVisible(row);
     }
 
@@ -732,7 +747,9 @@ impl Sidebar {
                 .unwrap_or_default();
             for child in children {
                 let path = self.path_of(child);
-                let Ok(real) = std::fs::canonicalize(&path) else { continue };
+                let Ok(real) = std::fs::canonicalize(&path) else {
+                    continue;
+                };
                 if !target.starts_with(&real) {
                     continue;
                 }
@@ -761,13 +778,18 @@ impl Sidebar {
     pub fn e2e_context_menu(&self, path: &Path) -> Vec<String> {
         let index = {
             let nodes = self.ivars().nodes.borrow();
-            nodes.iter().position(|node| !node.section && node.path == path)
+            nodes
+                .iter()
+                .position(|node| !node.section && node.path == path)
         };
         let menu = NSMenu::new(self.mtm());
         if let Some(index) = index {
             self.fill_context_menu(&menu, index);
         }
-        menu.itemArray().iter().map(|item| item.title().to_string()).collect()
+        menu.itemArray()
+            .iter()
+            .map(|item| item.title().to_string())
+            .collect()
     }
 
     pub fn e2e_favorites(&self) -> Vec<PathBuf> {
@@ -941,7 +963,10 @@ fn subfolders(path: &Path) -> Vec<PathBuf> {
     let mut folders: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
+        .filter(|p| {
+            !p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        })
         .filter(|p| p.is_dir())
         .filter(|p| !is_package(p))
         .collect();
@@ -999,7 +1024,14 @@ mod tests {
             PathBuf::from("/c"),
         ];
         reorder(&mut list, Path::new("/a"), 2);
-        assert_eq!(list, vec![PathBuf::from("/b"), PathBuf::from("/a"), PathBuf::from("/c")]);
+        assert_eq!(
+            list,
+            vec![
+                PathBuf::from("/b"),
+                PathBuf::from("/a"),
+                PathBuf::from("/c")
+            ]
+        );
         // And moving up lands above the row it was dropped on.
         reorder(&mut list, Path::new("/c"), 0);
         assert_eq!(list[0], PathBuf::from("/c"));

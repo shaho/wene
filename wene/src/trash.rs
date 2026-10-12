@@ -42,7 +42,11 @@ pub fn move_to_trash(paths: &[PathBuf]) -> Trashed {
                 }
             }
             Err(error) => {
-                eprintln!("trash failed: {}: {}", path.display(), error.localizedDescription());
+                eprintln!(
+                    "trash failed: {}: {}",
+                    path.display(),
+                    error.localizedDescription()
+                );
                 result.failed.push(path.clone());
             }
         }

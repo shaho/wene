@@ -233,7 +233,12 @@ mod tests {
     use super::*;
 
     fn playlist(n: usize) -> Playlist {
-        Playlist::new((0..n).map(|i| PathBuf::from(format!("/f/{i}.jpg"))).collect(), 0)
+        Playlist::new(
+            (0..n)
+                .map(|i| PathBuf::from(format!("/f/{i}.jpg")))
+                .collect(),
+            0,
+        )
     }
 
     fn name(p: &PathBuf) -> String {

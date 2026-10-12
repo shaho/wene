@@ -81,9 +81,13 @@ fn perform_menu_item(menu_title: &str, item_title: &str) -> bool {
         return false;
     };
     let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
-    let Some(menubar) = app.mainMenu() else { return false };
+    let Some(menubar) = app.mainMenu() else {
+        return false;
+    };
     for item in menubar.itemArray() {
-        let Some(submenu) = item.submenu() else { continue };
+        let Some(submenu) = item.submenu() else {
+            continue;
+        };
         if submenu.title().to_string() != menu_title {
             continue;
         }
@@ -107,7 +111,9 @@ fn cull_name(tag: &str) -> String {
 /// Take a cull test file back out of the trash, so a run leaves
 /// nothing behind.
 fn empty_from_trash(name: &str) {
-    let Ok(home) = std::env::var("HOME") else { return };
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
     let _ = std::fs::remove_file(format!("{home}/.Trash/{name}"));
 }
 
@@ -168,12 +174,24 @@ pub fn run_step(delegate: &AppDelegate) {
         }
         1 => {
             check(state, delegate.e2e_show_active(), "slideshow window active");
-            check(state, delegate.e2e_current_index() == Some(0), "starts at index 0");
-            check(state, delegate.e2e_slide_has_image(), "first slide decoded and shown");
+            check(
+                state,
+                delegate.e2e_current_index() == Some(0),
+                "starts at index 0",
+            );
+            check(
+                state,
+                delegate.e2e_slide_has_image(),
+                "first slide decoded and shown",
+            );
         }
         2 => {
             delegate.step_slideshow(1);
-            check(state, delegate.e2e_current_index() == Some(1), "arrow step to index 1");
+            check(
+                state,
+                delegate.e2e_current_index() == Some(1),
+                "arrow step to index 1",
+            );
         }
         3 => {
             check(state, delegate.e2e_slide_has_image(), "second slide shown");
@@ -346,13 +364,21 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.start_slideshow(0, true);
         }
         19 => {
-            check(state, delegate.e2e_show_active(), "windowed slideshow active");
+            check(
+                state,
+                delegate.e2e_show_active(),
+                "windowed slideshow active",
+            );
             check(
                 state,
                 delegate.e2e_show_is_windowed() == Some(true),
                 "window has a title bar",
             );
-            check(state, delegate.e2e_slide_has_image(), "windowed slide shown");
+            check(
+                state,
+                delegate.e2e_slide_has_image(),
+                "windowed slide shown",
+            );
             // Zoom holds the image point under the anchor. Anchored
             // a quarter-width right of the centre, doubling the scale
             // from fit has to pull the pan left by that same quarter.
@@ -364,7 +390,10 @@ pub fn run_step(delegate: &AppDelegate) {
                 );
                 let step = bounds.size.width / 4.0;
                 let fit = view.drawn_scale();
-                view.zoom_to(fit * 2.0, Some(objc2_core_foundation::CGPoint::new(cx + step, cy)));
+                view.zoom_to(
+                    fit * 2.0,
+                    Some(objc2_core_foundation::CGPoint::new(cx + step, cy)),
+                );
                 let (dx, dy) = view.state().offset;
                 check(
                     state,
@@ -392,7 +421,11 @@ pub fn run_step(delegate: &AppDelegate) {
             );
         }
         21 => {
-            check(state, delegate.e2e_show_active(), "menu started windowed show");
+            check(
+                state,
+                delegate.e2e_show_active(),
+                "menu started windowed show",
+            );
             check(
                 state,
                 delegate.e2e_show_is_windowed() == Some(true),
@@ -408,7 +441,11 @@ pub fn run_step(delegate: &AppDelegate) {
             );
         }
         23 => {
-            check(state, delegate.e2e_show_active(), "menu started fullscreen show");
+            check(
+                state,
+                delegate.e2e_show_active(),
+                "menu started fullscreen show",
+            );
             check(
                 state,
                 delegate.e2e_show_is_windowed() == Some(false),
@@ -417,7 +454,11 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.end_slideshow();
         }
         24 => {
-            check(state, !delegate.e2e_show_active(), "menu-started show closed");
+            check(
+                state,
+                !delegate.e2e_show_active(),
+                "menu-started show closed",
+            );
         }
         25 => {
             // Status bar: count, then selection info.
@@ -456,8 +497,7 @@ pub fn run_step(delegate: &AppDelegate) {
         28 => {
             // Animated GIF: drop one into the folder for the watcher.
             let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
-            let written =
-                std::fs::write(format!("{root}/zzz-anim.gif"), ANIMATED_GIF).is_ok();
+            let written = std::fs::write(format!("{root}/zzz-anim.gif"), ANIMATED_GIF).is_ok();
             check(state, written, "animated gif written");
         }
         29 => {
@@ -475,7 +515,11 @@ pub fn run_step(delegate: &AppDelegate) {
         }
         30 => {
             check(state, delegate.e2e_show_active(), "gif slideshow active");
-            check(state, delegate.e2e_slide_animating(), "gif frames are playing");
+            check(
+                state,
+                delegate.e2e_slide_animating(),
+                "gif frames are playing",
+            );
             delegate.end_slideshow();
             let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
             let _ = std::fs::remove_file(format!("{root}/zzz-anim.gif"));
@@ -549,9 +593,17 @@ pub fn run_step(delegate: &AppDelegate) {
             // both fall back to the modified date without breaking
             // the grid; then name order restores.
             delegate.e2e_sort(wene_core::SortOrder::ExifDate, true);
-            check(state, delegate.e2e_file_count() == 4, "EXIF date sort keeps all files");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "EXIF date sort keeps all files",
+            );
             delegate.e2e_sort(wene_core::SortOrder::Added, true);
-            check(state, delegate.e2e_file_count() == 4, "date added sort keeps all files");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "date added sort keeps all files",
+            );
             delegate.e2e_sort(wene_core::SortOrder::Name, false);
             check(
                 state,
@@ -570,7 +622,11 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, copied, "cull test file copied");
         }
         36 => {
-            check(state, delegate.e2e_file_count() == 5, "watcher saw the cull test file");
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher saw the cull test file",
+            );
             // Name order puts zzz-trash-a.heic last: index 4.
             delegate.e2e_select(&[4]);
             check(
@@ -578,7 +634,11 @@ pub fn run_step(delegate: &AppDelegate) {
                 perform_menu_item("File", "Move to trash"),
                 "menu item 'Move to trash' fired",
             );
-            check(state, delegate.e2e_file_count() == 4, "trashed image left the grid");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "trashed image left the grid",
+            );
             check(
                 state,
                 delegate.e2e_status_text() == format!("Moved to trash: {}", cull_name("a")),
@@ -609,14 +669,22 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, copied, "second cull test file copied");
         }
         38 => {
-            check(state, delegate.e2e_file_count() == 5, "watcher saw the second file");
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher saw the second file",
+            );
             delegate.start_slideshow(4, false);
             check(
                 state,
                 perform_menu_item("File", "Move to trash"),
                 "menu item 'Move to trash' fired with a show up",
             );
-            check(state, delegate.e2e_show_active(), "slideshow stays up after a cull");
+            check(
+                state,
+                delegate.e2e_show_active(),
+                "slideshow stays up after a cull",
+            );
             check(
                 state,
                 delegate.e2e_playlist_len() == Some(4),
@@ -633,7 +701,11 @@ pub fn run_step(delegate: &AppDelegate) {
             empty_from_trash(&cull_name("b"));
         }
         39 => {
-            check(state, delegate.e2e_file_count() == 4, "grid back to the fixture");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "grid back to the fixture",
+            );
         }
         40 => {
             // Move and copy: a test file of our own, into a folder
@@ -648,14 +720,22 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, made && copied, "transfer test folder and file ready");
         }
         41 => {
-            check(state, delegate.e2e_file_count() == 5, "watcher saw the transfer file");
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher saw the transfer file",
+            );
             // Name order puts the zzz file last: index 4.
             delegate.e2e_select(&[4]);
             delegate.e2e_transfer(&transfer_folder(), true);
         }
         42 => {
             check(state, !delegate.e2e_transfer_busy(), "the batch finished");
-            check(state, delegate.e2e_file_count() == 4, "moved image left the grid");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "moved image left the grid",
+            );
             check(
                 state,
                 std::path::Path::new(&format!("{}/{}", transfer_folder(), transfer_name()))
@@ -669,8 +749,7 @@ pub fn run_step(delegate: &AppDelegate) {
                 .into_owned();
             check(
                 state,
-                delegate.e2e_status_text()
-                    == format!("Moved {} to {folder_name}", transfer_name()),
+                delegate.e2e_status_text() == format!("Moved {} to {folder_name}", transfer_name()),
                 "status bar names the moved file and its folder",
             );
             check(
@@ -691,7 +770,11 @@ pub fn run_step(delegate: &AppDelegate) {
             );
         }
         43 => {
-            check(state, delegate.e2e_file_count() == 5, "watcher saw the second file");
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher saw the second file",
+            );
             delegate.e2e_select(&[4]);
             check(
                 state,
@@ -700,11 +783,17 @@ pub fn run_step(delegate: &AppDelegate) {
             );
         }
         44 => {
-            check(state, delegate.e2e_file_count() == 4, "second move left the grid");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "second move left the grid",
+            );
             let stem_now = transfer_name().trim_end_matches(".heic").to_string();
             check(
                 state,
-                delegate.e2e_status_text().contains(&format!("{stem_now} 2.heic"))
+                delegate
+                    .e2e_status_text()
+                    .contains(&format!("{stem_now} 2.heic"))
                     && delegate.e2e_status_text().ends_with(", 1 renamed"),
                 "status bar names the file by its new name and reports the rename",
             );
@@ -719,7 +808,11 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.e2e_transfer(&transfer_folder(), false);
         }
         45 => {
-            check(state, delegate.e2e_file_count() == 4, "a copy leaves the grid alone");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "a copy leaves the grid alone",
+            );
             check(
                 state,
                 std::path::Path::new(&format!("{}/apple.heic", transfer_folder())).exists(),
@@ -727,7 +820,9 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             check(
                 state,
-                delegate.e2e_status_text().starts_with("Copied apple.heic to "),
+                delegate
+                    .e2e_status_text()
+                    .starts_with("Copied apple.heic to "),
                 "status bar names the copied file",
             );
             // Two files at once, to check the batch line and that
@@ -741,13 +836,25 @@ pub fn run_step(delegate: &AppDelegate) {
             }
         }
         46 => {
-            check(state, delegate.e2e_file_count() == 6, "watcher saw both batch files");
+            check(
+                state,
+                delegate.e2e_file_count() == 6,
+                "watcher saw both batch files",
+            );
             delegate.e2e_select(&[4, 5]);
             delegate.e2e_transfer(&transfer_folder(), true);
         }
         47 => {
-            check(state, !delegate.e2e_transfer_busy(), "the two-file batch finished");
-            check(state, delegate.e2e_file_count() == 4, "the batch left the grid");
+            check(
+                state,
+                !delegate.e2e_transfer_busy(),
+                "the two-file batch finished",
+            );
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "the batch left the grid",
+            );
             let folder_name = std::path::Path::new(&transfer_folder())
                 .file_name()
                 .unwrap()
@@ -821,7 +928,11 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.e2e_sidebar_click(&root);
         }
         52 => {
-            check(state, !delegate.e2e_filter_open(), "a folder change closes the bar");
+            check(
+                state,
+                !delegate.e2e_filter_open(),
+                "a folder change closes the bar",
+            );
             check(
                 state,
                 delegate.e2e_file_count() == 4,
@@ -864,7 +975,11 @@ pub fn run_step(delegate: &AppDelegate) {
             let _ = std::fs::remove_file(format!("{root}/zzz-hidden-{pid}.heic"));
         }
         55 => {
-            check(state, delegate.e2e_file_count() == 4, "grid back to the fixture");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "grid back to the fixture",
+            );
         }
         56 => {
             // Finder open: a file in the folder already showing.
@@ -874,9 +989,7 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.start_slideshow(0, false);
             delegate.e2e_open_filter();
             delegate.e2e_type_filter("apple");
-            delegate.open_from_finder(vec![std::path::PathBuf::from(format!(
-                "{root}/img2.heic"
-            ))]);
+            delegate.open_from_finder(vec![std::path::PathBuf::from(format!("{root}/img2.heic"))]);
             check(
                 state,
                 delegate.e2e_selected_name().as_deref() == Some("img2.heic"),
@@ -1034,7 +1147,9 @@ pub fn run_step(delegate: &AppDelegate) {
                 state,
                 delegate.e2e_favorite_count() == before + 1
                     && names.first().map(String::as_str)
-                        == std::path::Path::new(&root).file_name().and_then(|n| n.to_str()),
+                        == std::path::Path::new(&root)
+                            .file_name()
+                            .and_then(|n| n.to_str()),
                 "a folder dropped at the top of Favorites lands there",
             );
             delegate.e2e_insert_favorite(&root, 3);
@@ -1042,7 +1157,10 @@ pub fn run_step(delegate: &AppDelegate) {
             check(
                 state,
                 delegate.e2e_favorite_count() == before + 1
-                    && names.first().map(String::as_str) != std::path::Path::new(&root).file_name().and_then(|n| n.to_str()),
+                    && names.first().map(String::as_str)
+                        != std::path::Path::new(&root)
+                            .file_name()
+                            .and_then(|n| n.to_str()),
                 "dropping it again moves it instead of adding a second row",
             );
             delegate.e2e_remove_favorite(&root);
@@ -1078,7 +1196,11 @@ pub fn run_step(delegate: &AppDelegate) {
             delegate.e2e_toggle_info();
             check(state, delegate.e2e_info_open(), "cmd-I opens the panel");
             delegate.e2e_toggle_info();
-            check(state, !delegate.e2e_info_open(), "a second cmd-I puts it away");
+            check(
+                state,
+                !delegate.e2e_info_open(),
+                "a second cmd-I puts it away",
+            );
         }
         65 => {
             // The overlay's extra blocks, on top of a running show.
@@ -1166,7 +1288,11 @@ pub fn run_step(delegate: &AppDelegate) {
         }
         69 => {
             let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
-            check(state, delegate.e2e_file_count() == 5, "watcher saw the undo test file");
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "watcher saw the undo test file",
+            );
             // Name order puts zzz-undo last.
             delegate.e2e_select(&[4]);
             check(
@@ -1198,7 +1324,11 @@ pub fn run_step(delegate: &AppDelegate) {
         }
         70 => {
             let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
-            check(state, delegate.e2e_file_count() == 5, "the restored file is in the grid");
+            check(
+                state,
+                delegate.e2e_file_count() == 5,
+                "the restored file is in the grid",
+            );
             delegate.e2e_redo();
             check(
                 state,
@@ -1275,7 +1405,11 @@ pub fn run_step(delegate: &AppDelegate) {
                     println!("e2e menu clash: {clash}");
                 }
             }
-            check(state, clashes.is_empty(), "every menu shortcut is bound once");
+            check(
+                state,
+                clashes.is_empty(),
+                "every menu shortcut is bound once",
+            );
         }
         75 => {
             // The preference that keeps a drag onto the desktop from

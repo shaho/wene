@@ -22,15 +22,16 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSColor, NSControlTextEditingDelegate, NSFont, NSTextFieldDelegate, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSOpenPanel, NSScreen, NSScrollView,
-    NSSplitViewController, NSSplitViewItem, NSTextField, NSTextView, NSViewController, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSColor, NSControlTextEditingDelegate, NSFont, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
+    NSOpenPanel, NSScreen, NSScrollView, NSSplitViewController, NSSplitViewItem, NSTextField,
+    NSTextFieldDelegate, NSTextView, NSViewController, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{
     ns_string, NSArray, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString, NSTimer,
-    NSURL, NSUserDefaults,
+    NSUserDefaults, NSURL,
 };
 use wene_core::history::{Entry, History, Step};
 use wene_core::transfer::Transfer;
@@ -712,7 +713,9 @@ impl AppDelegate {
         if let Some(window) = self.ivars().window.get() {
             window.setTitle(&NSString::from_str(&format!(
                 "Wêne — {}",
-                root.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                root.file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default()
             )));
         }
         // The sidebar follows the grid, whatever changed the folder.
@@ -729,15 +732,16 @@ impl AppDelegate {
     /// Show or hide the sidebar. The split view controller owns the
     /// collapse animation.
     fn toggle_sidebar(&self) {
-        let Some(split) = self.ivars().split.get() else { return };
+        let Some(split) = self.ivars().split.get() else {
+            return;
+        };
         unsafe { split.toggleSidebar(None) };
         self.sync_sidebar_item();
     }
 
     /// Tick the View menu item to match the sidebar.
     fn sync_sidebar_item(&self) {
-        let (Some(split), Some(item)) =
-            (self.ivars().split.get(), self.ivars().sidebar_item.get())
+        let (Some(split), Some(item)) = (self.ivars().split.get(), self.ivars().sidebar_item.get())
         else {
             return;
         };
@@ -877,8 +881,12 @@ impl AppDelegate {
 
     /// Push current state into the prefs controls (looked up by tag).
     fn sync_prefs_controls(&self) {
-        let Some(window) = self.ivars().prefs_window.get() else { return };
-        let Some(content) = window.contentView() else { return };
+        let Some(window) = self.ivars().prefs_window.get() else {
+            return;
+        };
+        let Some(content) = window.contentView() else {
+            return;
+        };
         let set_check = |tag: isize, on: bool| {
             if let Some(view) = content.viewWithTag(tag) {
                 if let Some(button) = view.downcast_ref::<objc2_app_kit::NSButton>() {
@@ -938,7 +946,9 @@ impl AppDelegate {
         if let Some(window) = self.ivars().window.get() {
             window.makeKeyAndOrderFront(None);
         }
-        let Some(first) = paths.first().cloned() else { return };
+        let Some(first) = paths.first().cloned() else {
+            return;
+        };
         if first.is_dir() {
             // A folder opens as a folder, one level deep, like a
             // click in the sidebar.
@@ -950,7 +960,11 @@ impl AppDelegate {
         // A path that went away between the Finder gesture and the
         // launch leaves the flag alone, so launch still restores the
         // last folder instead of showing nothing.
-        let Some(folder) = files.first().and_then(|path| path.parent()).map(PathBuf::from) else {
+        let Some(folder) = files
+            .first()
+            .and_then(|path| path.parent())
+            .map(PathBuf::from)
+        else {
             return;
         };
         self.ivars().opened_from_finder.set(true);
@@ -975,7 +989,9 @@ impl AppDelegate {
         if pending.is_empty() {
             return true;
         }
-        let Some(grid) = self.ivars().grid.get() else { return false };
+        let Some(grid) = self.ivars().grid.get() else {
+            return false;
+        };
         // Only touch the selection once the grid really holds them.
         // A scan of some other folder must leave it alone.
         if !grid.holds_all(&pending) {
@@ -1004,7 +1020,9 @@ impl AppDelegate {
 
     /// The field's text is the filter. Typing lands here.
     fn filter_changed(&self) {
-        let Some(field) = self.ivars().filter_field.get() else { return };
+        let Some(field) = self.ivars().filter_field.get() else {
+            return;
+        };
         let text = field.stringValue().to_string();
         if let Some(grid) = self.ivars().grid.get() {
             grid.set_filter(&text);
@@ -1050,7 +1068,9 @@ impl AppDelegate {
     /// Esc: the filter goes, the bar goes, the grid takes the keys
     /// back.
     fn close_filter(&self) {
-        let Some(bar) = self.ivars().filter_bar.get() else { return };
+        let Some(bar) = self.ivars().filter_bar.get() else {
+            return;
+        };
         if bar.isHidden() {
             return;
         }
@@ -1088,7 +1108,11 @@ impl AppDelegate {
         // the safe area. The grid keeps scrolling under the title bar
         // while the filter is closed.
         let title_h = content.safeAreaInsets().top;
-        let taken = if bar.isHidden() { 0.0 } else { title_h + FILTER_H };
+        let taken = if bar.isHidden() {
+            0.0
+        } else {
+            title_h + FILTER_H
+        };
         bar.setFrame(NSRect::new(
             CGPoint::new(0.0, size.height - title_h - FILTER_H),
             CGSize::new(size.width, FILTER_H),
@@ -1106,7 +1130,12 @@ impl AppDelegate {
     /// still on screen, so the slide takes the key back.
     fn run_panel(&self, panel: &NSOpenPanel) -> bool {
         let ok = panel.runModal() == objc2_app_kit::NSModalResponseOK;
-        let slide = self.ivars().show.borrow().as_ref().map(|show| show.window.clone());
+        let slide = self
+            .ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|show| show.window.clone());
         if let Some(window) = slide {
             window.makeKeyAndOrderFront(None);
         }
@@ -1273,8 +1302,7 @@ impl AppDelegate {
             slider.setDoubleValue(size);
         }
         if !e2e::enabled() {
-            NSUserDefaults::standardUserDefaults()
-                .setDouble_forKey(size, ns_string!("thumbSize"));
+            NSUserDefaults::standardUserDefaults().setDouble_forKey(size, ns_string!("thumbSize"));
         }
     }
 
@@ -1302,8 +1330,7 @@ impl AppDelegate {
             engine.set_max_thumb_px((cap * 2.0) as i32);
         }
         if !e2e::enabled() {
-            NSUserDefaults::standardUserDefaults()
-                .setDouble_forKey(cap, ns_string!("thumbCap"));
+            NSUserDefaults::standardUserDefaults().setDouble_forKey(cap, ns_string!("thumbCap"));
         }
     }
 
@@ -1312,9 +1339,13 @@ impl AppDelegate {
     /// grid is showing count: a file that landed in another folder is
     /// none of this folder's business.
     fn notice_files(&self, paths: &[PathBuf]) {
-        let Some(engine) = self.ivars().engine.get() else { return };
+        let Some(engine) = self.ivars().engine.get() else {
+            return;
+        };
         let scan = self.ivars().current_scan.borrow().clone();
-        let Some((root, recursive)) = scan else { return };
+        let Some((root, recursive)) = scan else {
+            return;
+        };
         let ours: Vec<PathBuf> = paths
             .iter()
             .filter(|path| {
@@ -1351,7 +1382,10 @@ impl AppDelegate {
         let (moves, next_step) = match (&entry.step, undoing) {
             // Undoing a move or a cull walks the files back.
             (Step::Moved(items), true) => (
-                items.iter().map(|(from, to)| (to.clone(), from.clone())).collect::<Vec<_>>(),
+                items
+                    .iter()
+                    .map(|(from, to)| (to.clone(), from.clone()))
+                    .collect::<Vec<_>>(),
                 Step::Moved(items.clone()),
             ),
             // Redoing one walks them forward again.
@@ -1367,7 +1401,8 @@ impl AppDelegate {
                     .filter(|(_, landed)| !landed.as_os_str().is_empty())
                     .map(|(copy, landed)| (landed.clone(), copy.clone()))
                     .collect();
-                let gone: Vec<PathBuf> = trashed.moved.iter().map(|(copy, _)| copy.clone()).collect();
+                let gone: Vec<PathBuf> =
+                    trashed.moved.iter().map(|(copy, _)| copy.clone()).collect();
                 self.after_take_back(&gone, &[], entry.label.clone(), Step::Moved(back), undoing);
                 return;
             }
@@ -1389,7 +1424,11 @@ impl AppDelegate {
                     left.push(from.clone());
                 }
                 Err(error) => {
-                    eprintln!("undo failed: {} -> {}: {error}", from.display(), to.display());
+                    eprintln!(
+                        "undo failed: {} -> {}: {error}",
+                        from.display(),
+                        to.display()
+                    );
                     failed += 1;
                 }
             }
@@ -1424,7 +1463,10 @@ impl AppDelegate {
         self.notice_files(&touched);
         {
             let mut history = self.ivars().history.borrow_mut();
-            let entry = Entry { label: label.clone(), step };
+            let entry = Entry {
+                label: label.clone(),
+                step,
+            };
             if undoing {
                 history.push_undone(entry);
             } else {
@@ -1474,8 +1516,7 @@ impl AppDelegate {
         let workspace = NSWorkspace::sharedWorkspace();
         for app in workspace.URLsForApplicationsToOpenURL(&url).iter() {
             let Some(path) = app.path() else { continue };
-            let name = objc2_foundation::NSFileManager::defaultManager()
-                .displayNameAtPath(&path);
+            let name = objc2_foundation::NSFileManager::defaultManager().displayNameAtPath(&path);
             let item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
                     NSMenuItem::alloc(mtm),
@@ -1502,12 +1543,13 @@ impl AppDelegate {
             .map(|path| NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())))
             .collect();
         let configuration = objc2_app_kit::NSWorkspaceOpenConfiguration::configuration();
-        NSWorkspace::sharedWorkspace().openURLs_withApplicationAtURL_configuration_completionHandler(
-            &NSArray::from_retained_slice(&urls),
-            app,
-            &configuration,
-            None,
-        );
+        NSWorkspace::sharedWorkspace()
+            .openURLs_withApplicationAtURL_configuration_completionHandler(
+                &NSArray::from_retained_slice(&urls),
+                app,
+                &configuration,
+                None,
+            );
     }
 
     /// cmd-C: the images themselves go on the clipboard, as the files
@@ -1588,12 +1630,11 @@ impl AppDelegate {
             .or_else(|| NSScreen::mainScreen(self.mtm()));
         let Some(screen) = screen else { return };
         let message = match unsafe {
-            NSWorkspace::sharedWorkspace()
-                .setDesktopImageURL_forScreen_options_error(
-                    &url,
-                    &screen,
-                    &objc2_foundation::NSDictionary::new(),
-                )
+            NSWorkspace::sharedWorkspace().setDesktopImageURL_forScreen_options_error(
+                &url,
+                &screen,
+                &objc2_foundation::NSDictionary::new(),
+            )
         } {
             Ok(()) => format!("Desktop picture: {}", file_name(path)),
             Err(_) => "Could not set the desktop picture".to_owned(),
@@ -1625,8 +1666,12 @@ impl AppDelegate {
     /// Fill the panel, if it is up. Cheap enough to run on every
     /// selection change: the header read is not a decode.
     fn refresh_info(&self) {
-        let Some(window) = self.ivars().info_window.get() else { return };
-        let Some(label) = self.ivars().info_label.get() else { return };
+        let Some(window) = self.ivars().info_window.get() else {
+            return;
+        };
+        let Some(label) = self.ivars().info_label.get() else {
+            return;
+        };
         if !window.isVisible() {
             return;
         }
@@ -1798,7 +1843,12 @@ impl AppDelegate {
             .and_then(|show| show.playlist.current().cloned());
         match current {
             Some(path) => vec![path],
-            None => self.ivars().grid.get().map(|g| g.selected_paths()).unwrap_or_default(),
+            None => self
+                .ivars()
+                .grid
+                .get()
+                .map(|g| g.selected_paths())
+                .unwrap_or_default(),
         }
     }
 
@@ -1917,8 +1967,12 @@ impl AppDelegate {
     /// Count plus name, dimensions, and size of the selection, like
     /// the original app's status bar.
     fn update_status(&self) {
-        let Some(status) = self.ivars().status.get() else { return };
-        let Some(grid) = self.ivars().grid.get() else { return };
+        let Some(status) = self.ivars().status.get() else {
+            return;
+        };
+        let Some(grid) = self.ivars().grid.get() else {
+            return;
+        };
         let (total, selected) = grid.selection_info();
         let (shown, in_folder) = grid.counts();
         let all_text = if grid.filtering() {
@@ -1941,8 +1995,11 @@ impl AppDelegate {
             }
             many => {
                 let bytes: u64 = many.iter().map(|f| f.size).sum();
-                let mut text =
-                    format!("{} of {shown} selected — {}", many.len(), format_bytes(bytes));
+                let mut text = format!(
+                    "{} of {shown} selected — {}",
+                    many.len(),
+                    format_bytes(bytes)
+                );
                 if grid.filtering() {
                     text.push_str(&format!(" · {all_text}"));
                 }
@@ -1975,7 +2032,10 @@ impl AppDelegate {
         }
         let screen_frame = NSScreen::mainScreen(mtm)
             .map(|s| s.frame())
-            .unwrap_or(NSRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1440.0, 900.0)));
+            .unwrap_or(NSRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(1440.0, 900.0),
+            ));
         let window = if windowed {
             SlideshowWindow::windowed(mtm, screen_frame)
         } else {
@@ -1990,9 +2050,10 @@ impl AppDelegate {
         let content_frame = window.contentRectForFrameRect(window.frame());
         let view = SlideView::new(mtm, content_frame);
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
-        let _ = view.ivars().delegate.set(unsafe {
-            Retained::retain(self as *const Self as *mut Self).unwrap()
-        });
+        let _ = view
+            .ivars()
+            .delegate
+            .set(unsafe { Retained::retain(self as *const Self as *mut Self).unwrap() });
 
         let overlay = NSTextField::labelWithString(ns_string!(""), mtm);
         overlay.setTextColor(Some(&NSColor::whiteColor()));
@@ -2045,7 +2106,12 @@ impl AppDelegate {
     pub fn end_slideshow(&self) {
         // Cleanup happens in windowWillClose: (shared with the close
         // button in windowed mode).
-        let window = self.ivars().show.borrow().as_ref().map(|s| s.window.clone());
+        let window = self
+            .ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.window.clone());
         if let Some(window) = window {
             window.close();
         }
@@ -2099,16 +2165,16 @@ impl AppDelegate {
 
     /// Space: toggle pause while auto-advancing, plain next otherwise.
     pub fn space_pressed(&self) {
-        let interval = self
-            .ivars()
-            .show
-            .borrow()
-            .as_ref()
-            .and_then(|s| s.interval);
+        let interval = self.ivars().show.borrow().as_ref().and_then(|s| s.interval);
         match interval {
             None => self.step_slideshow(1),
             Some(seconds) => {
-                let paused = self.ivars().show.borrow().as_ref().is_some_and(|s| s.timer.is_none());
+                let paused = self
+                    .ivars()
+                    .show
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|s| s.timer.is_none());
                 if paused {
                     self.schedule_timer(seconds);
                 } else if let Some(show) = self.ivars().show.borrow_mut().as_mut() {
@@ -2164,7 +2230,9 @@ impl AppDelegate {
 
     /// Sync the Auto-advance menu checkmarks to `seconds`.
     fn update_auto_menu(&self, seconds: Option<f64>) {
-        let Some(menu) = self.ivars().auto_menu.get() else { return };
+        let Some(menu) = self.ivars().auto_menu.get() else {
+            return;
+        };
         let selected_tag = seconds.map(|s| (s * 10.0) as isize).unwrap_or(0);
         for item in menu.itemArray() {
             item.setState(if item.tag() == selected_tag { 1 } else { 0 });
@@ -2177,20 +2245,30 @@ impl AppDelegate {
     /// past a point it is an upscale of that decode rather than the
     /// file's own pixels. Ask for a decode that carries them.
     fn ensure_zoom_resolution(&self) {
-        let Some(engine) = self.ivars().engine.get() else { return };
+        let Some(engine) = self.ivars().engine.get() else {
+            return;
+        };
         let request = {
             let show = self.ivars().show.borrow();
             let Some(show) = show.as_ref() else { return };
-            let Some(path) = show.playlist.current().cloned() else { return };
+            let Some(path) = show.playlist.current().cloned() else {
+                return;
+            };
             // An animated slide plays from its frames; a still decode
             // in their place would stop the animation.
             if decoder::is_animated_ext(&path) {
                 return;
             }
-            if show.pending_decode.as_ref().is_some_and(|(waiting, _)| *waiting == path) {
+            if show
+                .pending_decode
+                .as_ref()
+                .is_some_and(|(waiting, _)| *waiting == path)
+            {
                 return;
             }
-            let Some(zoom) = show.view.state().zoom else { return };
+            let Some(zoom) = show.view.state().zoom else {
+                return;
+            };
             let natural = show.view.natural_size();
             let backing = show.window.backingScaleFactor();
             wene_core::zoom_decode_request(
@@ -2201,7 +2279,9 @@ impl AppDelegate {
             )
             .map(|max_px| (path, max_px))
         };
-        let Some((path, max_px)) = request else { return };
+        let Some((path, max_px)) = request else {
+            return;
+        };
         if let Some(show) = self.ivars().show.borrow_mut().as_mut() {
             show.pending_decode = Some((path.clone(), max_px));
         }
@@ -2293,36 +2373,36 @@ impl AppDelegate {
             if let Some(flash) = show.flash.clone() {
                 (show.overlay.clone(), show.window.clone(), name, flash)
             } else {
-            let mut text = format!(
-                "{}/{}  {}",
-                show.playlist.current_index() + 1,
-                show.playlist.len(),
-                name
-            );
-            if show.playlist.shuffled() {
-                text.push_str("  [shuffle]");
-            }
-            if show.playlist.looping {
-                text.push_str("  [loop]");
-            }
-            if let Some(seconds) = show.interval {
-                if show.timer.is_some() {
-                    text.push_str(&format!("  [{seconds}s]"));
-                } else {
-                    text.push_str("  [paused]");
+                let mut text = format!(
+                    "{}/{}  {}",
+                    show.playlist.current_index() + 1,
+                    show.playlist.len(),
+                    name
+                );
+                if show.playlist.shuffled() {
+                    text.push_str("  [shuffle]");
                 }
-            }
-            let state = show.view.state();
-            if state.rotation != 0 {
-                text.push_str(&format!("  [{}°]", state.rotation));
-            }
-            if state.flipped {
-                text.push_str("  [flipped]");
-            }
-            if let Some(zoom) = state.zoom {
-                text.push_str(&format!("  [{:.0}%]", zoom * 100.0));
-            }
-            (show.overlay.clone(), show.window.clone(), name, text)
+                if show.playlist.looping {
+                    text.push_str("  [loop]");
+                }
+                if let Some(seconds) = show.interval {
+                    if show.timer.is_some() {
+                        text.push_str(&format!("  [{seconds}s]"));
+                    } else {
+                        text.push_str("  [paused]");
+                    }
+                }
+                let state = show.view.state();
+                if state.rotation != 0 {
+                    text.push_str(&format!("  [{}°]", state.rotation));
+                }
+                if state.flipped {
+                    text.push_str("  [flipped]");
+                }
+                if let Some(zoom) = state.zoom {
+                    text.push_str(&format!("  [{:.0}%]", zoom * 100.0));
+                }
+                (show.overlay.clone(), show.window.clone(), name, text)
             }
         };
         let text = if self.ivars().overlay_help.get() {
@@ -2401,7 +2481,8 @@ impl AppDelegate {
 
             if let Some(current) = show.playlist.current().cloned() {
                 if let Some(image) = show.cache.get(&current) {
-                    show.view.show_image(image.clone(), Self::natural_size(&current));
+                    show.view
+                        .show_image(image.clone(), Self::natural_size(&current));
                     if let Some(state) = show.view_states.get(&current) {
                         show.view.apply_state(*state);
                     }
@@ -2508,7 +2589,11 @@ impl AppDelegate {
     /// half the time, and it is the kind of mistake that arrives with
     /// the next menu item rather than this one.
     pub fn e2e_menu_conflicts(&self) -> Vec<String> {
-        fn walk(menu: &NSMenu, seen: &mut HashMap<(String, usize), String>, clashes: &mut Vec<String>) {
+        fn walk(
+            menu: &NSMenu,
+            seen: &mut HashMap<(String, usize), String>,
+            clashes: &mut Vec<String>,
+        ) {
             for item in menu.itemArray() {
                 let key = item.keyEquivalent().to_string();
                 if !key.is_empty() {
@@ -2583,7 +2668,11 @@ impl AppDelegate {
     }
 
     pub fn e2e_thumb_size(&self) -> f64 {
-        self.ivars().grid.get().map(|grid| grid.cell_size()).unwrap_or_default()
+        self.ivars()
+            .grid
+            .get()
+            .map(|grid| grid.cell_size())
+            .unwrap_or_default()
     }
 
     pub fn e2e_slider_value(&self) -> f64 {
@@ -2620,7 +2709,11 @@ impl AppDelegate {
     }
 
     pub fn e2e_playlist_len(&self) -> Option<usize> {
-        self.ivars().show.borrow().as_ref().map(|s| s.playlist.len())
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.playlist.len())
     }
 
     pub fn e2e_status_text(&self) -> String {
@@ -2652,7 +2745,12 @@ impl AppDelegate {
         self.ivars()
             .split
             .get()
-            .and_then(|split| split.splitViewItems().firstObject().map(|i| i.isCollapsed()))
+            .and_then(|split| {
+                split
+                    .splitViewItems()
+                    .firstObject()
+                    .map(|i| i.isCollapsed())
+            })
             .unwrap_or(false)
     }
 
@@ -2696,7 +2794,9 @@ impl AppDelegate {
     }
 
     pub fn e2e_slide_context_menu(&self) -> Vec<(String, bool)> {
-        let Some(menu) = self.slide_context_menu() else { return Vec::new() };
+        let Some(menu) = self.slide_context_menu() else {
+            return Vec::new();
+        };
         menu.update();
         menu.itemArray()
             .iter()
@@ -2824,7 +2924,11 @@ impl AppDelegate {
 
     /// Drive a move or a copy without the folder chooser.
     pub fn e2e_transfer(&self, folder: &str, moving: bool) {
-        let kind = if moving { Transfer::Move } else { Transfer::Copy };
+        let kind = if moving {
+            Transfer::Move
+        } else {
+            Transfer::Copy
+        };
         self.transfer_selection(PathBuf::from(folder), kind);
     }
 
@@ -2969,7 +3073,11 @@ impl AppDelegate {
             Event::ThumbReady { path, image } => {
                 let cost = image_cost(&image);
                 let image = ns_image(&image);
-                self.ivars().grid.get().unwrap().set_thumb(path, image, cost);
+                self.ivars()
+                    .grid
+                    .get()
+                    .unwrap()
+                    .set_thumb(path, image, cost);
             }
             Event::SlideReady { path, image } => {
                 let is_current = {
@@ -2980,7 +3088,11 @@ impl AppDelegate {
                     let is_current = show.playlist.current() == Some(&path);
                     let state = show.view_states.get(&path).copied();
                     let natural = Self::natural_size(&path);
-                    if show.pending_decode.as_ref().is_some_and(|(waiting, _)| *waiting == path) {
+                    if show
+                        .pending_decode
+                        .as_ref()
+                        .is_some_and(|(waiting, _)| *waiting == path)
+                    {
                         show.pending_decode = None;
                     }
                     show.cache.insert(path, image.clone(), cost);
@@ -3148,7 +3260,10 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
     // Startup folder row (top).
     label("Startup folder:", 20.0, 312.0);
     let field = NSTextField::labelWithString(ns_string!(""), mtm);
-    field.setFrame(NSRect::new(CGPoint::new(20.0, 292.0), CGSize::new(250.0, 18.0)));
+    field.setFrame(NSRect::new(
+        CGPoint::new(20.0, 292.0),
+        CGSize::new(250.0, 18.0),
+    ));
     field.setTag(7);
     field.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(11.0)));
     field.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -3186,7 +3301,10 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
 
     label("Auto-advance:", 20.0, 136.0);
     let popup = objc2_app_kit::NSPopUpButton::new(mtm);
-    popup.setFrame(NSRect::new(CGPoint::new(150.0, 128.0), CGSize::new(180.0, 26.0)));
+    popup.setFrame(NSRect::new(
+        CGPoint::new(150.0, 128.0),
+        CGSize::new(180.0, 26.0),
+    ));
     popup.setTag(6);
     for (title, tag) in [
         ("Off", 0isize),
@@ -3208,7 +3326,10 @@ fn build_prefs_window(mtm: MainThreadMarker, delegate: &AppDelegate) -> Retained
 
     label("Largest thumbnail:", 20.0, 96.0);
     let thumbs = objc2_app_kit::NSPopUpButton::new(mtm);
-    thumbs.setFrame(NSRect::new(CGPoint::new(150.0, 88.0), CGSize::new(180.0, 26.0)));
+    thumbs.setFrame(NSRect::new(
+        CGPoint::new(150.0, 88.0),
+        CGSize::new(180.0, 26.0),
+    ));
     thumbs.setTag(8);
     for cap in grid::CELL_CAPS {
         thumbs.addItemWithTitle(&NSString::from_str(&format!("{cap:.0} points")));
@@ -3266,7 +3387,9 @@ fn transfer_message(
         [] => format!("Nothing {} to {target}", verb.to_lowercase()),
         [(_, one)] => format!(
             "{verb} {} to {target}",
-            one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            one.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
         ),
         many => format!("{verb} {} images to {target}", many.len()),
     };
@@ -3290,7 +3413,11 @@ fn trash_message(moved: &[PathBuf], failed: usize) -> String {
     let names: Vec<String> = moved
         .iter()
         .take(3)
-        .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
         .collect();
     let mut moved_text = format!("Moved to trash: {}", names.join(", "));
     if moved.len() > names.len() {
@@ -3349,7 +3476,11 @@ esc or q   end the slideshow";
 /// Label and value, one pair per line, labels padded so the values
 /// line up in the panel's fixed-width layout.
 fn rows_text(rows: &[(String, String)]) -> String {
-    let width = rows.iter().map(|(label, _)| label.chars().count()).max().unwrap_or(0);
+    let width = rows
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
     rows.iter()
         .filter(|(_, value)| !value.is_empty())
         .map(|(label, value)| format!("{label:<width$}   {value}"))
@@ -3424,10 +3555,13 @@ fn build_info_window(mtm: MainThreadMarker) -> (Retained<NSWindow>, Retained<NST
         CGSize::new(frame.size.width - 24.0, frame.size.height - 24.0),
     ));
 
-    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), NSRect::new(
-        CGPoint::new(12.0, 12.0),
-        CGSize::new(frame.size.width - 24.0, frame.size.height - 24.0),
-    ));
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        NSRect::new(
+            CGPoint::new(12.0, 12.0),
+            CGSize::new(frame.size.width - 24.0, frame.size.height - 24.0),
+        ),
+    );
     scroll.setHasVerticalScroller(true);
     scroll.setDrawsBackground(false);
     scroll.setDocumentView(Some(&label));
@@ -3847,8 +3981,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         )
     };
     sidebar_item.setKeyEquivalentModifierMask(
-        objc2_app_kit::NSEventModifierFlags::Command
-            | objc2_app_kit::NSEventModifierFlags::Control,
+        objc2_app_kit::NSEventModifierFlags::Command | objc2_app_kit::NSEventModifierFlags::Control,
     );
     sidebar_item.setState(1);
     view_menu.addItem(&sidebar_item);
@@ -3995,9 +4128,7 @@ fn main() {
         CGPoint::new(8.0, 3.0),
         CGSize::new(content_size.width - 16.0, 22.0),
     ));
-    filter_field.setAutoresizingMask(
-        objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable,
-    );
+    filter_field.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable);
     filter_field.setPlaceholderString(Some(ns_string!("Filter by name")));
     filter_field.setBezelStyle(objc2_app_kit::NSTextFieldBezelStyle::RoundedBezel);
     unsafe { filter_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
@@ -4029,7 +4160,9 @@ fn main() {
             .setAutosaveName(Some(ns_string!("sidebarWidth2")));
     }
     split.addSplitViewItem(&sidebar_pane);
-    split.addSplitViewItem(&NSSplitViewItem::splitViewItemWithViewController(&content_vc));
+    split.addSplitViewItem(&NSSplitViewItem::splitViewItemWithViewController(
+        &content_vc,
+    ));
     window.setContentViewController(Some(&split));
     window.setFrame_display(frame, false);
     window.makeFirstResponder(Some(&grid));
@@ -4039,13 +4172,12 @@ fn main() {
     // run the same maths again.
     content.setPostsFrameChangedNotifications(true);
     unsafe {
-        objc2_foundation::NSNotificationCenter::defaultCenter()
-            .addObserver_selector_name_object(
-                &delegate,
-                sel!(contentResized:),
-                Some(objc2_app_kit::NSViewFrameDidChangeNotification),
-                Some(&content),
-            );
+        objc2_foundation::NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+            &delegate,
+            sel!(contentResized:),
+            Some(objc2_app_kit::NSViewFrameDidChangeNotification),
+            Some(&content),
+        );
     }
     let _ = delegate.ivars().content.set(content);
     let _ = delegate.ivars().scroll.set(scroll);
@@ -4071,7 +4203,11 @@ fn main() {
         // covers fit and a little zoom. The harness caps it far
         // lower, so its small fixture images outgrow their decode
         // the way a photo does on a real screen.
-        if e2e::enabled() { 256 } else { (screen_long_edge * 2.0) as i32 },
+        if e2e::enabled() {
+            256
+        } else {
+            (screen_long_edge * 2.0) as i32
+        },
         || {
             DispatchQueue::main().exec_async(|| {
                 let mtm = MainThreadMarker::new().expect("main queue is the main thread");

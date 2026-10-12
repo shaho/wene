@@ -16,8 +16,8 @@ use objc2::{
     define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 use objc2_app_kit::{
-    NSColor, NSDragOperation, NSDraggingItem, NSDraggingSession, NSDraggingSource,
-    NSDraggingContext, NSEvent, NSImage, NSMenu, NSMenuItem, NSPasteboardItem,
+    NSColor, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession,
+    NSDraggingSource, NSEvent, NSImage, NSMenu, NSMenuItem, NSPasteboardItem,
     NSPasteboardTypeFileURL, NSView,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -448,7 +448,12 @@ impl GridView {
         }
         // Only count hits inside the cell, not the padding gutter.
         let cell = self.ivars().cell.get();
-        let hit_h = cell + if self.ivars().labels.get() { LABEL_H } else { 0.0 };
+        let hit_h = cell
+            + if self.ivars().labels.get() {
+                LABEL_H
+            } else {
+                0.0
+            };
         let in_x = point.x - PAD - col * self.pitch();
         let in_y = point.y - PAD - row * self.row_pitch();
         if in_x > cell || in_y > hit_h {
@@ -483,7 +488,12 @@ impl GridView {
 
     /// Vertical spacing: adds the label strip when labels are on.
     fn row_pitch(&self) -> f64 {
-        self.pitch() + if self.ivars().labels.get() { LABEL_H } else { 0.0 }
+        self.pitch()
+            + if self.ivars().labels.get() {
+                LABEL_H
+            } else {
+                0.0
+            }
     }
 
     pub fn labels_visible(&self) -> bool {
@@ -597,7 +607,8 @@ impl GridView {
                     .filter_map(|&i| files.get(i).map(|f| f.path.clone()))
                     .collect();
                 let by_index = |slot: &Cell<Option<usize>>| {
-                    slot.get().and_then(|i| files.get(i).map(|f| f.path.clone()))
+                    slot.get()
+                        .and_then(|i| files.get(i).map(|f| f.path.clone()))
                 };
                 (
                     paths,
@@ -871,7 +882,10 @@ impl GridView {
             let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
             let entry = NSPasteboardItem::new();
             unsafe {
-                entry.setString_forType(&url.absoluteString().unwrap_or_default(), NSPasteboardTypeFileURL)
+                entry.setString_forType(
+                    &url.absoluteString().unwrap_or_default(),
+                    NSPasteboardTypeFileURL,
+                )
             };
             let item = NSDraggingItem::initWithPasteboardWriter(
                 NSDraggingItem::alloc(),

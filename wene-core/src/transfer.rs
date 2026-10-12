@@ -183,8 +183,14 @@ mod tests {
 
         assert!(done.renamed);
         assert_eq!(done.target, to.join("a 2.heic"));
-        assert_eq!(std::fs::read_to_string(to.join("a.heic")).unwrap(), "theirs");
-        assert_eq!(std::fs::read_to_string(to.join("a 2.heic")).unwrap(), "mine");
+        assert_eq!(
+            std::fs::read_to_string(to.join("a.heic")).unwrap(),
+            "theirs"
+        );
+        assert_eq!(
+            std::fs::read_to_string(to.join("a 2.heic")).unwrap(),
+            "mine"
+        );
     }
 
     #[test]

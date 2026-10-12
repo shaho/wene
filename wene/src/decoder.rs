@@ -5,20 +5,21 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL};
+use objc2_core_foundation::{
+    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL,
+};
 use objc2_core_graphics::CGImage;
 use objc2_image_io::{
     kCGImagePropertyColorModel, kCGImagePropertyExifApertureValue,
     kCGImagePropertyExifDateTimeOriginal, kCGImagePropertyExifDictionary,
-    kCGImagePropertyExifExposureTime, kCGImagePropertyExifFNumber,
-    kCGImagePropertyExifFocalLength, kCGImagePropertyExifISOSpeedRatings,
-    kCGImagePropertyExifLensModel, kCGImagePropertyGPSDictionary, kCGImagePropertyGPSLatitude,
-    kCGImagePropertyGPSLatitudeRef, kCGImagePropertyGPSLongitude, kCGImagePropertyGPSLongitudeRef,
-    kCGImagePropertyProfileName, kCGImagePropertyTIFFDictionary, kCGImagePropertyTIFFMake,
-    kCGImagePropertyTIFFModel,
+    kCGImagePropertyExifExposureTime, kCGImagePropertyExifFNumber, kCGImagePropertyExifFocalLength,
+    kCGImagePropertyExifISOSpeedRatings, kCGImagePropertyExifLensModel,
     kCGImagePropertyGIFDelayTime, kCGImagePropertyGIFDictionary,
-    kCGImagePropertyGIFUnclampedDelayTime, kCGImagePropertyPixelHeight,
-    kCGImagePropertyPixelWidth, kCGImagePropertyWebPDelayTime, kCGImagePropertyWebPDictionary,
+    kCGImagePropertyGIFUnclampedDelayTime, kCGImagePropertyGPSDictionary,
+    kCGImagePropertyGPSLatitude, kCGImagePropertyGPSLatitudeRef, kCGImagePropertyGPSLongitude,
+    kCGImagePropertyGPSLongitudeRef, kCGImagePropertyPixelHeight, kCGImagePropertyPixelWidth,
+    kCGImagePropertyProfileName, kCGImagePropertyTIFFDictionary, kCGImagePropertyTIFFMake,
+    kCGImagePropertyTIFFModel, kCGImagePropertyWebPDelayTime, kCGImagePropertyWebPDictionary,
     kCGImageSourceCreateThumbnailFromImageAlways, kCGImageSourceCreateThumbnailFromImageIfAbsent,
     kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceThumbnailMaxPixelSize, CGImageSource,
 };
@@ -32,15 +33,17 @@ pub fn image_dimensions(path: &Path) -> Option<(i64, i64)> {
         let src = CGImageSource::with_url(&url, None)?;
         let props = src.properties_at_index(src.primary_image_index(), None)?;
         // The header dictionary is untyped; its keys are CFStrings.
-        let props: CFRetained<CFDictionary<CFString, CFType>> =
-            CFRetained::cast_unchecked(props);
+        let props: CFRetained<CFDictionary<CFString, CFType>> = CFRetained::cast_unchecked(props);
         let dim = |key: &CFString| -> Option<i64> {
             props
                 .get(key)
                 .and_then(|v| v.downcast::<CFNumber>().ok())
                 .and_then(|n| n.as_i64())
         };
-        Some((dim(kCGImagePropertyPixelWidth)?, dim(kCGImagePropertyPixelHeight)?))
+        Some((
+            dim(kCGImagePropertyPixelWidth)?,
+            dim(kCGImagePropertyPixelHeight)?,
+        ))
     }
 }
 
@@ -49,9 +52,13 @@ pub fn image_dimensions(path: &Path) -> Option<(i64, i64)> {
 /// file gave nothing up.
 pub fn image_info(path: &Path) -> Vec<(String, String)> {
     let mut rows = Vec::new();
-    let Some(url) = CFURL::from_file_path(path) else { return rows };
+    let Some(url) = CFURL::from_file_path(path) else {
+        return rows;
+    };
     unsafe {
-        let Some(src) = CGImageSource::with_url(&url, None) else { return rows };
+        let Some(src) = CGImageSource::with_url(&url, None) else {
+            return rows;
+        };
         let Some(props) = src.properties_at_index(src.primary_image_index(), None) else {
             return rows;
         };
@@ -95,8 +102,8 @@ pub fn image_info(path: &Path) -> Vec<(String, String)> {
                 let shown = crate::exif_date_text(&taken).unwrap_or(taken);
                 rows.push(("Taken".into(), shown));
             }
-            if let Some(seconds) = number(&exif, kCGImagePropertyExifExposureTime)
-                .and_then(|n| n.as_f64())
+            if let Some(seconds) =
+                number(&exif, kCGImagePropertyExifExposureTime).and_then(|n| n.as_f64())
             {
                 rows.push(("Exposure".into(), exposure(seconds)));
             }
@@ -109,8 +116,8 @@ pub fn image_info(path: &Path) -> Vec<(String, String)> {
             if let Some(iso) = first_number(&exif, kCGImagePropertyExifISOSpeedRatings) {
                 rows.push(("ISO".into(), format!("{iso}")));
             }
-            if let Some(focal) = number(&exif, kCGImagePropertyExifFocalLength)
-                .and_then(|n| n.as_f64())
+            if let Some(focal) =
+                number(&exif, kCGImagePropertyExifFocalLength).and_then(|n| n.as_f64())
             {
                 rows.push(("Focal length".into(), format!("{focal:.0} mm")));
             }
@@ -186,8 +193,7 @@ fn exif_date(path: &Path) -> Option<SystemTime> {
     unsafe {
         let src = CGImageSource::with_url(&url, None)?;
         let props = src.properties_at_index(src.primary_image_index(), None)?;
-        let props: CFRetained<CFDictionary<CFString, CFType>> =
-            CFRetained::cast_unchecked(props);
+        let props: CFRetained<CFDictionary<CFString, CFType>> = CFRetained::cast_unchecked(props);
         let exif = props
             .get(kCGImagePropertyExifDictionary)?
             .downcast::<CFDictionary>()
@@ -203,7 +209,7 @@ fn exif_date(path: &Path) -> Option<SystemTime> {
 
 /// When the file landed in its folder (Finder's "date added").
 fn date_added(path: &Path) -> Option<SystemTime> {
-    use objc2_foundation::{NSURLAddedToDirectoryDateKey, NSArray, NSString, NSURL};
+    use objc2_foundation::{NSArray, NSString, NSURLAddedToDirectoryDateKey, NSURL};
     let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str()?));
     let keys = NSArray::from_slice(&[unsafe { NSURLAddedToDirectoryDateKey }]);
     let values = url.resourceValuesForKeys_error(&keys).ok()?;
@@ -244,7 +250,9 @@ impl ImageDecoder for ImageIoDecoder {
     type Image = CFRetained<CGImage>;
 
     fn decode(&self, path: &Path, max_px: i32) -> Option<Self::Image> {
-        thumbnail(path, max_px, unsafe { kCGImageSourceCreateThumbnailFromImageAlways })
+        thumbnail(path, max_px, unsafe {
+            kCGImageSourceCreateThumbnailFromImageAlways
+        })
     }
 
     /// Fast thumbnail: take the embedded preview when the file has
@@ -252,7 +260,9 @@ impl ImageDecoder for ImageIoDecoder {
     /// 160 px EXIF thumb on a retina-sized request) falls back to a
     /// full decode.
     fn decode_thumb(&self, path: &Path, max_px: i32) -> Option<Self::Image> {
-        let fast = thumbnail(path, max_px, unsafe { kCGImageSourceCreateThumbnailFromImageIfAbsent });
+        let fast = thumbnail(path, max_px, unsafe {
+            kCGImageSourceCreateThumbnailFromImageIfAbsent
+        });
         if let Some(image) = &fast {
             let long_edge = CGImage::width(Some(image)).max(CGImage::height(Some(image)));
             if long_edge * 2 >= max_px as usize {
@@ -315,11 +325,15 @@ mod tests {
     fn animated_gif_frames_decode() {
         let path = std::env::temp_dir().join("wene-anim-selfcheck.gif");
         std::fs::write(&path, crate::e2e::ANIMATED_GIF).unwrap();
-        let frames = ImageIoDecoder.decode_frames(&path).expect("gif is animated");
+        let frames = ImageIoDecoder
+            .decode_frames(&path)
+            .expect("gif is animated");
         assert_eq!(frames.len(), 2);
         assert!(frames.iter().all(|(_, delay)| *delay > 0.0));
         // Static file: no frames path.
-        assert!(ImageIoDecoder.decode_frames(std::path::Path::new("/x/a.jpg")).is_none());
+        assert!(ImageIoDecoder
+            .decode_frames(std::path::Path::new("/x/a.jpg"))
+            .is_none());
         let _ = std::fs::remove_file(&path);
     }
 }
@@ -341,9 +355,7 @@ fn frame_delay(src: &CGImageSource, index: usize) -> f64 {
                 props
                     .get(key)
                     .and_then(|v| v.downcast::<CFDictionary>().ok())
-                    .map(|d| {
-                        CFRetained::cast_unchecked::<CFDictionary<CFString, CFType>>(d)
-                    })
+                    .map(|d| CFRetained::cast_unchecked::<CFDictionary<CFString, CFType>>(d))
             };
             if let Some(gif) = sub(kCGImagePropertyGIFDictionary) {
                 number(&gif, kCGImagePropertyGIFUnclampedDelayTime)

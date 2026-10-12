@@ -3,8 +3,8 @@
 //! callback; the core owns all worker threads.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
@@ -30,7 +30,10 @@ pub trait ImageDecoder: Send + Sync + 'static {
     /// Extra sort metadata: (EXIF capture date, date added to its
     /// folder). Read during the scan; None falls back to the
     /// modified date when sorting.
-    fn file_dates(&self, _path: &Path) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
+    fn file_dates(
+        &self,
+        _path: &Path,
+    ) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
         (None, None)
     }
 
@@ -51,12 +54,25 @@ pub enum Event<I> {
     FilesRemoved(Vec<PathBuf>),
     /// A file's contents changed on disk; caches for it are stale.
     FileChanged(FileInfo),
-    ScanDone { total: usize },
-    ThumbReady { path: PathBuf, image: I },
-    SlideReady { path: PathBuf, image: I },
+    ScanDone {
+        total: usize,
+    },
+    ThumbReady {
+        path: PathBuf,
+        image: I,
+    },
+    SlideReady {
+        path: PathBuf,
+        image: I,
+    },
     /// An animated slide: every frame plus its delay in seconds.
-    SlideFramesReady { path: PathBuf, frames: Vec<(I, f64)> },
-    DecodeFailed { path: PathBuf },
+    SlideFramesReady {
+        path: PathBuf,
+        frames: Vec<(I, f64)>,
+    },
+    DecodeFailed {
+        path: PathBuf,
+    },
 }
 
 /// A found image with the metadata the sort orders need, captured
@@ -108,7 +124,11 @@ pub fn file_info_cmp(
             .unwrap_or(a.modified)
             .cmp(&b.added.unwrap_or(b.modified)),
     };
-    let primary = if descending { primary.reverse() } else { primary };
+    let primary = if descending {
+        primary.reverse()
+    } else {
+        primary
+    };
     primary.then_with(|| file_cmp(&a.path, &b.path))
 }
 
@@ -147,7 +167,10 @@ enum Job {
     /// `max_px` None takes the default slide cap. A zoomed slide
     /// names a bigger one, and skips the animation path: a still
     /// frame at full size is what zoom asks for.
-    Slide { path: PathBuf, max_px: Option<i32> },
+    Slide {
+        path: PathBuf,
+        max_px: Option<i32>,
+    },
 }
 
 /// Decode and scan engine. One scanner thread per scan, a two-thread
@@ -232,7 +255,13 @@ impl<I: Send + 'static> Engine<I> {
     /// do.
     pub fn notice(&self, paths: &[PathBuf]) {
         for path in paths {
-            apply_fs_change(path, &self.files, &self.events_tx, &self.wakeup, &self.dates);
+            apply_fs_change(
+                path,
+                &self.files,
+                &self.events_tx,
+                &self.wakeup,
+                &self.dates,
+            );
         }
     }
 
@@ -337,7 +366,10 @@ impl<I: Send + 'static> Engine<I> {
     /// Decode a slide to `max_px` on its longest edge, for a zoom
     /// that has outgrown the decode on hand.
     pub fn request_slide_at(&self, path: PathBuf, max_px: i32) {
-        let _ = self.slide_tx.send(Job::Slide { path, max_px: Some(max_px) });
+        let _ = self.slide_tx.send(Job::Slide {
+            path,
+            max_px: Some(max_px),
+        });
     }
 
     pub fn max_thumb_px(&self) -> i32 {
@@ -454,18 +486,19 @@ fn spawn_decode_worker<I: Send + 'static, D: ImageDecoder<Image = I>>(
         };
         let Ok(job) = job else { return };
         let event = match job {
-            Job::Thumb(path) => match decoder
-                .decode_thumb(&path, max_thumb_px.load(Ordering::Relaxed))
-            {
-                Some(image) => Event::ThumbReady { path, image },
-                None => Event::DecodeFailed { path },
-            },
-            Job::Slide { path, max_px: Some(max_px) } => {
-                match decoder.decode(&path, max_px) {
-                    Some(image) => Event::SlideReady { path, image },
+            Job::Thumb(path) => {
+                match decoder.decode_thumb(&path, max_thumb_px.load(Ordering::Relaxed)) {
+                    Some(image) => Event::ThumbReady { path, image },
                     None => Event::DecodeFailed { path },
                 }
             }
+            Job::Slide {
+                path,
+                max_px: Some(max_px),
+            } => match decoder.decode(&path, max_px) {
+                Some(image) => Event::SlideReady { path, image },
+                None => Event::DecodeFailed { path },
+            },
             Job::Slide { path, max_px: None } => match decoder.decode_frames(&path) {
                 Some(frames) => Event::SlideFramesReady { path, frames },
                 None => match decoder.decode(&path, max_slide_px) {
@@ -683,8 +716,8 @@ mod tests {
     }
 }
 
-pub mod history;
 pub mod cache;
+pub mod history;
 pub mod playlist;
 pub mod transfer;
 pub use cache::LruCache;
