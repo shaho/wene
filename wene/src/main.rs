@@ -3850,9 +3850,10 @@ fn main() {
     let toolbar = objc2_app_kit::NSToolbar::new(mtm);
     window.setToolbar(Some(&toolbar));
     window.setToolbarStyle(objc2_app_kit::NSWindowToolbarStyle::Unified);
-    // Tahoe draws the title as a wide capsule over the content when
-    // a sidebar window carries no toolbar; an empty toolbar restores
-    // the plain titlebar. The control strip is a later slice.
+    // Tahoe drew the name twice: once beside the traffic lights and
+    // once in the toolbar's own capsule. The window keeps its title
+    // for the Window menu and Mission Control, and draws neither.
+    window.setTitleVisibility(objc2_app_kit::NSWindowTitleVisibility::Hidden);
 
     let (sidebar, sidebar_scroll) = Sidebar::new(mtm, &delegate);
 
