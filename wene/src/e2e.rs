@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use objc2_app_kit::{NSBitmapImageFileType, NSView};
 use objc2_foundation::NSDictionary;
 
-use crate::AppDelegate;
+use crate::*;
 
 pub struct E2eState {
     pub step: usize,
@@ -146,7 +146,7 @@ fn transfer_folder() -> String {
 
 /// A folder of our own, to open from "Finder" and land somewhere
 /// other than the fixture.
-fn open_folder() -> String {
+pub(crate) fn open_folder() -> String {
     std::env::temp_dir()
         .join(format!("wene-e2e-open-{}", std::process::id()))
         .to_string_lossy()
@@ -1739,4 +1739,530 @@ pub fn run_step(delegate: &AppDelegate) {
     let mut state = state.borrow_mut();
     state.held = 0;
     state.step += 1;
+}
+
+// ---- state peeks and pokes for the harness ----
+
+impl AppDelegate {
+    pub fn e2e_header_reads(&self) -> usize {
+        self.ivars().header_reads.get()
+    }
+
+    pub fn e2e_state(&self) -> &RefCell<e2e::E2eState> {
+        &self.ivars().e2e
+    }
+
+    pub fn e2e_file_count(&self) -> usize {
+        self.ivars()
+            .grid
+            .get()
+            .map(|g| g.ivars().files.borrow().len())
+            .unwrap_or(0)
+    }
+
+    pub fn e2e_show_active(&self) -> bool {
+        self.ivars().show.borrow().is_some()
+    }
+
+    /// How many slideshow windows are on screen.
+    pub fn e2e_slideshow_windows(&self) -> usize {
+        NSApplication::sharedApplication(self.mtm())
+            .windows()
+            .iter()
+            .filter(|window| window.isVisible() && window.isKindOfClass(SlideshowWindow::class()))
+            .count()
+    }
+
+    /// Whether the menu would enable an item with this action.
+    pub fn e2e_menu_enabled(&self, action: objc2::runtime::Sel) -> bool {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(self.mtm()),
+                ns_string!(""),
+                Some(action),
+                ns_string!(""),
+            )
+        };
+        self.menu_item_enabled(&item)
+    }
+
+    pub fn e2e_current_index(&self) -> Option<usize> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.playlist.current_index())
+    }
+
+    pub fn e2e_slide_name(&self) -> Option<String> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.playlist.current().cloned())
+            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+    }
+
+    pub fn e2e_slide_has_image(&self) -> bool {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.view.has_image())
+    }
+
+    pub fn e2e_slide_view(&self) -> Option<Retained<SlideView>> {
+        self.ivars().show.borrow().as_ref().map(|s| s.view.clone())
+    }
+
+    pub fn e2e_overlay_text(&self) -> Option<String> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.overlay.stringValue().to_string())
+    }
+
+    pub fn e2e_sort(&self, order: SortOrder, descending: bool) {
+        self.ivars().sort_order.set(order);
+        self.ivars().sort_desc.set(descending);
+        self.apply_sort();
+    }
+
+    pub fn e2e_first_file(&self) -> Option<String> {
+        self.ivars().grid.get().and_then(|g| {
+            g.paths()
+                .first()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+    }
+
+    pub fn e2e_grid_height(&self) -> f64 {
+        self.ivars()
+            .grid
+            .get()
+            .map(|g| g.frame().size.height)
+            .unwrap_or(0.0)
+    }
+
+    /// Every key equivalent in the menu bar that two items share.
+    /// A shortcut bound twice is a shortcut that does the wrong thing
+    /// half the time, and it is the kind of mistake that arrives with
+    /// the next menu item rather than this one.
+    pub fn e2e_menu_conflicts(&self) -> Vec<String> {
+        fn walk(
+            menu: &NSMenu,
+            seen: &mut HashMap<(String, usize), String>,
+            clashes: &mut Vec<String>,
+        ) {
+            for item in menu.itemArray() {
+                let key = item.keyEquivalent().to_string();
+                if !key.is_empty() {
+                    let mask = item.keyEquivalentModifierMask().bits() as usize;
+                    let title = item.title().to_string();
+                    match seen.get(&(key.clone(), mask)) {
+                        // The same entry twice is one shortcut, not a
+                        // clash: a hidden twin catches the shifted
+                        // press of the same key.
+                        Some(held) if *held == title => {}
+                        Some(held) => clashes.push(format!("{key} ({mask}): {held} and {title}")),
+                        None => {
+                            seen.insert((key, mask), title);
+                        }
+                    }
+                }
+                if let Some(submenu) = item.submenu() {
+                    walk(&submenu, seen, clashes);
+                }
+            }
+        }
+        let mtm = self.mtm();
+        let Some(menubar) = NSApplication::sharedApplication(mtm).mainMenu() else {
+            return Vec::new();
+        };
+        let mut seen = HashMap::new();
+        let mut clashes = Vec::new();
+        walk(&menubar, &mut seen, &mut clashes);
+        clashes
+    }
+
+    pub fn e2e_copy_images(&self) {
+        self.copy_images_to_clipboard();
+    }
+
+    /// The types the clipboard is carrying, for the harness.
+    pub fn e2e_pasteboard_types(&self) -> Vec<String> {
+        objc2_app_kit::NSPasteboard::generalPasteboard()
+            .types()
+            .map(|types| types.iter().map(|t| t.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_toggle_scale_up(&self) {
+        self.toggle_scale_up_small();
+    }
+
+    pub fn e2e_scale_up(&self) -> bool {
+        self.ivars().scale_up_small.get()
+    }
+
+    /// How big the slide is drawn, as a fraction of its own size.
+    pub fn e2e_slide_scale(&self) -> f64 {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|show| show.view.drawn_scale())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_toggle_drag_copies(&self) {
+        self.toggle_drag_out_copies();
+    }
+
+    pub fn e2e_drag_copies(&self) -> bool {
+        self.ivars().drag_out_copies.get()
+    }
+
+    pub fn e2e_thumb_cap(&self, cap: f64) {
+        self.apply_thumb_cap(cap);
+    }
+
+    pub fn e2e_thumb_size(&self) -> f64 {
+        self.ivars()
+            .grid
+            .get()
+            .map(|grid| grid.cell_size())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_slider_value(&self) -> f64 {
+        self.ivars()
+            .thumb_slider
+            .get()
+            .map(|slider| slider.doubleValue())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_scale_cells(&self, factor: f64) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.scale_cells(factor);
+        }
+    }
+
+    pub fn e2e_select(&self, indices: &[usize]) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.e2e_set_selected(indices);
+        }
+    }
+
+    pub fn e2e_start_from_selection(&self) {
+        let (files, start) = self.ivars().grid.get().unwrap().slideshow_request();
+        self.start_slideshow_files(files, start, false);
+    }
+
+    pub fn e2e_show_is_windowed(&self) -> Option<bool> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.window.styleMask().contains(NSWindowStyleMask::Titled))
+    }
+
+    pub fn e2e_playlist_len(&self) -> Option<usize> {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .map(|s| s.playlist.len())
+    }
+
+    pub fn e2e_status_text(&self) -> String {
+        self.ivars()
+            .status
+            .get()
+            .map(|s| s.stringValue().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Mirror a sidebar click on `path`: open the tree down to it and
+    /// run the same handler the selection callback runs.
+    pub fn e2e_sidebar_click(&self, path: &str) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.e2e_click(std::path::Path::new(path));
+        }
+    }
+
+    pub fn e2e_sidebar_path(&self) -> String {
+        self.ivars()
+            .sidebar
+            .get()
+            .and_then(|s| s.selected_path())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_sidebar_hidden(&self) -> bool {
+        self.ivars()
+            .split
+            .get()
+            .and_then(|split| {
+                split
+                    .splitViewItems()
+                    .firstObject()
+                    .map(|i| i.isCollapsed())
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn e2e_toggle_sidebar(&self) {
+        self.toggle_sidebar();
+    }
+
+    pub fn e2e_add_favorite(&self, path: &str) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.add_favorite(std::path::Path::new(path));
+        }
+    }
+
+    pub fn e2e_remove_favorite(&self, path: &str) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.remove_favorite(std::path::Path::new(path));
+        }
+    }
+
+    /// Titles, levels and front-to-back order of the app's windows,
+    /// so the harness can see what covers what.
+    pub fn e2e_window_order(&self) -> Vec<(String, isize, isize)> {
+        NSApplication::sharedApplication(self.mtm())
+            .windows()
+            .iter()
+            .filter(|window| window.isVisible())
+            .map(|window| {
+                (
+                    window.title().to_string(),
+                    window.level(),
+                    window.orderedIndex(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn e2e_slide_context_menu(&self) -> Vec<(String, bool)> {
+        let Some(menu) = self.slide_context_menu() else {
+            return Vec::new();
+        };
+        menu.update();
+        menu.itemArray()
+            .iter()
+            .map(|item| (item.title().to_string(), item.isEnabled()))
+            .collect()
+    }
+
+    pub fn e2e_grid_context_menu(&self, index: usize) -> Vec<(String, bool)> {
+        self.ivars()
+            .grid
+            .get()
+            .map(|grid| grid.e2e_context_menu(index))
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_sidebar_context_menu(&self, path: &str) -> Vec<String> {
+        self.ivars()
+            .sidebar
+            .get()
+            .map(|sidebar| sidebar.e2e_context_menu(std::path::Path::new(path)))
+            .unwrap_or_default()
+    }
+
+    /// Drop a folder into Favorites at `at`, the way a drag does.
+    pub fn e2e_insert_favorite(&self, path: &str, at: usize) {
+        if let Some(sidebar) = self.ivars().sidebar.get() {
+            sidebar.insert_favorite(std::path::Path::new(path), at);
+        }
+    }
+
+    pub fn e2e_favorite_names(&self) -> Vec<String> {
+        self.ivars()
+            .sidebar
+            .get()
+            .map(|sidebar| {
+                sidebar
+                    .e2e_favorites()
+                    .iter()
+                    .filter_map(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn e2e_toggle_exif_overlay(&self) {
+        self.toggle_exif_overlay();
+    }
+
+    pub fn e2e_toggle_path_overlay(&self) {
+        self.toggle_path_overlay();
+    }
+
+    pub fn e2e_toggle_help_overlay(&self) {
+        self.toggle_help_overlay();
+    }
+
+    pub fn e2e_undo(&self) {
+        self.take_back(true);
+    }
+
+    pub fn e2e_redo(&self) {
+        self.take_back(false);
+    }
+
+    pub fn e2e_undo_title(&self) -> String {
+        self.ivars().history.borrow().undo_title()
+    }
+
+    pub fn e2e_redo_title(&self) -> String {
+        self.ivars().history.borrow().redo_title()
+    }
+
+    pub fn e2e_copy_path(&self, as_url: bool) {
+        self.copy_targets(as_url);
+    }
+
+    pub fn e2e_pasteboard_text(&self) -> String {
+        unsafe {
+            objc2_app_kit::NSPasteboard::generalPasteboard()
+                .stringForType(objc2_app_kit::NSPasteboardTypeString)
+        }
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+    }
+
+    pub fn e2e_open_with_names(&self) -> Vec<String> {
+        self.open_with_menu(self.mtm())
+            .itemArray()
+            .iter()
+            .map(|item| item.title().to_string())
+            .collect()
+    }
+
+    pub fn e2e_info_text(&self) -> String {
+        self.info_text()
+    }
+
+    pub fn e2e_toggle_info(&self) {
+        self.toggle_info();
+    }
+
+    pub fn e2e_info_open(&self) -> bool {
+        self.ivars()
+            .info_window
+            .get()
+            .is_some_and(|window| window.isVisible())
+    }
+
+    pub fn e2e_favorite_count(&self) -> usize {
+        self.ivars()
+            .sidebar
+            .get()
+            .map(|s| s.e2e_favorites().len())
+            .unwrap_or(0)
+    }
+
+    /// The name of the first selected image, for selection checks.
+    pub fn e2e_selected_name(&self) -> Option<String> {
+        let (_, selected) = self.ivars().grid.get()?.selection_info();
+        selected
+            .first()
+            .and_then(|info| info.path.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+    }
+
+    /// Drive a move or a copy without the folder chooser.
+    pub fn e2e_transfer(&self, folder: &str, moving: bool) {
+        let kind = if moving {
+            Transfer::Move
+        } else {
+            Transfer::Copy
+        };
+        self.transfer_selection(PathBuf::from(folder), kind);
+    }
+
+    pub fn e2e_open_filter(&self) {
+        self.open_filter();
+    }
+
+    /// Esc, the same way the field hands it over.
+    pub fn e2e_close_filter(&self) {
+        self.filter_field_command(sel!(cancelOperation:));
+    }
+
+    /// Type into the field and let the delegate do the rest.
+    pub fn e2e_type_filter(&self, text: &str) {
+        if let Some(field) = self.ivars().filter_field.get() {
+            field.setStringValue(&NSString::from_str(text));
+        }
+        self.filter_changed();
+    }
+
+    pub fn e2e_filter_open(&self) -> bool {
+        self.ivars()
+            .filter_bar
+            .get()
+            .is_some_and(|bar| !bar.isHidden())
+    }
+
+    pub fn e2e_select_all(&self) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.select_all();
+        }
+    }
+
+    pub fn e2e_transfer_busy(&self) -> bool {
+        self.ivars().transfer_busy.get()
+    }
+
+    pub fn e2e_repeat_item_title(&self, moving: bool) -> String {
+        let item = if moving {
+            self.ivars().move_again_item.get()
+        } else {
+            self.ivars().copy_again_item.get()
+        };
+        item.map(|i| i.title().to_string()).unwrap_or_default()
+    }
+
+    pub fn e2e_trash_selection(&self) {
+        self.trash_selection();
+    }
+
+    pub fn e2e_prefs_visible(&self) -> bool {
+        self.ivars()
+            .prefs_window
+            .get()
+            .is_some_and(|w| w.isVisible())
+    }
+
+    pub fn e2e_set_default_windowed(&self, windowed: bool) {
+        self.ivars().default_windowed.set(windowed);
+    }
+
+    pub fn e2e_close_prefs(&self) {
+        if let Some(window) = self.ivars().prefs_window.get() {
+            window.close();
+        }
+    }
+
+    pub fn e2e_slide_animating(&self) -> bool {
+        self.ivars()
+            .show
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.view.is_animating())
+    }
+
+    pub fn e2e_toggle_labels(&self) {
+        if let Some(grid) = self.ivars().grid.get() {
+            grid.set_labels(!grid.labels_visible());
+        }
+    }
 }
