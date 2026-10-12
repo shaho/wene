@@ -1345,6 +1345,45 @@ pub fn run_step(delegate: &AppDelegate) {
                 "one image is named instead of counted",
             );
         }
+        79 => {
+            // A zoomed slide asks for a decode that carries the
+            // file's own pixels. apple.heic is 512 px; the harness
+            // caps slide decodes at 256.
+            delegate.start_slideshow(0, false);
+        }
+        80 => {
+            let Some(view) = delegate.e2e_slide_view() else {
+                check(state, false, "slide view for the decode test");
+                return;
+            };
+            check(
+                state,
+                view.decoded_long_edge() <= 256.0,
+                "the first decode is the one that fits the screen",
+            );
+            view.zoom_to(2.0, None);
+        }
+        81 => {
+            let Some(view) = delegate.e2e_slide_view() else {
+                check(state, false, "slide view after the zoom");
+                return;
+            };
+            // The decode arrives on its own thread; give it a tick.
+            if view.decoded_long_edge() <= 256.0 && hold(state, 4) {
+                return;
+            }
+            check(
+                state,
+                view.decoded_long_edge() >= 512.0,
+                "zooming in brings a decode with the file's own pixels",
+            );
+            check(
+                state,
+                view.state().zoom == Some(2.0) && view.state().offset == (0.0, 0.0),
+                "the bigger decode changes the sharpness, not the view",
+            );
+            delegate.end_slideshow();
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {

@@ -101,6 +101,10 @@ pub struct SlideState {
 
 pub struct SlideViewIvars {
     image: RefCell<Option<Retained<NSImage>>>,
+    /// The file's own pixel size. Zoom is a scale against this, not
+    /// against the decode on hand, so swapping in a bigger decode
+    /// changes the sharpness and nothing else.
+    natural: Cell<CGSize>,
     /// Animated slide: every frame with its delay in seconds.
     frames: RefCell<Vec<(Retained<NSImage>, f64)>>,
     frame_index: Cell<usize>,
@@ -144,12 +148,14 @@ define_class!(
             objc2_app_kit::NSRectFill(dirty);
             let image = self.ivars().image.borrow();
             let Some(image) = image.as_ref() else { return };
-            let size = image.size();
+            // The slide is drawn at its own size times the scale, so
+            // a decode of any resolution fills the same rectangle.
+            let size = self.ivars().natural.get();
             if size.width <= 0.0 || size.height <= 0.0 {
                 return;
             }
             let bounds = self.bounds();
-            let scale = self.effective_scale(size, bounds.size);
+            let scale = self.effective_scale(bounds.size);
             let (dx, dy) = self.ivars().offset.get();
             let rotation = self.ivars().rotation.get();
             let flipped = self.ivars().flipped.get();
@@ -224,10 +230,10 @@ define_class!(
         // every other viewer does it.
         #[unsafe(method(magnifyWithEvent:))]
         fn magnify(&self, event: &NSEvent) {
-            let image = self.ivars().image.borrow().clone();
-            let Some(image) = image else { return };
-            let bounds = self.bounds();
-            let current = self.effective_scale(image.size(), bounds.size);
+            if self.ivars().image.borrow().is_none() {
+                return;
+            }
+            let current = self.effective_scale(self.bounds().size);
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             self.zoom_to(current * (1.0 + event.magnification()), Some(point));
         }
@@ -338,6 +344,7 @@ impl SlideView {
     pub fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(SlideViewIvars {
             image: RefCell::new(None),
+            natural: Cell::new(CGSize::new(0.0, 0.0)),
             frames: RefCell::new(Vec::new()),
             frame_index: Cell::new(0),
             anim_timer: RefCell::new(None),
@@ -355,13 +362,17 @@ impl SlideView {
     /// The scale that fits the image in the view. A small image
     /// stays at its own size unless the preference says to fill the
     /// screen with it.
-    fn fit_scale(&self, image: CGSize, bounds: CGSize) -> f64 {
+    fn fit_scale(&self, bounds: CGSize) -> f64 {
+        let natural = self.ivars().natural.get();
         // A quarter-turned image fits by its swapped dimensions.
         let (iw, ih) = if self.ivars().rotation.get() % 180 == 90 {
-            (image.height, image.width)
+            (natural.height, natural.width)
         } else {
-            (image.width, image.height)
+            (natural.width, natural.height)
         };
+        if iw <= 0.0 || ih <= 0.0 {
+            return 1.0;
+        }
         let fit = (bounds.width / iw).min(bounds.height / ih);
         let scales_up = self
             .ivars()
@@ -375,19 +386,37 @@ impl SlideView {
         }
     }
 
-    fn effective_scale(&self, image: CGSize, bounds: CGSize) -> f64 {
+    fn effective_scale(&self, bounds: CGSize) -> f64 {
         match self.ivars().zoom.get() {
             Some(zoom) => zoom,
-            None => self.fit_scale(image, bounds),
+            None => self.fit_scale(bounds),
         }
     }
 
     /// What the slide is scaled by right now, for the harness.
     pub fn drawn_scale(&self) -> f64 {
-        let Some(image) = self.ivars().image.borrow().clone() else {
+        if self.ivars().image.borrow().is_none() {
             return 0.0;
-        };
-        self.effective_scale(image.size(), self.bounds().size)
+        }
+        self.effective_scale(self.bounds().size)
+    }
+
+    /// The file's own pixel size, and the longest edge of the decode
+    /// being drawn from, for the resolution the zoom asks for.
+    pub fn natural_size(&self) -> CGSize {
+        self.ivars().natural.get()
+    }
+
+    pub fn decoded_long_edge(&self) -> f64 {
+        self.ivars()
+            .image
+            .borrow()
+            .as_ref()
+            .map(|image| {
+                let size = image.size();
+                size.width.max(size.height)
+            })
+            .unwrap_or(0.0)
     }
 
     pub fn rotate(&self, delta_degrees: i32) {
@@ -439,15 +468,16 @@ impl SlideView {
     /// puts the pan back, so a pinch out lands where the slide
     /// started instead of in a corner.
     pub fn zoom_to(&self, next: f64, anchor: Option<CGPoint>) {
-        let image = self.ivars().image.borrow().clone();
-        let Some(image) = image else { return };
+        if self.ivars().image.borrow().is_none() {
+            return;
+        }
         let bounds = self.bounds();
-        let current = self.effective_scale(image.size(), bounds.size);
+        let current = self.effective_scale(bounds.size);
         if current <= 0.0 {
             return;
         }
         let next = next.clamp(ZOOM_LADDER[0], ZOOM_LADDER[ZOOM_LADDER.len() - 1]);
-        if next <= self.fit_scale(image.size(), bounds.size) {
+        if next <= self.fit_scale(bounds.size) {
             self.set_zoom(None);
             return;
         }
@@ -482,9 +512,10 @@ impl SlideView {
     }
 
     fn zoom_step(&self, direction: i32) {
-        let image = self.ivars().image.borrow().clone();
-        let Some(image) = image else { return };
-        let current = self.effective_scale(image.size(), self.bounds().size);
+        if self.ivars().image.borrow().is_none() {
+            return;
+        }
+        let current = self.effective_scale(self.bounds().size);
         let next = if direction > 0 {
             ZOOM_LADDER
                 .iter()
@@ -508,19 +539,28 @@ impl SlideView {
 
     /// New slide: reset to defaults. The delegate re-applies any
     /// remembered per-file state afterwards.
-    pub fn show_image(&self, image: Retained<NSImage>) {
+    pub fn show_image(&self, image: Retained<NSImage>, natural: CGSize) {
         self.stop_animation();
         *self.ivars().image.borrow_mut() = Some(image);
+        self.ivars().natural.set(natural);
         self.apply_state(SlideState::default());
+    }
+
+    /// A bigger decode of the slide already on screen. The zoom, the
+    /// pan and the rest stay as they are: only the sharpness changes.
+    pub fn swap_decode(&self, image: Retained<NSImage>) {
+        *self.ivars().image.borrow_mut() = Some(image);
+        self.setNeedsDisplay(true);
     }
 
     /// New animated slide: frame 0 shows at once, the rest play on
     /// their own delays. Zoom/rotate/flip apply to whatever frame is
     /// current, same draw path as a still image.
-    pub fn show_frames(&self, frames: Vec<(Retained<NSImage>, f64)>) {
+    pub fn show_frames(&self, frames: Vec<(Retained<NSImage>, f64)>, natural: CGSize) {
         self.stop_animation();
         let Some((first, delay)) = frames.first().cloned() else { return };
         *self.ivars().image.borrow_mut() = Some(first);
+        self.ivars().natural.set(natural);
         *self.ivars().frames.borrow_mut() = frames;
         self.ivars().frame_index.set(0);
         self.apply_state(SlideState::default());

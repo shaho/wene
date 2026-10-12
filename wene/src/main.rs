@@ -59,6 +59,9 @@ struct Show {
     view: Retained<SlideView>,
     overlay: Retained<NSTextField>,
     playlist: Playlist,
+    /// A bigger decode a zoom asked for, while it is on its way, so
+    /// a pinch does not queue one decode per frame.
+    pending_decode: Option<(PathBuf, i32)>,
     cache: LruCache<PathBuf, Retained<NSImage>>,
     /// Remembered zoom/rotation/flip/pan per file for this session.
     view_states: HashMap<PathBuf, SlideState>,
@@ -2024,6 +2027,7 @@ impl AppDelegate {
             view,
             overlay,
             playlist,
+            pending_decode: None,
             cache: LruCache::new(SLIDE_CACHE_BYTES),
             view_states: HashMap::new(),
             interval: None,
@@ -2169,6 +2173,49 @@ impl AppDelegate {
 
     /// The slide view changed zoom/rotation/flip/pan: remember it
     /// for the current file and refresh the overlay.
+    /// A zoomed slide draws from a decode made to fit the screen, so
+    /// past a point it is an upscale of that decode rather than the
+    /// file's own pixels. Ask for a decode that carries them.
+    fn ensure_zoom_resolution(&self) {
+        let Some(engine) = self.ivars().engine.get() else { return };
+        let request = {
+            let show = self.ivars().show.borrow();
+            let Some(show) = show.as_ref() else { return };
+            let Some(path) = show.playlist.current().cloned() else { return };
+            // An animated slide plays from its frames; a still decode
+            // in their place would stop the animation.
+            if decoder::is_animated_ext(&path) {
+                return;
+            }
+            if show.pending_decode.as_ref().is_some_and(|(waiting, _)| *waiting == path) {
+                return;
+            }
+            let Some(zoom) = show.view.state().zoom else { return };
+            let natural = show.view.natural_size();
+            let backing = show.window.backingScaleFactor();
+            wene_core::zoom_decode_request(
+                natural.width.max(natural.height) as i32,
+                show.view.decoded_long_edge() as i32,
+                zoom,
+                backing,
+            )
+            .map(|max_px| (path, max_px))
+        };
+        let Some((path, max_px)) = request else { return };
+        if let Some(show) = self.ivars().show.borrow_mut().as_mut() {
+            show.pending_decode = Some((path.clone(), max_px));
+        }
+        engine.request_slide_at(path, max_px);
+    }
+
+    /// The file's own pixel size, for a slide the view is about to
+    /// draw. A header read, not a decode.
+    fn natural_size(path: &std::path::Path) -> CGSize {
+        decoder::image_dimensions(path)
+            .map(|(w, h)| CGSize::new(w as f64, h as f64))
+            .unwrap_or(CGSize::new(0.0, 0.0))
+    }
+
     pub fn slide_state_changed(&self) {
         {
             let mut show = self.ivars().show.borrow_mut();
@@ -2183,6 +2230,7 @@ impl AppDelegate {
                 }
             }
         }
+        self.ensure_zoom_resolution();
         self.update_overlay();
     }
 
@@ -2353,7 +2401,7 @@ impl AppDelegate {
 
             if let Some(current) = show.playlist.current().cloned() {
                 if let Some(image) = show.cache.get(&current) {
-                    show.view.show_image(image.clone());
+                    show.view.show_image(image.clone(), Self::natural_size(&current));
                     if let Some(state) = show.view_states.get(&current) {
                         show.view.apply_state(*state);
                     }
@@ -2931,11 +2979,21 @@ impl AppDelegate {
                     let Some(show) = show.as_mut() else { return };
                     let is_current = show.playlist.current() == Some(&path);
                     let state = show.view_states.get(&path).copied();
+                    let natural = Self::natural_size(&path);
+                    if show.pending_decode.as_ref().is_some_and(|(waiting, _)| *waiting == path) {
+                        show.pending_decode = None;
+                    }
                     show.cache.insert(path, image.clone(), cost);
                     if is_current {
-                        show.view.show_image(image);
-                        if let Some(state) = state {
-                            show.view.apply_state(state);
+                        // A bigger decode of the slide already up is
+                        // a swap: the zoom that asked for it stays.
+                        if show.view.has_image() && show.view.natural_size() == natural {
+                            show.view.swap_decode(image);
+                        } else {
+                            show.view.show_image(image, natural);
+                            if let Some(state) = state {
+                                show.view.apply_state(state);
+                            }
                         }
                     }
                     is_current
@@ -2955,7 +3013,7 @@ impl AppDelegate {
                         let frames: Vec<_> =
                             frames.iter().map(|(img, d)| (ns_image(img), *d)).collect();
                         let state = show.view_states.get(&path).copied();
-                        show.view.show_frames(frames);
+                        show.view.show_frames(frames, Self::natural_size(&path));
                         if let Some(state) = state {
                             show.view.apply_state(state);
                         }
@@ -4009,7 +4067,11 @@ fn main() {
     let (engine, rx) = Engine::start(
         ImageIoDecoder,
         (grid::CELL * 2.0) as i32,
-        (screen_long_edge * 2.0) as i32,
+        // Slides decode to twice the screen's longest edge, which
+        // covers fit and a little zoom. The harness caps it far
+        // lower, so its small fixture images outgrow their decode
+        // the way a photo does on a real screen.
+        if e2e::enabled() { 256 } else { (screen_long_edge * 2.0) as i32 },
         || {
             DispatchQueue::main().exec_async(|| {
                 let mtm = MainThreadMarker::new().expect("main queue is the main thread");

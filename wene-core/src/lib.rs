@@ -144,7 +144,10 @@ const SCAN_BATCH: usize = 64;
 
 enum Job {
     Thumb(PathBuf),
-    Slide(PathBuf),
+    /// `max_px` None takes the default slide cap. A zoomed slide
+    /// names a bigger one, and skips the animation path: a still
+    /// frame at full size is what zoom asks for.
+    Slide { path: PathBuf, max_px: Option<i32> },
 }
 
 /// Decode and scan engine. One scanner thread per scan, a two-thread
@@ -328,7 +331,13 @@ impl<I: Send + 'static> Engine<I> {
     }
 
     pub fn request_slide(&self, path: PathBuf) {
-        let _ = self.slide_tx.send(Job::Slide(path));
+        let _ = self.slide_tx.send(Job::Slide { path, max_px: None });
+    }
+
+    /// Decode a slide to `max_px` on its longest edge, for a zoom
+    /// that has outgrown the decode on hand.
+    pub fn request_slide_at(&self, path: PathBuf, max_px: i32) {
+        let _ = self.slide_tx.send(Job::Slide { path, max_px: Some(max_px) });
     }
 
     pub fn max_thumb_px(&self) -> i32 {
@@ -451,7 +460,13 @@ fn spawn_decode_worker<I: Send + 'static, D: ImageDecoder<Image = I>>(
                 Some(image) => Event::ThumbReady { path, image },
                 None => Event::DecodeFailed { path },
             },
-            Job::Slide(path) => match decoder.decode_frames(&path) {
+            Job::Slide { path, max_px: Some(max_px) } => {
+                match decoder.decode(&path, max_px) {
+                    Some(image) => Event::SlideReady { path, image },
+                    None => Event::DecodeFailed { path },
+                }
+            }
+            Job::Slide { path, max_px: None } => match decoder.decode_frames(&path) {
                 Some(frames) => Event::SlideFramesReady { path, frames },
                 None => match decoder.decode(&path, max_slide_px) {
                     Some(image) => Event::SlideReady { path, image },
@@ -464,6 +479,39 @@ fn spawn_decode_worker<I: Send + 'static, D: ImageDecoder<Image = I>>(
         }
         wakeup();
     });
+}
+
+/// A zoomed slide needs more pixels than the decode it is drawn
+/// from. Returns the longest edge to decode to, or None when the
+/// decode on hand is good enough.
+///
+/// `natural_long` is the file's own longest edge, `decoded_long` the
+/// decode being drawn, `zoom` the scale against the natural size,
+/// and `backing` the screen's pixel-per-point factor. The answer
+/// never asks for more than the file holds, and asks only when the
+/// gain is worth a decode, which keeps a pinch from queueing one
+/// decode per frame.
+pub fn zoom_decode_request(
+    natural_long: i32,
+    decoded_long: i32,
+    zoom: f64,
+    backing: f64,
+) -> Option<i32> {
+    if natural_long <= 0 || decoded_long <= 0 || !zoom.is_finite() || zoom <= 0.0 {
+        return None;
+    }
+    // The decode already holds everything the file has.
+    if decoded_long >= natural_long {
+        return None;
+    }
+    let wanted = (natural_long as f64 * zoom * backing.max(1.0)).ceil();
+    let wanted = (wanted as i32).min(natural_long);
+    // A decode costs a full read; a fifth more pixels does not pay
+    // for one.
+    if wanted as f64 <= decoded_long as f64 * 1.2 {
+        return None;
+    }
+    Some(wanted)
 }
 
 /// Parse an EXIF datetime ("2023:07:14 10:30:05") into a SystemTime.
@@ -492,6 +540,47 @@ pub fn parse_exif_datetime(s: &str) -> Option<SystemTime> {
         return None;
     }
     Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::zoom_decode_request;
+
+    #[test]
+    fn fit_needs_nothing() {
+        // Fit on a retina screen: the 2560 decode covers it.
+        assert_eq!(zoom_decode_request(6000, 2560, 0.2, 2.0), None);
+    }
+
+    #[test]
+    fn zooming_in_asks_for_more() {
+        assert_eq!(zoom_decode_request(6000, 2560, 1.0, 2.0), Some(6000));
+        assert_eq!(zoom_decode_request(6000, 1000, 0.25, 2.0), Some(3000));
+    }
+
+    #[test]
+    fn never_asks_for_more_than_the_file_holds() {
+        assert_eq!(zoom_decode_request(4000, 1000, 8.0, 2.0), Some(4000));
+        assert_eq!(zoom_decode_request(4000, 4000, 8.0, 2.0), None);
+        assert_eq!(zoom_decode_request(800, 800, 4.0, 2.0), None);
+    }
+
+    #[test]
+    fn a_small_gain_is_not_worth_a_decode() {
+        // Wants 2808: more than the 2560 on hand, but under the
+        // fifth more that pays for a decode.
+        assert_eq!(zoom_decode_request(6000, 2560, 0.234, 2.0), None);
+        // Wants 3600: worth it.
+        assert_eq!(zoom_decode_request(6000, 2560, 0.3, 2.0), Some(3600));
+    }
+
+    #[test]
+    fn nonsense_input_asks_for_nothing() {
+        assert_eq!(zoom_decode_request(0, 100, 2.0, 2.0), None);
+        assert_eq!(zoom_decode_request(100, 0, 2.0, 2.0), None);
+        assert_eq!(zoom_decode_request(100, 50, f64::NAN, 2.0), None);
+        assert_eq!(zoom_decode_request(100, 50, -1.0, 2.0), None);
+    }
 }
 
 #[cfg(test)]
