@@ -1717,11 +1717,14 @@ impl AppDelegate {
                 rows_text(&rows)
             }
             many => {
-                let bytes: u64 = many
-                    .iter()
-                    .filter_map(|path| std::fs::metadata(path).ok())
-                    .map(|meta| meta.len())
-                    .sum();
+                // Several images are the grid's selection, and the scan
+                // already knows every size: no stat per file.
+                let bytes: u64 = self
+                    .ivars()
+                    .grid
+                    .get()
+                    .map(|grid| grid.selection_info().1.iter().map(|info| info.size).sum())
+                    .unwrap_or(0);
                 let folder = many[0]
                     .parent()
                     .map(|folder| folder.to_string_lossy().into_owned())
@@ -3100,7 +3103,7 @@ impl AppDelegate {
                     *self.ivars().header_rows.borrow_mut() = None;
                 }
                 let grid = self.ivars().grid.get().unwrap();
-                grid.invalidate_thumb(&info.path);
+                grid.file_changed(&info);
                 let is_current = {
                     let mut show = self.ivars().show.borrow_mut();
                     if let Some(show) = show.as_mut() {

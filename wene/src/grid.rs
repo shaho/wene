@@ -1038,11 +1038,16 @@ impl GridView {
         self.notify_selection();
     }
 
-    /// A file changed on disk: forget its thumbnail so the next draw
-    /// re-requests it.
-    pub fn invalidate_thumb(&self, path: &PathBuf) {
-        self.ivars().thumbs.borrow_mut().remove(path);
-        self.ivars().requested.borrow_mut().remove(path);
+    /// A file changed on disk: keep its new size and dates, and
+    /// forget its thumbnail so the next draw re-requests it.
+    pub fn file_changed(&self, info: &FileInfo) {
+        for list in [&self.ivars().all, &self.ivars().files] {
+            if let Some(slot) = list.borrow_mut().iter_mut().find(|f| f.path == info.path) {
+                *slot = info.clone();
+            }
+        }
+        self.ivars().thumbs.borrow_mut().remove(&info.path);
+        self.ivars().requested.borrow_mut().remove(&info.path);
         self.setNeedsDisplay(true);
     }
 

@@ -75,6 +75,11 @@ fn wait_for_transfer(state: &RefCell<E2eState>, delegate: &AppDelegate) -> bool 
     delegate.e2e_transfer_busy() && hold(state, 4)
 }
 
+/// A test file the harness grows on disk.
+fn grow_path(root: &str) -> String {
+    format!("{root}/zzz-grow-{}.heic", std::process::id())
+}
+
 fn check(state: &RefCell<E2eState>, ok: bool, what: &str) {
     let mut state = state.borrow_mut();
     let step = state.step;
@@ -1247,6 +1252,19 @@ pub fn run_step(delegate: &AppDelegate) {
                 delegate.e2e_info_text().contains("2 images"),
                 "several selected images come back as a count",
             );
+            let on_disk: u64 = delegate
+                .action_targets()
+                .iter()
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .map(|meta| meta.len())
+                .sum();
+            check(
+                state,
+                delegate
+                    .e2e_info_text()
+                    .contains(&crate::format_bytes(on_disk)),
+                "their size is the size on disk",
+            );
             delegate.e2e_select(&[]);
             check(
                 state,
@@ -1649,6 +1667,61 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             delegate.e2e_toggle_exif_overlay();
             delegate.end_slideshow();
+        }
+        86 => {
+            // A file that grows on disk: the sizes the grid keeps
+            // follow it.
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let copied = std::fs::copy(format!("{root}/img2.heic"), grow_path(&root)).is_ok();
+            check(state, copied, "growing test file copied");
+        }
+        87 => {
+            if wait_for_count(state, delegate, 5) {
+                return;
+            }
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            use std::io::Write;
+            let grown = std::fs::OpenOptions::new()
+                .append(true)
+                .open(grow_path(&root))
+                .and_then(|mut file| file.write_all(&[0; 5000]))
+                .is_ok();
+            check(state, grown, "test file grown on disk");
+        }
+        88 => {
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            let size = |path: String| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let grown = crate::format_bytes(size(grow_path(&root)));
+            // Name order puts the zzz file last: index 4.
+            delegate.e2e_select(&[4]);
+            if !delegate.e2e_status_text().contains(&grown) && hold(state, 4) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_status_text().contains(&grown),
+                "the status bar shows the new size",
+            );
+            delegate.e2e_select(&[3, 4]);
+            // Natural name order: index 3 is img10.heic.
+            let both =
+                crate::format_bytes(size(format!("{root}/img10.heic")) + size(grow_path(&root)));
+            check(
+                state,
+                delegate.e2e_info_text().contains(&both),
+                "the info panel adds up the new size",
+            );
+            let _ = std::fs::remove_file(grow_path(&root));
+        }
+        89 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "grid back to the fixture",
+            );
         }
         _ => {
             let failures = state.borrow().failures.clone();
