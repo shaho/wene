@@ -3013,20 +3013,24 @@ impl AppDelegate {
     // ---- core events ----
 
     fn handle_event(&self, event: Event<Img>) {
+        // The grid was reset for the new folder already.
+        if self.ivars().engine.get().unwrap().is_stale(&event) {
+            return;
+        }
         match event {
-            Event::FilesInserted(inserts) => {
-                self.ivars().grid.get().unwrap().insert_files(inserts);
+            Event::FilesInserted { files, .. } => {
+                self.ivars().grid.get().unwrap().insert_files(files);
                 // Core streams in name order; re-sort the batch into
                 // the active order.
                 if !self.sort_is_default() {
                     self.apply_sort();
                 }
             }
-            Event::FilesRemoved(paths) => {
+            Event::FilesRemoved { paths, .. } => {
                 self.ivars().grid.get().unwrap().remove_paths(&paths);
                 self.drop_from_slideshow(&paths);
             }
-            Event::FileChanged(info) => {
+            Event::FileChanged { info, .. } => {
                 let grid = self.ivars().grid.get().unwrap();
                 grid.invalidate_thumb(&info.path);
                 let is_current = {
@@ -3042,7 +3046,7 @@ impl AppDelegate {
                     self.show_current();
                 }
             }
-            Event::ScanDone { total } => {
+            Event::ScanDone { total, .. } => {
                 println!("scan done: {total} images");
                 // Their own folder has finished scanning and they
                 // are still not there: the files are gone from disk,

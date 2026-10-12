@@ -3,7 +3,7 @@
 //! callback; the core owns all worker threads.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -45,16 +45,29 @@ pub trait ImageDecoder: Send + Sync + 'static {
     }
 }
 
+/// The `scan` in a file event is the number of the scan it belongs
+/// to. A new scan makes every event of the old one stale, including
+/// those already in the channel: ask `Engine::is_stale` and drop them.
 pub enum Event<I> {
     /// Files inserted into the sorted-by-name list. Each entry is the
     /// index the file was inserted at (indices are valid when applied
     /// in order) plus its info.
-    FilesInserted(Vec<(usize, FileInfo)>),
+    FilesInserted {
+        scan: u64,
+        files: Vec<(usize, FileInfo)>,
+    },
     /// Files that disappeared from disk (watcher).
-    FilesRemoved(Vec<PathBuf>),
+    FilesRemoved {
+        scan: u64,
+        paths: Vec<PathBuf>,
+    },
     /// A file's contents changed on disk; caches for it are stale.
-    FileChanged(FileInfo),
+    FileChanged {
+        scan: u64,
+        info: FileInfo,
+    },
     ScanDone {
+        scan: u64,
         total: usize,
     },
     ThumbReady {
@@ -187,6 +200,10 @@ pub struct Engine<I> {
     /// Canonical name-sorted list; shared by the scan walk and the
     /// file watcher so insert indices stay consistent.
     files: Arc<Mutex<Vec<FileInfo>>>,
+    /// The number of the scan `files` belongs to. It changes under
+    /// the `files` lock, and every writer checks it under that lock,
+    /// so an old scan's walk or watcher never reaches the new list.
+    scan: Arc<AtomicU64>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
     dates: DatesFn,
 }
@@ -239,6 +256,7 @@ impl<I: Send + 'static> Engine<I> {
                 wakeup,
                 max_thumb_px,
                 files: Arc::new(Mutex::new(Vec::new())),
+                scan: Arc::new(AtomicU64::new(0)),
                 watcher: Mutex::new(None),
                 dates,
             },
@@ -254,9 +272,12 @@ impl<I: Send + 'static> Engine<I> {
     /// the watcher's own event a moment later then finds nothing to
     /// do.
     pub fn notice(&self, paths: &[PathBuf]) {
+        let scan = self.scan.load(Ordering::SeqCst);
         for path in paths {
             apply_fs_change(
                 path,
+                scan,
+                &self.scan,
                 &self.files,
                 &self.events_tx,
                 &self.wakeup,
@@ -265,17 +286,35 @@ impl<I: Send + 'static> Engine<I> {
         }
     }
 
+    /// True for a file event of a scan that a newer scan replaced.
+    /// Its indices and paths belong to the old folder.
+    pub fn is_stale(&self, event: &Event<I>) -> bool {
+        let scan = match event {
+            Event::FilesInserted { scan, .. }
+            | Event::FilesRemoved { scan, .. }
+            | Event::FileChanged { scan, .. }
+            | Event::ScanDone { scan, .. } => *scan,
+            _ => return false,
+        };
+        scan != self.scan.load(Ordering::SeqCst)
+    }
+
     /// Walk `root` on a fresh thread, recursively or one level deep.
     /// Batches of found files stream out as FilesInserted events with
     /// sorted-insert indices; the shell mirrors the inserts to keep
     /// the same order. The folder is then watched (matching depth):
     /// adds, removals, and edits keep flowing as events until the
-    /// next scan.
+    /// next scan. The next scan stops this one's walk and watcher.
     pub fn scan(&self, root: PathBuf, recursive: bool) {
-        self.files.lock().unwrap().clear();
+        let scan = {
+            let mut files = self.files.lock().unwrap();
+            files.clear();
+            self.scan.fetch_add(1, Ordering::SeqCst) + 1
+        };
         *self.watcher.lock().unwrap() = None;
-        self.start_watcher(&root, recursive);
+        self.start_watcher(&root, recursive, scan);
 
+        let current = Arc::clone(&self.scan);
         let events_tx = self.events_tx.clone();
         let wakeup = Arc::clone(&self.wakeup);
         let files = Arc::clone(&self.files);
@@ -284,6 +323,11 @@ impl<I: Send + 'static> Engine<I> {
             let mut pending: Vec<FileInfo> = Vec::new();
             let mut stack = vec![root];
             while let Some(dir) = stack.pop() {
+                // A deep tree with few images flushes rarely, so the
+                // walk also looks between folders.
+                if current.load(Ordering::SeqCst) != scan {
+                    return;
+                }
                 let Ok(entries) = std::fs::read_dir(&dir) else {
                     continue;
                 };
@@ -317,29 +361,36 @@ impl<I: Send + 'static> Engine<I> {
                             exif_date,
                             added,
                         });
-                        if pending.len() >= SCAN_BATCH {
-                            flush(&files, &mut pending, &events_tx, &wakeup);
+                        if pending.len() >= SCAN_BATCH
+                            && !flush(scan, &current, &files, &mut pending, &events_tx, &wakeup)
+                        {
+                            return;
                         }
                     }
                 }
             }
-            flush(&files, &mut pending, &events_tx, &wakeup);
+            if !flush(scan, &current, &files, &mut pending, &events_tx, &wakeup) {
+                return;
+            }
             let total = files.lock().unwrap().len();
-            let _ = events_tx.send(Event::ScanDone { total });
+            let _ = events_tx.send(Event::ScanDone { scan, total });
             wakeup();
         });
     }
 
-    fn start_watcher(&self, root: &Path, recursive: bool) {
+    fn start_watcher(&self, root: &Path, recursive: bool, scan: u64) {
         use notify::Watcher;
+        let current = Arc::clone(&self.scan);
         let events_tx = self.events_tx.clone();
         let wakeup = Arc::clone(&self.wakeup);
         let files = Arc::clone(&self.files);
         let dates = Arc::clone(&self.dates);
+        // Dropping the watcher stops new calls, not one already
+        // running, so the handler carries its scan's number too.
         let handler = move |result: Result<notify::Event, notify::Error>| {
             let Ok(event) = result else { return };
             for path in event.paths {
-                apply_fs_change(&path, &files, &events_tx, &wakeup, &dates);
+                apply_fs_change(&path, scan, &current, &files, &events_tx, &wakeup, &dates);
             }
         };
         let Ok(mut watcher) = notify::recommended_watcher(handler) else {
@@ -383,18 +434,22 @@ impl<I: Send + 'static> Engine<I> {
     }
 }
 
+/// Insert a batch from scan number `scan`. False when a newer scan
+/// has replaced it: nothing is inserted, and the walk must stop.
 fn flush<I>(
+    scan: u64,
+    current: &AtomicU64,
     files: &Arc<Mutex<Vec<FileInfo>>>,
     pending: &mut Vec<FileInfo>,
     events_tx: &Sender<Event<I>>,
     wakeup: &Arc<dyn Fn() + Send + Sync>,
-) {
-    if pending.is_empty() {
-        return;
-    }
+) -> bool {
     let mut inserts = Vec::with_capacity(pending.len());
     {
         let mut sorted = files.lock().unwrap();
+        if current.load(Ordering::SeqCst) != scan {
+            return false;
+        }
         for info in pending.drain(..) {
             match sorted.binary_search_by(|p| file_cmp(&p.path, &info.path)) {
                 // Already present (watcher raced the walk): skip.
@@ -406,16 +461,27 @@ fn flush<I>(
             }
         }
     }
-    if !inserts.is_empty() && events_tx.send(Event::FilesInserted(inserts)).is_ok() {
+    if !inserts.is_empty()
+        && events_tx
+            .send(Event::FilesInserted {
+                scan,
+                files: inserts,
+            })
+            .is_ok()
+    {
         wakeup();
     }
+    true
 }
 
 /// Watcher callback: reconcile one path against the canonical list.
 /// Existence on disk decides between insert, change, and removal,
-/// which absorbs create/modify/rename event ambiguity.
+/// which absorbs create/modify/rename event ambiguity. A change seen
+/// by scan number `scan` is dropped once a newer scan has replaced it.
 fn apply_fs_change<I>(
     path: &Path,
+    scan: u64,
+    current: &AtomicU64,
     files: &Arc<Mutex<Vec<FileInfo>>>,
     events_tx: &Sender<Event<I>>,
     wakeup: &Arc<dyn Fn() + Send + Sync>,
@@ -445,21 +511,30 @@ fn apply_fs_change<I>(
     };
     let event = {
         let mut sorted = files.lock().unwrap();
+        if current.load(Ordering::SeqCst) != scan {
+            return;
+        }
         let existing = sorted.binary_search_by(|p| file_cmp(&p.path, path));
         match (meta, existing) {
             (Some(meta), Err(index)) => {
                 let info = make_info(&meta);
                 sorted.insert(index, info.clone());
-                Some(Event::FilesInserted(vec![(index, info)]))
+                Some(Event::FilesInserted {
+                    scan,
+                    files: vec![(index, info)],
+                })
             }
             (Some(meta), Ok(index)) => {
                 let info = make_info(&meta);
                 sorted[index] = info.clone();
-                Some(Event::FileChanged(info))
+                Some(Event::FileChanged { scan, info })
             }
             (None, Ok(index)) => {
                 sorted.remove(index);
-                Some(Event::FilesRemoved(vec![path.to_path_buf()]))
+                Some(Event::FilesRemoved {
+                    scan,
+                    paths: vec![path.to_path_buf()],
+                })
             }
             (None, Err(_)) => None,
         }
@@ -713,6 +788,69 @@ mod tests {
         files.sort_by(|x, y| file_info_cmp(x, y, SortOrder::Added, false));
         // a added day 20 vs b's modified fallback day 9.
         assert_eq!(files[0].path, b.path);
+    }
+
+    /// Decodes nothing, and reads each file's dates slowly, so a walk
+    /// of a big folder is still running when the next scan starts.
+    struct SlowDates;
+
+    impl ImageDecoder for SlowDates {
+        type Image = ();
+        fn decode(&self, _path: &Path, _max_px: i32) -> Option<()> {
+            None
+        }
+        fn file_dates(&self, _path: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
+            thread::sleep(std::time::Duration::from_millis(2));
+            (None, None)
+        }
+    }
+
+    #[test]
+    fn a_new_scan_drops_the_old_folder() {
+        let root = std::env::temp_dir().join(format!("wene-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (big, small) = (root.join("big"), root.join("small"));
+        std::fs::create_dir_all(&big).unwrap();
+        std::fs::create_dir_all(&small).unwrap();
+        for n in 0..300 {
+            std::fs::write(big.join(format!("{n}.jpg")), "").unwrap();
+        }
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            std::fs::write(small.join(name), "").unwrap();
+        }
+        let (engine, events) = Engine::start(SlowDates, 100, 100, || {});
+
+        engine.scan(big, false);
+        thread::sleep(std::time::Duration::from_millis(200));
+        // What the shell does: reset its list, then start the scan.
+        let mut shown: Vec<PathBuf> = Vec::new();
+        engine.scan(small.clone(), false);
+        // Long enough for the old walk to have finished, had it run on.
+        while let Ok(event) = events.recv_timeout(std::time::Duration::from_millis(1000)) {
+            if engine.is_stale(&event) {
+                continue;
+            }
+            if let Event::FilesInserted { files, .. } = event {
+                for (index, info) in files {
+                    shown.insert(index, info.path);
+                }
+            }
+        }
+
+        let expected: Vec<PathBuf> = ["a.jpg", "b.jpg", "c.jpg"]
+            .iter()
+            .map(|name| small.join(name))
+            .collect();
+        assert_eq!(shown, expected);
+        let listed: Vec<PathBuf> = engine
+            .files
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        assert_eq!(listed, expected);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
