@@ -5,14 +5,11 @@
 //! "IMG_1234 2.heic". The new name is claimed by creating the file
 //! first, so two batches running at once cannot pick the same one.
 //! A move across disks is a copy and then a delete, which is why a
-//! batch runs off the main thread.
+//! batch runs off the main thread. Once the copy is whole it is never
+//! deleted, so a failure there can leave two files but never none.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-
-/// rename(2) across mount points. `ErrorKind::CrossesDevices` is
-/// still unstable, so the raw number stands in for it.
-const EXDEV: i32 = 18;
 
 /// Move or copy: the same job apart from what happens to the
 /// original.
@@ -58,18 +55,11 @@ impl Transfer {
             });
         }
         let (target, renamed) = claim_name(source, folder)?;
-        let result = match self {
-            Transfer::Move => move_onto(source, &target),
-            Transfer::Copy => std::fs::copy(source, &target).map(|_| ()),
-        };
-        match result {
-            Ok(()) => Ok(Transferred { target, renamed }),
-            Err(error) => {
-                // The claim was ours, so take it back.
-                let _ = std::fs::remove_file(&target);
-                Err(error)
-            }
+        match self {
+            Transfer::Move => move_onto(source, &target)?,
+            Transfer::Copy => copy_onto(source, &target)?,
         }
+        Ok(Transferred { target, renamed })
     }
 }
 
@@ -82,23 +72,41 @@ pub fn move_exact(source: &Path, target: &Path) -> std::io::Result<()> {
             "another file now has that name",
         ));
     }
-    move_onto(source, target).inspect_err(|_| {
-        // The claim was ours, so take it back.
-        let _ = std::fs::remove_file(target);
-    })
+    move_onto(source, target)
 }
 
-/// rename replaces the claimed file. Another disk cannot be renamed
-/// onto, so the file is copied and then deleted.
+/// Move `source` onto the claimed `target`. rename replaces the
+/// claim. Another disk cannot be renamed onto, so the file goes
+/// across as a copy. A rename that fails takes the claim back.
 fn move_onto(source: &Path, target: &Path) -> std::io::Result<()> {
     match std::fs::rename(source, target) {
         Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(EXDEV) => {
-            std::fs::copy(source, target)?;
-            std::fs::remove_file(source)
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            move_across(source, target)
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            let _ = std::fs::remove_file(target);
+            Err(error)
+        }
     }
+}
+
+/// Copy, flush the copy to its disk, and only then delete the
+/// original. From the flush on, the target is the file, so it stays
+/// even when the original will not go: the error reports two files,
+/// never none.
+fn move_across(source: &Path, target: &Path) -> std::io::Result<()> {
+    copy_onto(source, target)?;
+    std::fs::File::open(target)?.sync_all()?;
+    std::fs::remove_file(source)
+}
+
+/// Copy `source` over the claimed `target`. A copy that fails takes
+/// the claim back, so no partial file is left behind.
+fn copy_onto(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::copy(source, target).map(|_| ()).inspect_err(|_| {
+        let _ = std::fs::remove_file(target);
+    })
 }
 
 /// Claim a free name in `folder` by creating the file, and say
@@ -145,6 +153,7 @@ fn claim(path: &Path) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// A scratch folder of this test's own.
     fn scratch(tag: &str) -> PathBuf {
@@ -297,5 +306,26 @@ mod tests {
 
         assert!(move_exact(&from.join("gone.heic"), &to.join("gone.heic")).is_err());
         assert!(!to.join("gone.heic").exists());
+    }
+
+    #[test]
+    fn a_move_across_disks_keeps_the_copy_when_the_original_stays() {
+        let from = scratch("across-from");
+        let to = scratch("across-to");
+        let source = from.join("a.heic");
+        write(&source, "one");
+        let target = to.join("a.heic");
+        assert!(claim(&target).unwrap());
+        // A folder that is not writable keeps its files, so the
+        // original cannot be deleted once the copy is made.
+        let locked = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&from, locked).unwrap();
+
+        let result = move_across(&source, &target);
+
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "one");
     }
 }
