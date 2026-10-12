@@ -34,7 +34,7 @@ use objc2_foundation::{
     NSUserDefaults, NSURL,
 };
 use wene_core::history::{Entry, History, Step};
-use wene_core::transfer::Transfer;
+use wene_core::transfer::{self, Transfer};
 use wene_core::{Engine, Event, LruCache, Playlist, SortOrder};
 
 use decoder::ImageIoDecoder;
@@ -1418,7 +1418,7 @@ impl AppDelegate {
             if let Some(parent) = to.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match std::fs::rename(from, to).or_else(|_| copy_then_delete(from, to)) {
+            match transfer::move_exact(from, to) {
                 Ok(()) => {
                     arrived.push(to.clone());
                     left.push(from.clone());
@@ -3443,13 +3443,6 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
-}
-
-/// rename(2) refuses to cross disks, so an undo that crosses one
-/// copies and then deletes, the way a move does.
-fn copy_then_delete(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::copy(from, to)?;
-    std::fs::remove_file(from)
 }
 
 /// The cheat sheet, shown over the slide by h or ?. It is written by

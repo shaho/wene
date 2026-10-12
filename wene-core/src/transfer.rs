@@ -73,6 +73,21 @@ impl Transfer {
     }
 }
 
+/// Move one file to exactly `target`, as undo and redo do. A file
+/// that now holds that name is never replaced: the move fails instead.
+pub fn move_exact(source: &Path, target: &Path) -> std::io::Result<()> {
+    if !claim(target)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "another file now has that name",
+        ));
+    }
+    move_onto(source, target).inspect_err(|_| {
+        // The claim was ours, so take it back.
+        let _ = std::fs::remove_file(target);
+    })
+}
+
 /// rename replaces the claimed file. Another disk cannot be renamed
 /// onto, so the file is copied and then deleted.
 fn move_onto(source: &Path, target: &Path) -> std::io::Result<()> {
@@ -241,6 +256,46 @@ mod tests {
         let missing = from.join("gone.heic");
 
         assert!(Transfer::Copy.apply(&missing, &to).is_err());
+        assert!(!to.join("gone.heic").exists());
+    }
+
+    #[test]
+    fn an_exact_move_lands_on_the_name_it_was_given() {
+        let from = scratch("exact-from");
+        let to = scratch("exact-to");
+        let source = from.join("a.heic");
+        write(&source, "one");
+
+        move_exact(&source, &to.join("a.heic")).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(std::fs::read_to_string(to.join("a.heic")).unwrap(), "one");
+    }
+
+    #[test]
+    fn an_exact_move_never_replaces_a_file() {
+        let from = scratch("exact-clash-from");
+        let to = scratch("exact-clash-to");
+        write(&to.join("a.heic"), "theirs");
+        let source = from.join("a.heic");
+        write(&source, "mine");
+
+        let error = move_exact(&source, &to.join("a.heic")).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(to.join("a.heic")).unwrap(),
+            "theirs"
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "mine");
+    }
+
+    #[test]
+    fn a_failed_exact_move_leaves_no_empty_file_behind() {
+        let from = scratch("exact-fail-from");
+        let to = scratch("exact-fail-to");
+
+        assert!(move_exact(&from.join("gone.heic"), &to.join("gone.heic")).is_err());
         assert!(!to.join("gone.heic").exists());
     }
 }
