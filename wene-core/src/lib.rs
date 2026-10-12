@@ -921,6 +921,7 @@ mod tests {
 
 pub mod cache;
 pub mod history;
+pub mod messages;
 pub mod playlist;
 pub mod transfer;
 pub use cache::LruCache;

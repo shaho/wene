@@ -1262,7 +1262,7 @@ pub fn run_step(delegate: &AppDelegate) {
                 state,
                 delegate
                     .e2e_info_text()
-                    .contains(&crate::format_bytes(on_disk)),
+                    .contains(&wene_core::messages::format_bytes(on_disk)),
                 "their size is the size on disk",
             );
             delegate.e2e_select(&[]);
@@ -1691,7 +1691,7 @@ pub fn run_step(delegate: &AppDelegate) {
         88 => {
             let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
             let size = |path: String| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            let grown = crate::format_bytes(size(grow_path(&root)));
+            let grown = wene_core::messages::format_bytes(size(grow_path(&root)));
             // Name order puts the zzz file last: index 4.
             delegate.e2e_select(&[4]);
             if !delegate.e2e_status_text().contains(&grown) && hold(state, 4) {
@@ -1704,8 +1704,9 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             delegate.e2e_select(&[3, 4]);
             // Natural name order: index 3 is img10.heic.
-            let both =
-                crate::format_bytes(size(format!("{root}/img10.heic")) + size(grow_path(&root)));
+            let both = wene_core::messages::format_bytes(
+                size(format!("{root}/img10.heic")) + size(grow_path(&root)),
+            );
             check(
                 state,
                 delegate.e2e_info_text().contains(&both),

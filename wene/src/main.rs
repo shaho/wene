@@ -43,6 +43,7 @@ use objc2_foundation::{
     NSUserDefaults, NSURL,
 };
 use wene_core::history::{Entry, History, Step};
+use wene_core::messages::{folder_label, format_bytes, transfer_message, trash_message};
 use wene_core::transfer::{self, Transfer};
 use wene_core::{Engine, Event, LruCache, Playlist, SortOrder};
 
@@ -861,21 +862,6 @@ fn on_main(f: impl FnOnce(&AppDelegate) + Send + 'static) {
         let mtm = MainThreadMarker::new().expect("main queue is the main thread");
         f(DELEGATE.get().expect("delegate is set at launch").get(mtm));
     });
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
-        value /= 1000.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
 }
 
 fn drain_events(mtm: MainThreadMarker) {
