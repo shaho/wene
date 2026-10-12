@@ -4,8 +4,8 @@
 //! drawn without one.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use wene_core::transfer::Transfer;
 use wene_core::{file_info_cmp, FileInfo, LruCache, SortOrder};
@@ -625,21 +625,28 @@ impl GridView {
                 .filter(|info| matches_filter(info, &filter))
                 .cloned()
                 .collect();
+            // One lookup table, so a select-all costs one pass and not
+            // one search of the folder per selected file.
+            let place: HashMap<&Path, usize> = visible
+                .iter()
+                .enumerate()
+                .map(|(index, info)| (info.path.as_path(), index))
+                .collect();
             let mut selected = self.ivars().selected.borrow_mut();
             selected.clear();
-            for path in &selected_paths {
-                if let Some(index) = visible.iter().position(|f| &f.path == path) {
-                    selected.insert(index);
-                }
-            }
+            selected.extend(
+                selected_paths
+                    .iter()
+                    .filter_map(|path| place.get(path.as_path()).copied()),
+            );
             self.ivars()
                 .focus
-                .set(focus_path.and_then(|p| visible.iter().position(|f| f.path == p)));
+                .set(focus_path.and_then(|p| place.get(p.as_path()).copied()));
             // The anchor is the other end of a shift-selection, so it
             // keeps its own file rather than snapping to the focus.
             self.ivars().anchor.set(
                 anchor_path
-                    .and_then(|p| visible.iter().position(|f| f.path == p))
+                    .and_then(|p| place.get(p.as_path()).copied())
                     .or_else(|| self.ivars().focus.get()),
             );
             *self.ivars().files.borrow_mut() = visible;
@@ -751,17 +758,19 @@ impl GridView {
         // Where the focus was, in case the focused file is one of
         // the ones going.
         let focus_index = self.ivars().focus.get();
-        let mut removed = 0;
-        {
+        let going: HashSet<&PathBuf> = paths.iter().collect();
+        let removed = {
             let mut all = self.ivars().all.borrow_mut();
+            let before = all.len();
+            all.retain(|f| !going.contains(&f.path));
+            before - all.len()
+        };
+        if removed > 0 {
+            let mut thumbs = self.ivars().thumbs.borrow_mut();
+            let mut requested = self.ivars().requested.borrow_mut();
             for path in paths {
-                let Some(index) = all.iter().position(|f| &f.path == path) else {
-                    continue;
-                };
-                all.remove(index);
-                removed += 1;
-                self.ivars().thumbs.borrow_mut().remove(path);
-                self.ivars().requested.borrow_mut().remove(path);
+                thumbs.remove(path);
+                requested.remove(path);
             }
         }
         if removed == 0 {
