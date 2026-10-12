@@ -17,16 +17,18 @@ use objc2_image_io::{
     kCGImagePropertyGIFDelayTime, kCGImagePropertyGIFDictionary,
     kCGImagePropertyGIFUnclampedDelayTime, kCGImagePropertyGPSDictionary,
     kCGImagePropertyGPSLatitude, kCGImagePropertyGPSLatitudeRef, kCGImagePropertyGPSLongitude,
-    kCGImagePropertyGPSLongitudeRef, kCGImagePropertyPixelHeight, kCGImagePropertyPixelWidth,
-    kCGImagePropertyProfileName, kCGImagePropertyTIFFDictionary, kCGImagePropertyTIFFMake,
-    kCGImagePropertyTIFFModel, kCGImagePropertyWebPDelayTime, kCGImagePropertyWebPDictionary,
-    kCGImageSourceCreateThumbnailFromImageAlways, kCGImageSourceCreateThumbnailFromImageIfAbsent,
-    kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceThumbnailMaxPixelSize, CGImageSource,
+    kCGImagePropertyGPSLongitudeRef, kCGImagePropertyOrientation, kCGImagePropertyPixelHeight,
+    kCGImagePropertyPixelWidth, kCGImagePropertyProfileName, kCGImagePropertyTIFFDictionary,
+    kCGImagePropertyTIFFMake, kCGImagePropertyTIFFModel, kCGImagePropertyWebPDelayTime,
+    kCGImagePropertyWebPDictionary, kCGImageSourceCreateThumbnailFromImageAlways,
+    kCGImageSourceCreateThumbnailFromImageIfAbsent, kCGImageSourceCreateThumbnailWithTransform,
+    kCGImageSourceThumbnailMaxPixelSize, CGImageSource,
 };
 use wene_core::ImageDecoder;
 
-/// Pixel dimensions from the file header, no decode. Cheap enough
-/// for a synchronous main-thread call on one selected file.
+/// Pixel dimensions from the file header, no decode, as the image
+/// is shown. Cheap enough for a synchronous main-thread call on one
+/// selected file.
 pub fn image_dimensions(path: &Path) -> Option<(i64, i64)> {
     let url = CFURL::from_file_path(path)?;
     unsafe {
@@ -34,17 +36,25 @@ pub fn image_dimensions(path: &Path) -> Option<(i64, i64)> {
         let props = src.properties_at_index(src.primary_image_index(), None)?;
         // The header dictionary is untyped; its keys are CFStrings.
         let props: CFRetained<CFDictionary<CFString, CFType>> = CFRetained::cast_unchecked(props);
-        let dim = |key: &CFString| -> Option<i64> {
-            props
-                .get(key)
-                .and_then(|v| v.downcast::<CFNumber>().ok())
-                .and_then(|n| n.as_i64())
-        };
-        Some((
-            dim(kCGImagePropertyPixelWidth)?,
-            dim(kCGImagePropertyPixelHeight)?,
-        ))
+        shown_dimensions(&props)
     }
+}
+
+/// Width and height as the image is shown. The header stores them as
+/// the sensor wrote them, and EXIF orientations 5 to 8 turn the image
+/// on its side. Every decode here applies the orientation, so a
+/// portrait phone photo stored as landscape must swap them.
+fn shown_dimensions(props: &CFDictionary<CFString, CFType>) -> Option<(i64, i64)> {
+    let width = number(props, unsafe { kCGImagePropertyPixelWidth })?.as_i64()?;
+    let height = number(props, unsafe { kCGImagePropertyPixelHeight })?.as_i64()?;
+    let on_its_side = number(props, unsafe { kCGImagePropertyOrientation })
+        .and_then(|n| n.as_i64())
+        .is_some_and(|orientation| (5..=8).contains(&orientation));
+    Some(if on_its_side {
+        (height, width)
+    } else {
+        (width, height)
+    })
 }
 
 /// Everything the file header can say about one image, as ordered
@@ -64,9 +74,7 @@ pub fn image_info(path: &Path) -> Vec<(String, String)> {
         };
         let props: CFRetained<CFDictionary<CFString, CFType>> = CFRetained::cast_unchecked(props);
 
-        let width = number(&props, kCGImagePropertyPixelWidth).and_then(|n| n.as_i64());
-        let height = number(&props, kCGImagePropertyPixelHeight).and_then(|n| n.as_i64());
-        if let (Some(width), Some(height)) = (width, height) {
+        if let Some((width, height)) = shown_dimensions(&props) {
             rows.push(("Dimensions".into(), format!("{width} × {height}")));
         }
         if let Some(model) = text(&props, kCGImagePropertyColorModel) {
@@ -334,6 +342,25 @@ mod tests {
         assert!(ImageIoDecoder
             .decode_frames(std::path::Path::new("/x/a.jpg"))
             .is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_photo_on_its_side_reports_its_shown_size() {
+        // Stored 4 wide and 2 high, with EXIF orientation 6: shown
+        // 2 wide and 4 high.
+        let path = std::env::temp_dir().join("wene-rotated-selfcheck.jpg");
+        std::fs::write(&path, include_bytes!("../testdata/rotated-6.jpg")).unwrap();
+
+        assert_eq!(image_dimensions(&path), Some((2, 4)));
+        let decoded = ImageIoDecoder.decode(&path, 100).expect("jpeg decodes");
+        assert_eq!(
+            (
+                CGImage::width(Some(&decoded)),
+                CGImage::height(Some(&decoded))
+            ),
+            (2, 4)
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
