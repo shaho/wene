@@ -291,9 +291,7 @@ impl Sidebar {
         delegate: &Retained<AppDelegate>,
     ) -> (Retained<Self>, Retained<NSScrollView>) {
         let favorites = load_favorites();
-        let mut nodes = Vec::new();
-        nodes.push(section_node("Favorites"));
-        nodes.push(section_node("Local"));
+        let nodes = vec![section_node("Favorites"), section_node("Local")];
 
         let this = Self::alloc(mtm).set_ivars(SidebarIvars {
             nodes: RefCell::new(nodes),

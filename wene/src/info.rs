@@ -175,7 +175,7 @@ fn build_info_window(mtm: MainThreadMarker) -> (Retained<NSWindow>, Retained<NST
     };
     window.setTitle(ns_string!("Info"));
     unsafe { window.setReleasedWhenClosed(false) };
-    window.setLevel(objc2_app_kit::NSFloatingWindowLevel as isize);
+    window.setLevel(objc2_app_kit::NSFloatingWindowLevel);
 
     let label = NSTextField::labelWithString(ns_string!(""), mtm);
     label.setSelectable(true);

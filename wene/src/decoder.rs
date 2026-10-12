@@ -331,6 +331,42 @@ pub fn is_animated_ext(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Per-frame delay in seconds. GIF prefers the unclamped value;
+/// zero/absent falls back to the 0.1 s browsers use.
+fn frame_delay(src: &CGImageSource, index: usize) -> f64 {
+    let delay = unsafe {
+        let props = src.properties_at_index(index, None);
+        props.and_then(|props| {
+            let props: CFRetained<CFDictionary<CFString, CFType>> =
+                CFRetained::cast_unchecked(props);
+            let number = |dict: &CFDictionary<CFString, CFType>, key: &CFString| {
+                dict.get(key)
+                    .and_then(|v| v.downcast::<CFNumber>().ok())
+                    .and_then(|n| n.as_f64())
+            };
+            let sub = |key: &'static CFString| {
+                props
+                    .get(key)
+                    .and_then(|v| v.downcast::<CFDictionary>().ok())
+                    .map(|d| CFRetained::cast_unchecked::<CFDictionary<CFString, CFType>>(d))
+            };
+            if let Some(gif) = sub(kCGImagePropertyGIFDictionary) {
+                number(&gif, kCGImagePropertyGIFUnclampedDelayTime)
+                    .filter(|&d| d > 0.0)
+                    .or_else(|| number(&gif, kCGImagePropertyGIFDelayTime))
+            } else if let Some(webp) = sub(kCGImagePropertyWebPDictionary) {
+                number(&webp, kCGImagePropertyWebPDelayTime)
+            } else {
+                None
+            }
+        })
+    };
+    match delay {
+        Some(d) if d > 0.011 => d,
+        _ => 0.1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,41 +404,5 @@ mod tests {
             (2, 4)
         );
         let _ = std::fs::remove_file(&path);
-    }
-}
-
-/// Per-frame delay in seconds. GIF prefers the unclamped value;
-/// zero/absent falls back to the 0.1 s browsers use.
-fn frame_delay(src: &CGImageSource, index: usize) -> f64 {
-    let delay = unsafe {
-        let props = src.properties_at_index(index, None);
-        props.and_then(|props| {
-            let props: CFRetained<CFDictionary<CFString, CFType>> =
-                CFRetained::cast_unchecked(props);
-            let number = |dict: &CFDictionary<CFString, CFType>, key: &CFString| {
-                dict.get(key)
-                    .and_then(|v| v.downcast::<CFNumber>().ok())
-                    .and_then(|n| n.as_f64())
-            };
-            let sub = |key: &'static CFString| {
-                props
-                    .get(key)
-                    .and_then(|v| v.downcast::<CFDictionary>().ok())
-                    .map(|d| CFRetained::cast_unchecked::<CFDictionary<CFString, CFType>>(d))
-            };
-            if let Some(gif) = sub(kCGImagePropertyGIFDictionary) {
-                number(&gif, kCGImagePropertyGIFUnclampedDelayTime)
-                    .filter(|&d| d > 0.0)
-                    .or_else(|| number(&gif, kCGImagePropertyGIFDelayTime))
-            } else if let Some(webp) = sub(kCGImagePropertyWebPDictionary) {
-                number(&webp, kCGImagePropertyWebPDelayTime)
-            } else {
-                None
-            }
-        })
-    };
-    match delay {
-        Some(d) if d > 0.011 => d,
-        _ => 0.1,
     }
 }

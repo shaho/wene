@@ -629,9 +629,7 @@ pub fn zoom_decode_request(
 /// EXIF carries no time zone; the value is treated as UTC, which
 /// keeps the ordering consistent.
 pub fn parse_exif_datetime(s: &str) -> Option<SystemTime> {
-    let mut it = s
-        .split(|c: char| c == ':' || c == ' ')
-        .map(|part| part.trim().parse::<i64>());
+    let mut it = s.split([':', ' ']).map(|part| part.trim().parse::<i64>());
     let mut next = || it.next()?.ok();
     let (y, mo, d) = (next()?, next()?, next()?);
     let (h, mi, se) = (next()?, next()?, next()?);
@@ -781,13 +779,13 @@ mod tests {
             b.exif_date = parse_exif_datetime("1970:01:02 00:00:00"); // day 1
             b
         };
-        let mut files = vec![a.clone(), b.clone()];
+        let mut files = [a.clone(), b.clone()];
         files.sort_by(|x, y| file_info_cmp(x, y, SortOrder::ExifDate, false));
         // b's EXIF day 1 sorts before a's modified day 3.
         assert_eq!(files[0].path, b.path);
 
         a.added = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(20 * day));
-        let mut files = vec![a.clone(), b.clone()];
+        let mut files = [a.clone(), b.clone()];
         files.sort_by(|x, y| file_info_cmp(x, y, SortOrder::Added, false));
         // a added day 20 vs b's modified fallback day 9.
         assert_eq!(files[0].path, b.path);

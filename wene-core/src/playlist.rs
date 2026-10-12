@@ -231,6 +231,7 @@ impl Playlist {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn playlist(n: usize) -> Playlist {
         Playlist::new(
@@ -241,7 +242,7 @@ mod tests {
         )
     }
 
-    fn name(p: &PathBuf) -> String {
+    fn name(p: &Path) -> String {
         p.file_name().unwrap().to_string_lossy().into_owned()
     }
 
@@ -291,7 +292,7 @@ mod tests {
         pl.step(1); // current = 2.jpg
         pl.set_shuffled(true);
         assert_eq!(name(pl.current().unwrap()), "2.jpg"); // plays first
-        let mut seen = vec![false; 10];
+        let mut seen = [false; 10];
         seen[pl.current_index()] = true;
         while pl.step(1) {
             seen[pl.current_index()] = true;
@@ -337,10 +338,6 @@ mod tests {
             .unwrap();
         pl.remove(&PathBuf::from(format!("/f/{victim}")));
         assert_eq!(name(pl.current().unwrap()), current);
-        let mut seen = vec![name(pl.current().unwrap())];
-        while pl.step(1) {
-            seen.push(name(pl.current().unwrap()));
-        }
         pl.jump_first();
         // All remaining 5 files reachable, none repeated.
         let mut all: Vec<String> = (0..6)
@@ -354,7 +351,6 @@ mod tests {
         from_start.sort();
         all.sort();
         assert_eq!(from_start, all);
-        let _ = seen;
     }
 
     #[test]

@@ -168,7 +168,7 @@ impl AppDelegate {
         }
     }
 
-    /// cmd-Z and shift-cmd-Z.    /// cmd-Z and shift-cmd-Z. Undo reverses the last batch; redo
+    /// cmd-Z and shift-cmd-Z. Undo reverses the last batch; redo
     /// performs it again. Both end in the same place: a list of files
     /// to move, and a batch recorded on the other stack.
     pub(crate) fn take_back(&self, undoing: bool) {

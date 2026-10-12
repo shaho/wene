@@ -12,23 +12,13 @@ use objc2_foundation::NSDictionary;
 
 use crate::*;
 
+#[derive(Default)]
 pub struct E2eState {
     pub step: usize,
     pub failures: Vec<String>,
     pub started: bool,
     /// Ticks the current step has waited, for `hold`.
     held: u32,
-}
-
-impl Default for E2eState {
-    fn default() -> Self {
-        E2eState {
-            step: 0,
-            failures: Vec::new(),
-            started: false,
-            held: 0,
-        }
-    }
 }
 
 /// Minimal 1×1 two-frame animated GIF (black frame, white frame,
@@ -1863,7 +1853,7 @@ impl AppDelegate {
             for item in menu.itemArray() {
                 let key = item.keyEquivalent().to_string();
                 if !key.is_empty() {
-                    let mask = item.keyEquivalentModifierMask().bits() as usize;
+                    let mask = item.keyEquivalentModifierMask().bits();
                     let title = item.title().to_string();
                     match seen.get(&(key.clone(), mask)) {
                         // The same entry twice is one shortcut, not a

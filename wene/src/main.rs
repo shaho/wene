@@ -697,10 +697,6 @@ impl AppDelegate {
         unsafe { msg_send![super(this), init] }
     }
 
-    fn mtm(&self) -> MainThreadMarker {
-        MainThreadMarker::new().expect("delegate methods run on the main thread")
-    }
-
     fn handle_event(&self, event: Event<Img>) {
         // The grid was reset for the new folder already.
         if self.ivars().engine.get().unwrap().is_stale(&event) {
@@ -742,8 +738,7 @@ impl AppDelegate {
                     self.show_current();
                 }
             }
-            Event::ScanDone { total, .. } => {
-                println!("scan done: {total} images");
+            Event::ScanDone { .. } => {
                 // Their own folder has finished scanning and they
                 // are still not there: the files are gone from disk,
                 // so stop waiting for them. A scan of any other
@@ -1080,11 +1075,11 @@ fn main() {
         },
     );
     let _ = delegate.ivars().engine.set(engine);
-    EVENTS.set(Mutex::new(rx)).ok().expect("EVENTS set once");
-    DELEGATE
-        .set(MainThreadBound::new(delegate, mtm))
-        .ok()
-        .expect("DELEGATE set once");
+    assert!(EVENTS.set(Mutex::new(rx)).is_ok(), "EVENTS set once");
+    assert!(
+        DELEGATE.set(MainThreadBound::new(delegate, mtm)).is_ok(),
+        "DELEGATE set once"
+    );
 
     window.makeKeyAndOrderFront(None);
     #[allow(deprecated)]
