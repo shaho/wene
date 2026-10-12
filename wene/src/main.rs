@@ -42,7 +42,7 @@ use objc2_foundation::{
     ns_string, NSArray, NSNotification, NSObject, NSObjectProtocol, NSRect, NSString, NSTimer,
     NSUserDefaults, NSURL,
 };
-use wene_core::history::{Entry, History, Step};
+use wene_core::history::{Entry, History, Reversal, Step};
 use wene_core::messages::{folder_label, format_bytes, transfer_message, trash_message};
 use wene_core::transfer::{self, Transfer};
 use wene_core::{Engine, Event, LruCache, Playlist, SortOrder};

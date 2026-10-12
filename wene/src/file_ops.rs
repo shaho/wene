@@ -185,22 +185,12 @@ impl AppDelegate {
         };
         let Some(entry) = entry else { return };
 
-        let (moves, next_step) = match (&entry.step, undoing) {
-            // Undoing a move or a cull walks the files back.
-            (Step::Moved(items), true) => (
-                items
-                    .iter()
-                    .map(|(from, to)| (to.clone(), from.clone()))
-                    .collect::<Vec<_>>(),
-                Step::Moved(items.clone()),
-            ),
-            // Redoing one walks them forward again.
-            (Step::Moved(items), false) => (items.clone(), Step::Moved(items.clone())),
-            // Undoing a copy trashes the copies. Where they land in
-            // the trash becomes the way back, so a redo can fetch
-            // them out again.
-            (Step::Copied(copies), true) => {
-                let trashed = trash::move_to_trash(copies);
+        let (moves, next_step) = match entry.step.reversal(undoing) {
+            Reversal::Move { moves, then } => (moves, then),
+            // Where the copies land in the trash becomes the way back,
+            // so a redo can fetch them out again.
+            Reversal::Trash(copies) => {
+                let trashed = trash::move_to_trash(&copies);
                 let back: Vec<(PathBuf, PathBuf)> = trashed
                     .moved
                     .iter()
@@ -212,9 +202,6 @@ impl AppDelegate {
                 self.after_take_back(&gone, &[], entry.label.clone(), Step::Moved(back), undoing);
                 return;
             }
-            // A copy is never redone by copying again: the files are
-            // sitting in the trash, so they are fetched back.
-            (Step::Copied(copies), false) => (Vec::new(), Step::Copied(copies.clone())),
         };
 
         let mut arrived: Vec<PathBuf> = Vec::new();

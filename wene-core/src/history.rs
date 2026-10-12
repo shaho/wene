@@ -29,6 +29,47 @@ impl Step {
             Step::Copied(items) => items.is_empty(),
         }
     }
+
+    /// What undoing (`undoing`) or redoing this batch does on disk.
+    pub fn reversal(&self, undoing: bool) -> Reversal {
+        match (self, undoing) {
+            // Undoing a move or a cull walks the files back.
+            (Step::Moved(items), true) => Reversal::Move {
+                moves: items
+                    .iter()
+                    .map(|(from, to)| (to.clone(), from.clone()))
+                    .collect(),
+                then: self.clone(),
+            },
+            // Redoing one walks them forward again.
+            (Step::Moved(items), false) => Reversal::Move {
+                moves: items.clone(),
+                then: self.clone(),
+            },
+            // Undoing a copy trashes the copies.
+            (Step::Copied(copies), true) => Reversal::Trash(copies.clone()),
+            // A copy is never redone by copying again: an undone copy
+            // sits in the trash as a move, so its redo is that move.
+            (Step::Copied(_), false) => Reversal::Move {
+                moves: Vec::new(),
+                then: self.clone(),
+            },
+        }
+    }
+}
+
+/// How a batch is taken back or done again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reversal {
+    /// Move each file from the first path to the second. `then` is the
+    /// batch as the other stack keeps it afterwards.
+    Move {
+        moves: Vec<(PathBuf, PathBuf)>,
+        then: Step,
+    },
+    /// Trash these copies. Where they land in the trash is the way
+    /// back, so the caller records that as a move.
+    Trash(Vec<PathBuf>),
 }
 
 /// One batch with the name the menu shows for it.
@@ -151,6 +192,48 @@ mod tests {
         history.record("copy", Step::Copied(Vec::new()));
         assert!(!history.can_undo());
         assert_eq!(history.undo_title(), "Undo");
+    }
+
+    #[test]
+    fn a_move_is_undone_backwards_and_redone_forwards() {
+        let step = Step::Moved(vec![
+            (PathBuf::from("/a/x.heic"), PathBuf::from("/b/x.heic")),
+            (PathBuf::from("/a/y.heic"), PathBuf::from("/b/y 2.heic")),
+        ]);
+        assert_eq!(
+            step.reversal(true),
+            Reversal::Move {
+                moves: vec![
+                    (PathBuf::from("/b/x.heic"), PathBuf::from("/a/x.heic")),
+                    (PathBuf::from("/b/y 2.heic"), PathBuf::from("/a/y.heic")),
+                ],
+                then: step.clone(),
+            }
+        );
+        let Step::Moved(items) = &step else {
+            unreachable!()
+        };
+        assert_eq!(
+            step.reversal(false),
+            Reversal::Move {
+                moves: items.clone(),
+                then: step.clone(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_copy_is_undone_by_the_trash() {
+        let copies = vec![PathBuf::from("/b/x.heic")];
+        let step = Step::Copied(copies.clone());
+        assert_eq!(step.reversal(true), Reversal::Trash(copies));
+        assert_eq!(
+            step.reversal(false),
+            Reversal::Move {
+                moves: Vec::new(),
+                then: step.clone(),
+            }
+        );
     }
 
     #[test]
