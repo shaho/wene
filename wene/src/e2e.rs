@@ -1617,6 +1617,39 @@ pub fn run_step(delegate: &AppDelegate) {
                 "both start items come back after the slideshow",
             );
         }
+        84 => {
+            // A pan or a pinch redraws the overlay on every event. The
+            // file header is read once, not once per event.
+            delegate.start_slideshow(0, false);
+            delegate.e2e_toggle_exif_overlay();
+        }
+        85 => {
+            if !delegate.e2e_slide_has_image() && hold(state, 4) {
+                return;
+            }
+            let Some(view) = delegate.e2e_slide_view() else {
+                check(state, false, "slide view for the header test");
+                return;
+            };
+            let before = delegate.e2e_header_reads();
+            for zoom in [1.5, 2.0, 3.0, 1.5, 2.0] {
+                view.zoom_to(zoom, None);
+            }
+            check(
+                state,
+                delegate.e2e_header_reads() == before,
+                "zooming does not read the file header again",
+            );
+            check(
+                state,
+                delegate
+                    .e2e_overlay_text()
+                    .is_some_and(|text| text.contains("Dimensions")),
+                "the EXIF block is still on the overlay",
+            );
+            delegate.e2e_toggle_exif_overlay();
+            delegate.end_slideshow();
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {

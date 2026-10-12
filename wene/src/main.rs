@@ -43,6 +43,9 @@ use sidebar::Sidebar;
 use slideshow::{SlideState, SlideView, SlideshowWindow};
 
 type Img = CFRetained<CGImage>;
+/// Label and value pairs from a file header, as the info panel and
+/// the overlay show them.
+type HeaderRows = Vec<(String, String)>;
 
 /// Slide memory budget: roughly 15 retina-screen slides, so stepping
 /// back through recent history never re-decodes.
@@ -137,6 +140,12 @@ pub struct DelegateIvars {
     /// full path (p).
     overlay_exif: Cell<bool>,
     overlay_path: Cell<bool>,
+    /// The last file's header rows. A pan or a pinch redraws the
+    /// overlay and the info panel on every event, and the file has
+    /// not changed, so neither reads it again.
+    header_rows: RefCell<Option<(PathBuf, HeaderRows)>>,
+    /// How many times a header was read from disk, for the harness.
+    header_reads: Cell<usize>,
     /// The cheat sheet (h or ?), which takes the overlay over while
     /// it is up.
     overlay_help: Cell<bool>,
@@ -654,6 +663,8 @@ impl AppDelegate {
             overlay_visible: Cell::new(false),
             overlay_exif: Cell::new(false),
             overlay_path: Cell::new(false),
+            header_rows: RefCell::new(None),
+            header_reads: Cell::new(0),
             overlay_help: Cell::new(false),
             status: OnceCell::new(),
             loop_item: OnceCell::new(),
@@ -1699,7 +1710,7 @@ impl AppDelegate {
                         rows.push(("Modified".to_owned(), date_text(modified)));
                     }
                 }
-                rows.extend(decoder::image_info(path));
+                rows.extend(self.header_rows(path));
                 if let Some(folder) = path.parent() {
                     rows.push(("Folder".to_owned(), folder.to_string_lossy().into_owned()));
                 }
@@ -2430,6 +2441,26 @@ impl AppDelegate {
         window.setTitle(&NSString::from_str(&name));
     }
 
+    /// The header rows of one file, read once until another file asks
+    /// or this one changes on disk.
+    fn header_rows(&self, path: &Path) -> HeaderRows {
+        if let Some((cached, rows)) = self.ivars().header_rows.borrow().as_ref() {
+            if cached == path {
+                return rows.clone();
+            }
+        }
+        let rows = decoder::image_info(path);
+        self.ivars()
+            .header_reads
+            .set(self.ivars().header_reads.get() + 1);
+        *self.ivars().header_rows.borrow_mut() = Some((path.to_path_buf(), rows.clone()));
+        rows
+    }
+
+    pub fn e2e_header_reads(&self) -> usize {
+        self.ivars().header_reads.get()
+    }
+
     /// The usual line, plus whatever extra blocks are switched on.
     fn with_overlay_extras(&self, line: String) -> String {
         let want_exif = self.ivars().overlay_exif.get();
@@ -2452,7 +2483,7 @@ impl AppDelegate {
             text.push_str(&path.to_string_lossy());
         }
         if want_exif {
-            let rows = decoder::image_info(&path);
+            let rows = self.header_rows(&path);
             if rows.is_empty() {
                 text.push_str("\nNo EXIF in this file.");
             } else {
@@ -3061,6 +3092,13 @@ impl AppDelegate {
                 self.drop_from_slideshow(&paths);
             }
             Event::FileChanged { info, .. } => {
+                let stale = matches!(
+                    self.ivars().header_rows.borrow().as_ref(),
+                    Some((cached, _)) if *cached == info.path
+                );
+                if stale {
+                    *self.ivars().header_rows.borrow_mut() = None;
+                }
                 let grid = self.ivars().grid.get().unwrap();
                 grid.invalidate_thumb(&info.path);
                 let is_current = {
