@@ -47,10 +47,10 @@ GIFs.
 ### Opening from Finder
 
 Once the app is on your disk, wêne shows up under "Open with" for JPEG, PNG,
-HEIC, HEIF, GIF, WebP, TIFF, BMP, AVIF, and JPEG XL, and Get Info ▸ Open with
-▸ Change All makes it the default. Opening an image shows it full screen,
-with the rest of its folder behind it as the slideshow; opening a folder shows
-that folder's grid.
+HEIC, HEIF, GIF, WebP, TIFF, BMP, AVIF, and JPEG XL, and Get Info ▸ Open with ▸
+Change All makes it the default. Opening an image shows it full screen, with the
+rest of its folder behind it as the slideshow; opening a folder shows that
+folder's grid.
 
 ## Run it
 
@@ -108,6 +108,7 @@ The first line builds the folder the harness expects: four images whose names,
 sizes and dates it asserts on, made from the app icon with `sips`. Keep the
 fixture out of the Desktop and out of `/tmp` — an unsigned binary is refused
 files under the Desktop, and the folder watcher never reports a change under
-`/tmp`. The script refuses both for you.
+`/tmp`. The script refuses both for you. It also refuses a folder that already
+exists unless the script built it, since it deletes the folder before it builds.
 
 It exits 0 with a report, or 1 listing what failed.

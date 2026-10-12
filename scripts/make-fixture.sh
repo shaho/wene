@@ -8,8 +8,14 @@
 #   WENE_E2E=1 cargo run -p wene -- ~/wene-e2e-fixture
 set -eu
 
-cd "$(dirname "$0")/.."
 FIXTURE=${1:-$HOME/wene-e2e-fixture}
+# A relative folder means relative to where the script was run, so it
+# is made absolute before the cd below changes that.
+case "$FIXTURE" in
+  /*) ;;
+  *) FIXTURE=$PWD/$FIXTURE ;;
+esac
+cd "$(dirname "$0")/.."
 
 # Two places break the harness for reasons that have nothing to do
 # with wene: under the Desktop an unsigned binary is refused the files
@@ -23,9 +29,18 @@ case "$FIXTURE" in
     ;;
 esac
 
+# The folder is deleted and built again, so it must be one this script
+# built. The marker says so; the scan skips it, like any hidden file.
+MARKER=.wene-fixture
+if [ -e "$FIXTURE" ] && [ ! -e "$FIXTURE/$MARKER" ]; then
+  echo "refusing $FIXTURE: it exists and this script did not build it" >&2
+  exit 1
+fi
+
 ICONS=branding/macos/AppIcon.appiconset
 rm -rf "$FIXTURE"
 mkdir -p "$FIXTURE"
+touch "$FIXTURE/$MARKER"
 
 # name order is apple, img1, img2, img10, and the sizes differ so the
 # size sort has something to sort.
