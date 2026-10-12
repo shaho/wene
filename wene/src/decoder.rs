@@ -22,7 +22,7 @@ use objc2_image_io::{
     kCGImagePropertyTIFFMake, kCGImagePropertyTIFFModel, kCGImagePropertyWebPDelayTime,
     kCGImagePropertyWebPDictionary, kCGImageSourceCreateThumbnailFromImageAlways,
     kCGImageSourceCreateThumbnailFromImageIfAbsent, kCGImageSourceCreateThumbnailWithTransform,
-    kCGImageSourceThumbnailMaxPixelSize, CGImageSource,
+    kCGImageSourceShouldCacheImmediately, kCGImageSourceThumbnailMaxPixelSize, CGImageSource,
 };
 use wene_core::ImageDecoder;
 
@@ -305,9 +305,15 @@ impl ImageDecoder for ImageIoDecoder {
             if (w as usize) * (h as usize) * 4 * count > FRAME_BUDGET_BYTES {
                 return None;
             }
+            // Decode each frame here, on the worker thread. Without
+            // this, a frame is decoded the first time it is drawn, on
+            // the main thread, once per frame of the animation.
+            let yes: &CFBoolean = CFBoolean::new(true);
+            let decode_now: CFRetained<CFDictionary<CFString, CFType>> =
+                CFDictionary::from_slices(&[kCGImageSourceShouldCacheImmediately], &[yes.as_ref()]);
             let mut frames = Vec::with_capacity(count);
             for index in 0..count {
-                let image = src.image_at_index(index, None)?;
+                let image = src.image_at_index(index, Some(decode_now.as_ref()))?;
                 frames.push((image, frame_delay(&src, index)));
             }
             Some(frames)
