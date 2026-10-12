@@ -52,6 +52,16 @@ Change All makes it the default. Opening an image shows it full screen, with the
 rest of its folder behind it as the slideshow; opening a folder shows that
 folder's grid.
 
+## Install it
+
+```bash
+brew install --cask shaho/wene/wene
+```
+
+The bundle is signed ad hoc, not with a Developer ID, and it is not notarized.
+So the first launch is refused. Open System Settings › Privacy & Security and
+press "Open anyway", once. Every launch after that is normal.
+
 ## Run it
 
 ```bash
@@ -71,15 +81,14 @@ To build the .app bundle in `target/wene.app`:
 ```
 
 To build a disk image, named after the version in `wene/Cargo.toml`
-(`target/wene-0.3.1.dmg` today):
+(`target/wene-0.3.43.dmg` today):
 
 ```bash
 ./scripts/make-dmg.sh
 ```
 
 Opening files from Finder needs the bundle, not `cargo run`: a bare binary has
-no Info.plist, so macOS never offers it. The bundle is signed ad hoc, not with a
-Developer ID, and it is not notarized.
+no Info.plist, so macOS never offers it.
 
 Needs macOS 11.5 or later and a Rust toolchain.
 
