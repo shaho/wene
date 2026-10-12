@@ -501,8 +501,10 @@ fn apply_fs_change<I>(
     if hidden {
         return;
     }
-    let meta = std::fs::metadata(path).ok();
-    let make_info = |meta: &std::fs::Metadata| {
+    // The dates come from the file header, a read from disk. It
+    // happens before the lock, so the walk, the watcher and the main
+    // thread never wait behind it.
+    let info = std::fs::metadata(path).ok().map(|meta| {
         let (exif_date, added) = dates(path);
         FileInfo {
             path: path.to_path_buf(),
@@ -511,24 +513,22 @@ fn apply_fs_change<I>(
             exif_date,
             added,
         }
-    };
+    });
     let event = {
         let mut sorted = files.lock().unwrap();
         if current.load(Ordering::SeqCst) != scan {
             return;
         }
         let existing = sorted.binary_search_by(|p| file_cmp(&p.path, path));
-        match (meta, existing) {
-            (Some(meta), Err(index)) => {
-                let info = make_info(&meta);
+        match (info, existing) {
+            (Some(info), Err(index)) => {
                 sorted.insert(index, info.clone());
                 Some(Event::FilesInserted {
                     scan,
                     files: vec![(index, info)],
                 })
             }
-            (Some(meta), Ok(index)) => {
-                let info = make_info(&meta);
+            (Some(info), Ok(index)) => {
                 sorted[index] = info.clone();
                 Some(Event::FileChanged { scan, info })
             }
@@ -806,6 +806,46 @@ mod tests {
             thread::sleep(std::time::Duration::from_millis(2));
             (None, None)
         }
+    }
+
+    /// Reads each file's dates very slowly.
+    struct SlowHeaders;
+
+    impl ImageDecoder for SlowHeaders {
+        type Image = ();
+        fn decode(&self, _path: &Path, _max_px: i32) -> Option<()> {
+            None
+        }
+        fn file_dates(&self, _path: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
+            thread::sleep(std::time::Duration::from_millis(400));
+            (None, None)
+        }
+    }
+
+    #[test]
+    fn a_header_read_does_not_hold_the_file_list() {
+        let root = std::env::temp_dir().join(format!("wene-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.jpg");
+        std::fs::write(&path, "").unwrap();
+        let (engine, _events) = Engine::start(SlowHeaders, 100, 100, || {});
+
+        let waited = thread::scope(|scope| {
+            scope.spawn(|| engine.notice(std::slice::from_ref(&path)));
+            // The notice is now inside its 400 ms header read.
+            thread::sleep(std::time::Duration::from_millis(100));
+            let start = std::time::Instant::now();
+            drop(engine.files.lock().unwrap());
+            start.elapsed()
+        });
+
+        assert!(
+            waited < std::time::Duration::from_millis(100),
+            "waited {waited:?}"
+        );
+        assert_eq!(engine.files.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
