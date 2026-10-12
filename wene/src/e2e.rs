@@ -1518,6 +1518,42 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             delegate.end_slideshow();
         }
+        82 => {
+            // A second slideshow takes the place of the first one.
+            delegate.start_slideshow(0, true);
+            delegate.start_slideshow(1, false);
+            check(
+                state,
+                delegate.e2e_slideshow_windows() == 1,
+                "a second slideshow leaves one slideshow window",
+            );
+            check(
+                state,
+                delegate.e2e_show_is_windowed() == Some(false)
+                    && delegate.e2e_current_index() == Some(1),
+                "the second slideshow is the one on screen",
+            );
+            check(
+                state,
+                !delegate.e2e_menu_enabled(objc2::sel!(startSlideshow:))
+                    && !delegate.e2e_menu_enabled(objc2::sel!(startSlideshowWindowed:)),
+                "both start items are grey during a slideshow",
+            );
+            delegate.end_slideshow();
+        }
+        83 => {
+            check(
+                state,
+                delegate.e2e_slideshow_windows() == 0,
+                "ending the slideshow leaves no slideshow window",
+            );
+            check(
+                state,
+                delegate.e2e_menu_enabled(objc2::sel!(startSlideshow:))
+                    && delegate.e2e_menu_enabled(objc2::sel!(startSlideshowWindowed:)),
+                "both start items come back after the slideshow",
+            );
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {

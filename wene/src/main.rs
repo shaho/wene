@@ -1799,6 +1799,10 @@ impl AppDelegate {
         if action == Some(sel!(selectAll:)) || action == Some(sel!(showFilter:)) {
             return !prefs_key && self.ivars().show.borrow().is_none();
         }
+        // One slideshow at a time.
+        if action == Some(sel!(startSlideshow:)) || action == Some(sel!(startSlideshowWindowed:)) {
+            return self.ivars().show.borrow().is_none();
+        }
         let acts_on_images = [
             sel!(moveToTrash:),
             sel!(revealInFinder:),
@@ -2030,6 +2034,10 @@ impl AppDelegate {
         if files.is_empty() {
             return;
         }
+        // One slideshow at a time. A second one on top would leave the
+        // first one's window and timer running, so the new one takes
+        // its place.
+        self.end_slideshow();
         let screen_frame = NSScreen::mainScreen(mtm)
             .map(|s| s.frame())
             .unwrap_or(NSRect::new(
@@ -2522,6 +2530,28 @@ impl AppDelegate {
 
     pub fn e2e_show_active(&self) -> bool {
         self.ivars().show.borrow().is_some()
+    }
+
+    /// How many slideshow windows are on screen.
+    pub fn e2e_slideshow_windows(&self) -> usize {
+        NSApplication::sharedApplication(self.mtm())
+            .windows()
+            .iter()
+            .filter(|window| window.isVisible() && window.isKindOfClass(SlideshowWindow::class()))
+            .count()
+    }
+
+    /// Whether the menu would enable an item with this action.
+    pub fn e2e_menu_enabled(&self, action: objc2::runtime::Sel) -> bool {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(self.mtm()),
+                ns_string!(""),
+                Some(action),
+                ns_string!(""),
+            )
+        };
+        self.menu_item_enabled(&item)
     }
 
     pub fn e2e_current_index(&self) -> Option<usize> {
