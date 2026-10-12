@@ -220,6 +220,18 @@ define_class!(
             NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
         }
 
+        // Pinch on the trackpad: zoom around the fingers, the way
+        // every other viewer does it.
+        #[unsafe(method(magnifyWithEvent:))]
+        fn magnify(&self, event: &NSEvent) {
+            let image = self.ivars().image.borrow().clone();
+            let Some(image) = image else { return };
+            let bounds = self.bounds();
+            let current = self.effective_scale(image.size(), bounds.size);
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            self.zoom_to(current * (1.0 + event.magnification()), Some(point));
+        }
+
         // The wheel steps slides while the image fits, and pans it
         // once it is zoomed in, where panning is what a wheel is for.
         #[unsafe(method(scrollWheel:))]
@@ -309,7 +321,7 @@ define_class!(
                 }
                 "+" => self.zoom_step(1),
                 "-" => self.zoom_step(-1),
-                "=" => self.set_zoom(Some(1.0)),
+                "=" => self.zoom_to(1.0, self.pointer()),
                 "*" => {
                     self.apply_state(SlideState::default());
                     self.notify_state_change();
@@ -340,30 +352,33 @@ impl SlideView {
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
-    fn effective_scale(&self, image: CGSize, bounds: CGSize) -> f64 {
+    /// The scale that fits the image in the view. A small image
+    /// stays at its own size unless the preference says to fill the
+    /// screen with it.
+    fn fit_scale(&self, image: CGSize, bounds: CGSize) -> f64 {
         // A quarter-turned image fits by its swapped dimensions.
         let (iw, ih) = if self.ivars().rotation.get() % 180 == 90 {
             (image.height, image.width)
         } else {
             (image.width, image.height)
         };
+        let fit = (bounds.width / iw).min(bounds.height / ih);
+        let scales_up = self
+            .ivars()
+            .delegate
+            .get()
+            .is_some_and(|delegate| delegate.scales_small_images_up());
+        if scales_up {
+            fit
+        } else {
+            fit.min(1.0)
+        }
+    }
+
+    fn effective_scale(&self, image: CGSize, bounds: CGSize) -> f64 {
         match self.ivars().zoom.get() {
             Some(zoom) => zoom,
-            None => {
-                let fit = (bounds.width / iw).min(bounds.height / ih);
-                // A small image is shown at its own size unless the
-                // preference says to fill the screen with it.
-                let scales_up = self
-                    .ivars()
-                    .delegate
-                    .get()
-                    .is_some_and(|delegate| delegate.scales_small_images_up());
-                if scales_up {
-                    fit
-                } else {
-                    fit.min(1.0)
-                }
-            }
+            None => self.fit_scale(image, bounds),
         }
     }
 
@@ -418,9 +433,57 @@ impl SlideView {
         self.notify_state_change();
     }
 
+    /// Zoom to `next`, holding the image point under `anchor` still.
+    /// The anchor is in view coordinates; None holds the view centre.
+    /// Zooming back to the fitting scale drops to fit, which also
+    /// puts the pan back, so a pinch out lands where the slide
+    /// started instead of in a corner.
+    pub fn zoom_to(&self, next: f64, anchor: Option<CGPoint>) {
+        let image = self.ivars().image.borrow().clone();
+        let Some(image) = image else { return };
+        let bounds = self.bounds();
+        let current = self.effective_scale(image.size(), bounds.size);
+        if current <= 0.0 {
+            return;
+        }
+        let next = next.clamp(ZOOM_LADDER[0], ZOOM_LADDER[ZOOM_LADDER.len() - 1]);
+        if next <= self.fit_scale(image.size(), bounds.size) {
+            self.set_zoom(None);
+            return;
+        }
+        // The image point under the anchor stays under it when the
+        // pan moves by the same factor the scale grew by.
+        let factor = next / current;
+        let (ax, ay) = match anchor {
+            Some(point) => (
+                point.x - (bounds.origin.x + bounds.size.width / 2.0),
+                point.y - (bounds.origin.y + bounds.size.height / 2.0),
+            ),
+            None => (0.0, 0.0),
+        };
+        let (dx, dy) = self.ivars().offset.get();
+        self.ivars()
+            .offset
+            .set((ax * (1.0 - factor) + factor * dx, ay * (1.0 - factor) + factor * dy));
+        self.ivars().zoom.set(Some(next));
+        self.notify_state_change();
+    }
+
+    /// Where the pointer is in this view, when it is over the view.
+    fn pointer(&self) -> Option<CGPoint> {
+        let window = self.window()?;
+        let point = self.convertPoint_fromView(window.mouseLocationOutsideOfEventStream(), None);
+        let bounds = self.bounds();
+        let inside = point.x >= bounds.origin.x
+            && point.y >= bounds.origin.y
+            && point.x <= bounds.origin.x + bounds.size.width
+            && point.y <= bounds.origin.y + bounds.size.height;
+        inside.then_some(point)
+    }
+
     fn zoom_step(&self, direction: i32) {
-        let image = self.ivars().image.borrow();
-        let Some(image) = image.as_ref() else { return };
+        let image = self.ivars().image.borrow().clone();
+        let Some(image) = image else { return };
         let current = self.effective_scale(image.size(), self.bounds().size);
         let next = if direction > 0 {
             ZOOM_LADDER
@@ -436,8 +499,7 @@ impl SlideView {
                 .copied()
                 .unwrap_or(*ZOOM_LADDER.first().unwrap())
         };
-        self.ivars().zoom.set(Some(next));
-        self.notify_state_change();
+        self.zoom_to(next, self.pointer());
     }
 
     pub fn has_image(&self) -> bool {

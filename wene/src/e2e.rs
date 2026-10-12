@@ -16,6 +16,8 @@ pub struct E2eState {
     pub step: usize,
     pub failures: Vec<String>,
     pub started: bool,
+    /// Ticks the current step has waited, for `hold`.
+    held: u32,
 }
 
 impl Default for E2eState {
@@ -24,6 +26,7 @@ impl Default for E2eState {
             step: 0,
             failures: Vec::new(),
             started: false,
+            held: 0,
         }
     }
 }
@@ -45,6 +48,18 @@ pub const ANIMATED_GIF: &[u8] = &[
 
 pub fn enabled() -> bool {
     std::env::var("WENE_E2E").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Let a step wait for something the app does not control, such as
+/// the folder watcher, instead of failing on the first tick. True
+/// while tries are left, and the step runs again on the next tick.
+fn hold(state: &RefCell<E2eState>, tries: u32) -> bool {
+    let mut state = state.borrow_mut();
+    if state.held < tries {
+        state.held += 1;
+        return true;
+    }
+    false
 }
 
 fn check(state: &RefCell<E2eState>, ok: bool, what: &str) {
@@ -338,6 +353,32 @@ pub fn run_step(delegate: &AppDelegate) {
                 "window has a title bar",
             );
             check(state, delegate.e2e_slide_has_image(), "windowed slide shown");
+            // Zoom holds the image point under the anchor. Anchored
+            // a quarter-width right of the centre, doubling the scale
+            // from fit has to pull the pan left by that same quarter.
+            if let Some(view) = delegate.e2e_slide_view() {
+                let bounds = view.bounds();
+                let (cx, cy) = (
+                    bounds.origin.x + bounds.size.width / 2.0,
+                    bounds.origin.y + bounds.size.height / 2.0,
+                );
+                let step = bounds.size.width / 4.0;
+                let fit = view.drawn_scale();
+                view.zoom_to(fit * 2.0, Some(objc2_core_foundation::CGPoint::new(cx + step, cy)));
+                let (dx, dy) = view.state().offset;
+                check(
+                    state,
+                    (dx + step).abs() < 0.01 && dy.abs() < 0.01,
+                    "zoom holds the point under the pointer",
+                );
+                // Back to the fitting scale: fit again, pan cleared.
+                view.zoom_to(fit, None);
+                check(
+                    state,
+                    view.state().zoom.is_none() && view.state().offset == (0.0, 0.0),
+                    "zooming back out lands on fit, with the pan cleared",
+                );
+            }
             delegate.end_slideshow();
         }
         20 => {
@@ -420,6 +461,10 @@ pub fn run_step(delegate: &AppDelegate) {
             check(state, written, "animated gif written");
         }
         29 => {
+            // The watcher can take more than one tick to report it.
+            if delegate.e2e_file_count() != 5 && hold(state, 3) {
+                return;
+            }
             check(
                 state,
                 delegate.e2e_file_count() == 5,
@@ -1313,5 +1358,7 @@ pub fn run_step(delegate: &AppDelegate) {
             std::process::exit(1);
         }
     }
-    state.borrow_mut().step += 1;
+    let mut state = state.borrow_mut();
+    state.held = 0;
+    state.step += 1;
 }
