@@ -87,6 +87,21 @@ To build a disk image, named after the version in `wene/Cargo.toml`
 ./scripts/make-dmg.sh
 ```
 
+Both sign the bundle ad hoc, which is enough on your own Mac. A release for
+other Macs is signed with a Developer ID and notarized by Apple, so Gatekeeper
+opens it with no prompt. Once per Mac, save the notary credentials (an
+app-specific password from account.apple.com) in the keychain:
+
+```bash
+xcrun notarytool store-credentials wene-notary --apple-id <apple-id> --team-id <team-id> --password <app-specific-password>
+```
+
+Then build the release. It prints the .dmg path and its SHA-256 for the cask:
+
+```bash
+WENE_SIGN_IDENTITY="Developer ID Application: <name> (<team-id>)" WENE_NOTARY_PROFILE=wene-notary ./scripts/make-release.sh
+```
+
 Opening files from Finder needs the bundle, not `cargo run`: a bare binary has
 no Info.plist, so macOS never offers it.
 

@@ -83,7 +83,8 @@ PLIST
 # only the binary, so Info.plist and the icon were not covered, and
 # Gatekeeper calls a downloaded copy of such a bundle "damaged". Ad
 # hoc is not a Developer ID: another Mac still asks before the first
-# open, but it can open the app.
+# open, but it can open the app. scripts/make-release.sh re-signs with a
+# Developer ID and notarizes.
 codesign --force --sign - "$APP"
 codesign --verify --strict "$APP"
 
