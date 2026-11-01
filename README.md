@@ -58,9 +58,8 @@ folder's grid.
 brew install --cask shaho/wene/wene
 ```
 
-The bundle is signed ad hoc, not with a Developer ID, and it is not notarized.
-So the first launch is refused. Open System Settings › Privacy & Security and
-press "Open anyway", once. Every launch after that is normal.
+The app is signed with a Developer ID and notarized by Apple, so it opens like
+any other app, with no prompt.
 
 ## Run it
 
