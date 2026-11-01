@@ -44,6 +44,8 @@ notarize() {
   file=$1
   result=target/notary-result.json
   submit_exit=0
+  # notarytool's own output goes to the result file, so say why it is quiet.
+  echo "notarizing $file: uploading, then waiting for Apple's verdict (usually 1-5 minutes)"
   xcrun notarytool submit "$file" --keychain-profile "$WENE_NOTARY_PROFILE" \
     --wait --output-format json >"$result" || submit_exit=$?
   if [ "$submit_exit" -eq 0 ] &&
