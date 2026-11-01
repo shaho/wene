@@ -6,8 +6,7 @@ set -eu
 cd "$(dirname "$0")/.."
 cargo build --release
 
-# One source for the version: the crate the app is built from.
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' wene/Cargo.toml | head -1)
+VERSION=$(./scripts/version.sh)
 
 APP=target/wene.app
 rm -rf "$APP"
