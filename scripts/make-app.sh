@@ -4,14 +4,20 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-cargo build --release
+# One universal binary: Apple silicon and Intel Macs run the same bundle.
+# Needs `rustup target add x86_64-apple-darwin` once.
+cargo build --release --target aarch64-apple-darwin
+cargo build --release --target x86_64-apple-darwin
 
 VERSION=$(./scripts/version.sh)
 
 APP=target/wene.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/wene "$APP/Contents/MacOS/wene"
+lipo -create \
+  target/aarch64-apple-darwin/release/wene \
+  target/x86_64-apple-darwin/release/wene \
+  -output "$APP/Contents/MacOS/wene"
 
 # App icon: iconutil wants its own naming, so restage the artwork
 # from branding/ under the names it expects.
