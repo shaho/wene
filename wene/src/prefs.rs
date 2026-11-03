@@ -53,6 +53,20 @@ impl AppDelegate {
                 item.setState(1);
             }
         }
+        // The repeat folders come back too. One that is not a folder
+        // now (an unplugged disk) stays unread, and its key stays, so
+        // it is there again next time.
+        for (key, slot) in [
+            (ns_string!("lastMoveFolder"), &self.ivars().last_move),
+            (ns_string!("lastCopyFolder"), &self.ivars().last_copy),
+        ] {
+            let folder = d
+                .stringForKey(key)
+                .map(|s| PathBuf::from(s.to_string()))
+                .filter(|p| p.is_dir());
+            *slot.borrow_mut() = folder;
+        }
+        self.sync_repeat_items();
     }
 
     /// Persist everything the prefs window and the menus control.

@@ -128,12 +128,18 @@ impl AppDelegate {
         self.refresh_history_items();
         if !done.is_empty() {
             // Only a folder that took files is worth repeating to.
-            let slot = match kind {
-                Transfer::Move => &self.ivars().last_move,
-                Transfer::Copy => &self.ivars().last_copy,
+            let (slot, key) = match kind {
+                Transfer::Move => (&self.ivars().last_move, ns_string!("lastMoveFolder")),
+                Transfer::Copy => (&self.ivars().last_copy, ns_string!("lastCopyFolder")),
             };
             *slot.borrow_mut() = Some(folder.clone());
             self.sync_repeat_items();
+            if !e2e::enabled() {
+                let value = NSString::from_str(&folder.to_string_lossy());
+                unsafe {
+                    NSUserDefaults::standardUserDefaults().setObject_forKey(Some(&value), key);
+                }
+            }
         }
         let message = transfer_message(kind, &done, &folder, renamed, failed);
         self.show_status_message(&message);
@@ -474,7 +480,7 @@ impl AppDelegate {
     }
 
     /// Name the repeat items after their folders.
-    fn sync_repeat_items(&self) {
+    pub(crate) fn sync_repeat_items(&self) {
         for (item, kind) in [
             (self.ivars().move_again_item.get(), Transfer::Move),
             (self.ivars().copy_again_item.get(), Transfer::Copy),
