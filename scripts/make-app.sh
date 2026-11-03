@@ -19,19 +19,18 @@ lipo -create \
   target/x86_64-apple-darwin/release/wene \
   -output "$APP/Contents/MacOS/wene"
 
-# App icon: iconutil wants its own naming, so restage the artwork
-# from branding/ under the names it expects.
-ICONSET=target/AppIcon.iconset
-rm -rf "$ICONSET"
-mkdir -p "$ICONSET"
-for size in 16 32 128 256 512; do
-  cp "branding/macos/AppIcon.appiconset/icon-$size.png" \
-    "$ICONSET/icon_${size}x${size}.png"
-  cp "branding/macos/AppIcon.appiconset/icon-$size@2x.png" \
-    "$ICONSET/icon_${size}x${size}@2x.png"
-done
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
-rm -rf "$ICONSET"
+# App icon: actool compiles the asset catalog into Assets.car plus
+# AppIcon.icns. The App Store wants the Assets.car that CFBundleIconName
+# names. actool reads only an .xcassets folder, so stage one.
+ASSETS=target/Assets.xcassets
+rm -rf "$ASSETS"
+mkdir -p "$ASSETS"
+cp -R branding/macos/AppIcon.appiconset "$ASSETS/"
+xcrun actool "$ASSETS" --compile "$APP/Contents/Resources" \
+  --platform macosx --minimum-deployment-target 11.5 --app-icon AppIcon \
+  --output-partial-info-plist target/actool-info.plist \
+  --errors --warnings >/dev/null
+rm -rf "$ASSETS" target/actool-info.plist
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -47,8 +46,15 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+  <!-- The App Store's build number. Every slice bumps the version, so
+       every upload has a higher one. -->
+  <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSMinimumSystemVersion</key><string>11.5</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.photography</string>
+  <!-- wene uses no encryption, so App Store Connect does not ask about
+       export rules on every upload. -->
+  <key>ITSAppUsesNonExemptEncryption</key><false/>
   <!-- Image types wene can decode, so Finder offers it in Open With
        and lets it be made the default. -->
   <key>CFBundleDocumentTypes</key>
