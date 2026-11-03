@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- The App Store accepts only sandboxed apps. Brew ships the same
+       build, so both run in the sandbox. -->
+  <key>com.apple.security.app-sandbox</key><true/>
+  <!-- Read and write what the user picks in an open panel, or drops,
+       or opens from Finder. Security-scoped bookmarks (grants.rs)
+       keep those folders readable across launches. -->
+  <key>com.apple.security.files.user-selected.read-write</key><true/>
+  <!-- The Pictures folder: the first-run grid and favorite. -->
+  <key>com.apple.security.assets.pictures.read-write</key><true/>
+</dict>
+</plist>

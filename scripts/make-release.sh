@@ -67,8 +67,9 @@ APP=target/wene.app
 
 # Replaces make-app.sh's ad-hoc seal. Notarization requires the hardened
 # runtime and a secure timestamp. wene needs none of the runtime's
-# exceptions (no JIT, no unsigned libraries), so it gets no entitlements.
-codesign --force --options runtime --timestamp --sign "$WENE_SIGN_IDENTITY" "$APP"
+# exceptions (no JIT, no unsigned libraries); its entitlements are the
+# App Sandbox ones, the same as the ad-hoc build.
+codesign --force --options runtime --timestamp --entitlements wene/wene.entitlements --sign "$WENE_SIGN_IDENTITY" "$APP"
 codesign --verify --strict "$APP"
 
 # The notary service takes a zip, a dmg, or a pkg, not a bare bundle.

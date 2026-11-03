@@ -143,9 +143,14 @@ fn transfer_folder() -> String {
 }
 
 /// A folder of our own, to open from "Finder" and land somewhere
-/// other than the fixture.
+/// other than the fixture. It sits beside the fixture, not in the
+/// temp dir: inside the App Sandbox the temp dir is in the container,
+/// where no sidebar row leads, and the sidebar has to find it.
 pub(crate) fn open_folder() -> String {
-    std::env::temp_dir()
+    let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+    std::path::Path::new(&root)
+        .parent()
+        .expect("the fixture has a parent")
         .join(format!("wene-e2e-open-{}", std::process::id()))
         .to_string_lossy()
         .into_owned()

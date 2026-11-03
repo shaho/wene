@@ -381,6 +381,37 @@ impl<I: Send + 'static> Engine<I> {
         });
     }
 
+    /// Show these files and nothing else: no walk and no watcher.
+    /// For files handed over one by one when their folder cannot be
+    /// read, as the App Sandbox does for an open from Finder.
+    pub fn show(&self, paths: Vec<PathBuf>) {
+        let scan = {
+            let mut files = self.files.lock().unwrap();
+            files.clear();
+            self.scan.fetch_add(1, Ordering::SeqCst) + 1
+        };
+        *self.watcher.lock().unwrap() = None;
+
+        let current = Arc::clone(&self.scan);
+        let events_tx = self.events_tx.clone();
+        let wakeup = Arc::clone(&self.wakeup);
+        let files = Arc::clone(&self.files);
+        let dates = Arc::clone(&self.dates);
+        thread::spawn(move || {
+            let mut pending: Vec<FileInfo> = paths
+                .iter()
+                .filter(|path| is_image(path))
+                .filter_map(|path| file_info(path, &dates))
+                .collect();
+            if !flush(scan, &current, &files, &mut pending, &events_tx, &wakeup) {
+                return;
+            }
+            let total = files.lock().unwrap().len();
+            let _ = events_tx.send(Event::ScanDone { scan, total });
+            wakeup();
+        });
+    }
+
     fn start_watcher(&self, root: &Path, recursive: bool, scan: u64) {
         use notify::Watcher;
         let current = Arc::clone(&self.scan);
@@ -481,6 +512,19 @@ fn flush<I>(
 /// Existence on disk decides between insert, change, and removal,
 /// which absorbs create/modify/rename event ambiguity. A change seen
 /// by scan number `scan` is dropped once a newer scan has replaced it.
+/// One file's entry, or None for a file that is not there.
+fn file_info(path: &Path, dates: &DatesFn) -> Option<FileInfo> {
+    let meta = std::fs::metadata(path).ok()?;
+    let (exif_date, added) = dates(path);
+    Some(FileInfo {
+        path: path.to_path_buf(),
+        modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+        size: meta.len(),
+        exif_date,
+        added,
+    })
+}
+
 fn apply_fs_change<I>(
     path: &Path,
     scan: u64,
@@ -504,16 +548,7 @@ fn apply_fs_change<I>(
     // The dates come from the file header, a read from disk. It
     // happens before the lock, so the walk, the watcher and the main
     // thread never wait behind it.
-    let info = std::fs::metadata(path).ok().map(|meta| {
-        let (exif_date, added) = dates(path);
-        FileInfo {
-            path: path.to_path_buf(),
-            modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-            size: meta.len(),
-            exif_date,
-            added,
-        }
-    });
+    let info = file_info(path, dates);
     let event = {
         let mut sorted = files.lock().unwrap();
         if current.load(Ordering::SeqCst) != scan {
@@ -843,6 +878,42 @@ mod tests {
             "waited {waited:?}"
         );
         assert_eq!(engine.files.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn show_lists_the_given_files_and_walks_nothing() {
+        let root = std::env::temp_dir().join(format!("wene-show-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["a.jpg", "b.jpg", "c.jpg", "notes.txt"] {
+            std::fs::write(root.join(name), "").unwrap();
+        }
+        let (engine, events) = Engine::start(SlowDates, 100, 100, || {});
+        engine.show(vec![
+            root.join("c.jpg"),
+            root.join("a.jpg"),
+            root.join("notes.txt"),
+        ]);
+        let mut shown: Vec<PathBuf> = Vec::new();
+        let mut done = None;
+        while let Ok(event) = events.recv_timeout(std::time::Duration::from_millis(1000)) {
+            match event {
+                Event::FilesInserted { files, .. } => {
+                    for (index, info) in files {
+                        shown.insert(index, info.path);
+                    }
+                }
+                Event::ScanDone { total, .. } => {
+                    done = Some(total);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // Only the images named, in name order; b.jpg stays unseen.
+        assert_eq!(shown, vec![root.join("a.jpg"), root.join("c.jpg")]);
+        assert_eq!(done, Some(2));
         let _ = std::fs::remove_dir_all(&root);
     }
 

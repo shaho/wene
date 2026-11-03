@@ -33,6 +33,26 @@ impl AppDelegate {
     /// `remember` is false only for the launch fallback: a folder the
     /// user never picked must not overwrite the saved one.
     pub(crate) fn scan_root_inner(&self, root: PathBuf, recursive: bool, remember: bool) {
+        self.present_folder(&root);
+        if remember {
+            save_last_folder(&root);
+        }
+        grants::remember(&root);
+        *self.ivars().current_scan.borrow_mut() = Some((root.clone(), recursive));
+        self.ivars().engine.get().unwrap().scan(root, recursive);
+    }
+
+    /// Finder granted these files and not their folder, which the
+    /// sandbox will not let the app read. The grid shows just them.
+    fn show_files(&self, folder: PathBuf, files: Vec<PathBuf>) {
+        self.present_folder(&folder);
+        *self.ivars().current_scan.borrow_mut() = Some((folder, false));
+        self.ivars().engine.get().unwrap().show(files);
+    }
+
+    /// Clear the window for a folder: the filter, the grid, the title
+    /// and the sidebar's highlight.
+    fn present_folder(&self, root: &Path) {
         // A filter typed for the last folder would explain nothing
         // here, and an almost empty grid reads as a bug.
         self.close_filter();
@@ -49,13 +69,8 @@ impl AppDelegate {
         }
         // The sidebar follows the grid, whatever changed the folder.
         if let Some(sidebar) = self.ivars().sidebar.get() {
-            sidebar.reveal(&root);
+            sidebar.reveal(root);
         }
-        if remember {
-            save_last_folder(&root);
-        }
-        *self.ivars().current_scan.borrow_mut() = Some((root.clone(), recursive));
-        self.ivars().engine.get().unwrap().scan(root, recursive);
     }
 
     /// Show or hide the sidebar. The split view controller owns the
@@ -149,10 +164,14 @@ impl AppDelegate {
         self.ivars().pending_fullscreen.set(true);
         // Calls can arrive one after another, so they add up rather
         // than replace each other.
-        self.ivars().pending_open.borrow_mut().extend(files);
+        self.ivars().pending_open.borrow_mut().extend(files.clone());
         // A grid already holding them needs no rescan, which keeps a
         // recursive cmd-O grid intact.
         if self.select_pending() {
+            return;
+        }
+        if grants::sandboxed() && !grants::readable(&folder) {
+            self.show_files(folder, files);
             return;
         }
         self.scan_root(folder, false);

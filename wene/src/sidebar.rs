@@ -28,7 +28,7 @@ use objc2_foundation::{
     NSObjectProtocol, NSRect, NSString, NSUserDefaults, NSURL,
 };
 
-use crate::{e2e, menu_item, AppDelegate};
+use crate::{e2e, grants, menu_item, AppDelegate};
 use wene_core::transfer::Transfer;
 
 /// Width of the sidebar pane, and the limits the split view allows.
@@ -397,16 +397,41 @@ impl Sidebar {
     /// lists that folder only; cmd-O stays recursive, so clicking the
     /// folder cmd-O opened narrows it back to one level.
     fn open_selected(&self) {
-        let Some(path) = self.selected_path() else {
+        let Some(index) = self.selected_index() else {
             return;
         };
+        let path = self.path_of(index);
         let Some(delegate) = self.ivars().delegate.get() else {
             return;
         };
+        // The sandbox refuses this folder until the user hands it
+        // over. Once granted, the row can open and expand.
+        if grants::sandboxed() && !grants::readable(&path) {
+            let Some(granted) = delegate.ask_access(&path) else {
+                return;
+            };
+            self.refresh_node(index);
+            delegate.scan_root(granted, false);
+            return;
+        }
         if delegate.current_scan() == Some((path.clone(), false)) {
             return;
         }
         delegate.scan_root(path, false);
+    }
+
+    /// Forget what a row knew about its folder, so the triangle and
+    /// the children are read again.
+    fn refresh_node(&self, index: usize) {
+        {
+            let mut nodes = self.ivars().nodes.borrow_mut();
+            nodes[index].expandable = None;
+            nodes[index].children = None;
+        }
+        unsafe {
+            self.outline()
+                .reloadItem_reloadChildren(Some(&item_for(index)), true)
+        };
     }
 
     fn mtm(&self) -> MainThreadMarker {
@@ -617,13 +642,17 @@ impl Sidebar {
     }
 
     pub fn selected_path(&self) -> Option<PathBuf> {
+        self.selected_index().map(|index| self.path_of(index))
+    }
+
+    /// The highlighted folder row, if the highlight is on one.
+    fn selected_index(&self) -> Option<usize> {
         let row = self.outline().selectedRow();
         if row < 0 {
             return None;
         }
         let index = index_of(self.outline().itemAtRow(row).as_deref())?;
-        let (path, section) = self.with_node(index, |node| (node.path.clone(), node.section));
-        (!section).then_some(path)
+        (!self.with_node(index, |node| node.section)).then_some(index)
     }
 
     // ---- favorites ----
@@ -636,6 +665,7 @@ impl Sidebar {
             }
             favorites.push(path.to_path_buf());
         }
+        grants::remember(path);
         self.save_favorites();
         self.reload_section(self.ivars().favorites_root.get());
     }
@@ -647,6 +677,7 @@ impl Sidebar {
             let mut favorites = self.ivars().favorites.borrow_mut();
             reorder(&mut favorites, path, at);
         }
+        grants::remember(path);
         self.save_favorites();
         self.reload_section(self.ivars().favorites_root.get());
     }
@@ -698,12 +729,20 @@ impl Sidebar {
                 let name = component.as_os_str();
                 unsafe { self.outline().expandItem(Some(&item_for(index))) };
                 self.load_children(index);
-                let next = self
-                    .with_node(index, |node| node.children.clone())
-                    .and_then(|kids| {
-                        kids.into_iter()
-                            .find(|kid| self.with_node(*kid, |n| n.path.file_name() == Some(name)))
-                    });
+                let child = |this: &Self| {
+                    this.with_node(index, |node| node.children.clone())
+                        .and_then(|kids| {
+                            kids.into_iter().find(|kid| {
+                                this.with_node(*kid, |n| n.path.file_name() == Some(name))
+                            })
+                        })
+                };
+                // A folder made since the row was read has no child
+                // yet, so the row is read once more before giving up.
+                let next = child(self).or_else(|| {
+                    self.refresh_node(index);
+                    child(self)
+                });
                 match next {
                     Some(next) => index = next,
                     // The tree leaves out dot-folders and packages, so
@@ -922,7 +961,7 @@ fn row_view(mtm: MainThreadMarker, name: &str, icon: Option<&NSImage>) -> Retain
 /// Favorites from preferences; first run seeds Pictures, Desktop, and
 /// the home folder.
 fn load_favorites() -> Vec<PathBuf> {
-    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = grants::home();
     let seed = || vec![home.join("Pictures"), home.join("Desktop"), home.clone()];
     if e2e::enabled() {
         return seed();

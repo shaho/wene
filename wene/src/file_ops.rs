@@ -38,8 +38,9 @@ impl AppDelegate {
         if !self.run_panel(&panel) {
             return None;
         }
-        let path = panel.URL()?.path()?;
-        Some(PathBuf::from(path.to_string()))
+        let path = PathBuf::from(panel.URL()?.path()?.to_string());
+        grants::remember(&path);
+        Some(path)
     }
 
     /// Send the images to `folder` on a background thread, so a long

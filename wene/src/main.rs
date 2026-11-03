@@ -7,6 +7,7 @@ mod browse;
 mod decoder;
 mod e2e;
 mod file_ops;
+mod grants;
 mod grid;
 mod info;
 mod menu;
@@ -302,7 +303,7 @@ define_class!(
                 self.scan_root(root, false);
                 return;
             }
-            let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+            let home = grants::home();
             let fallback = startup_folder_pref()
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir())
@@ -456,6 +457,7 @@ define_class!(
                 return;
             }
             let Some(path) = panel.URL().and_then(|u| u.path()) else { return };
+            grants::remember(Path::new(&path.to_string()));
             if !e2e::enabled() {
                 unsafe {
                     NSUserDefaults::standardUserDefaults()

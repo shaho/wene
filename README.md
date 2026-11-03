@@ -85,7 +85,7 @@ To build the .app bundle in `target/wene.app`:
 ```
 
 To build a disk image, named after the version in `wene/Cargo.toml`
-(`target/wene-0.3.49.dmg` today):
+(`target/wene-0.3.50.dmg` today):
 
 ```bash
 ./scripts/make-dmg.sh
@@ -109,6 +109,14 @@ WENE_SIGN_IDENTITY="Developer ID Application: <name> (<team-id>)" WENE_NOTARY_PR
 Opening files from Finder needs the bundle, not `cargo run`: a bare binary has
 no Info.plist, so macOS never offers it.
 
+The bundle runs in the App Sandbox, as the App Store requires. It reads the
+folders you hand it, in an open panel, with a drop, or by opening from Finder,
+plus your Pictures folder, and it keeps those folders readable across launches.
+A sidebar row the sandbox refuses has no disclosure triangle; clicking it asks
+for access once. An image opened from Finder in a folder the app cannot read is
+shown on its own. `cargo run` is not sandboxed, so check folder access in the
+bundle.
+
 Needs macOS 11.5 or later and a Rust toolchain.
 
 ## How it is built
@@ -131,6 +139,14 @@ the status bar text:
 ```bash
 sh scripts/make-fixture.sh
 WENE_E2E=1 cargo run -p wene -- ~/wene-e2e-fixture
+```
+
+The same harness runs inside the sandbox through the bundle, with the fixture
+under Pictures, the one folder the entitlements grant:
+
+```bash
+sh scripts/make-fixture.sh ~/Pictures/wene-e2e-fixture
+WENE_E2E=1 target/wene.app/Contents/MacOS/wene ~/Pictures/wene-e2e-fixture
 ```
 
 The first line builds the folder the harness expects: four images whose names,

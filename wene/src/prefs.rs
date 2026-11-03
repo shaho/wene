@@ -16,6 +16,9 @@ impl AppDelegate {
         if e2e::enabled() {
             return;
         }
+        // Folders first: the saved folder and the favorites are read
+        // right after this.
+        grants::restore();
         let d = NSUserDefaults::standardUserDefaults();
         if d.boolForKey(ns_string!("slideshowLoop")) {
             self.ivars().loop_enabled.set(true);
