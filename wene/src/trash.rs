@@ -10,13 +10,14 @@ use std::path::PathBuf;
 use objc2_foundation::{NSFileManager, NSURL};
 
 /// What one run of the trash did: where each file landed inside the
-/// trash, and which files would not go.
+/// trash, and why each file that would not go stayed.
 pub struct Trashed {
     /// Original path and the path it now has in the trash. The trash
     /// renames on a collision, so the reported URL is the only handle
     /// that can bring a file back.
     pub moved: Vec<(PathBuf, PathBuf)>,
-    pub failed: Vec<PathBuf>,
+    /// One reason per file that stayed, in the system's words.
+    pub failed: Vec<String>,
 }
 
 /// Move each path to the trash.
@@ -28,7 +29,7 @@ pub fn move_to_trash(paths: &[PathBuf]) -> Trashed {
     };
     for path in paths {
         let Some(url) = NSURL::from_file_path(path) else {
-            result.failed.push(path.clone());
+            result.failed.push("the path is not a file URL".to_owned());
             continue;
         };
         let mut landed: Option<objc2::rc::Retained<NSURL>> = None;
@@ -43,12 +44,9 @@ pub fn move_to_trash(paths: &[PathBuf]) -> Trashed {
                 }
             }
             Err(error) => {
-                eprintln!(
-                    "trash failed: {}: {}",
-                    path.display(),
-                    error.localizedDescription()
-                );
-                result.failed.push(path.clone());
+                let why = error.localizedDescription().to_string();
+                eprintln!("trash failed: {}: {why}", path.display());
+                result.failed.push(wene_core::messages::reason(&why));
             }
         }
     }

@@ -45,7 +45,9 @@ GIFs.
 - ⌘C copies the selected images as files, for a paste in Finder. ⌘V pastes the
   files on the clipboard into the folder on screen, as copies, one undo for the
   batch.
-- Nothing is ever deleted for real, and nothing is ever replaced.
+- Nothing is ever deleted for real, and nothing is ever replaced. A file that
+  will not move, copy or trash is counted in the status bar with the system's
+  reason.
 
 ### Opening from Finder
 
@@ -84,7 +86,7 @@ To build the .app bundle in `target/wene.app`:
 ```
 
 To build a disk image, named after the version in `wene/Cargo.toml`
-(`target/wene-0.3.47.dmg` today):
+(`target/wene-0.3.48.dmg` today):
 
 ```bash
 ./scripts/make-dmg.sh

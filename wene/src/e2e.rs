@@ -127,6 +127,14 @@ fn empty_from_trash(name: &str) {
 
 /// The folder move and copy send files to, outside the fixture so a
 /// recursive scan never sees them again.
+/// A folder no file can land in, for the failure message test.
+fn locked_folder() -> String {
+    std::env::temp_dir()
+        .join(format!("wene-e2e-locked-{}", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn transfer_folder() -> String {
     std::env::temp_dir()
         .join(format!("wene-e2e-transfer-{}", std::process::id()))
@@ -1787,6 +1795,43 @@ pub fn run_step(delegate: &AppDelegate) {
             );
             empty_from_trash("apple 2.heic");
             empty_from_trash("img1 2.heic");
+        }
+        93 => {
+            // A copy into a folder that will not take files says why,
+            // not just how many.
+            use std::os::unix::fs::PermissionsExt;
+            let locked = locked_folder();
+            let made = std::fs::create_dir_all(&locked).is_ok()
+                && std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+                    .is_ok();
+            check(state, made, "a read-only target folder is ready");
+            delegate.e2e_select(&[0]);
+            delegate.e2e_transfer(&locked, false);
+        }
+        94 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let locked = locked_folder();
+            let name = std::path::Path::new(&locked)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            check(
+                state,
+                delegate.e2e_status_text()
+                    == format!("Nothing copied to {name}, 1 failed: Permission denied"),
+                "the status bar says why the copy failed",
+            );
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "the failed copy left the grid alone",
+            );
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&locked);
         }
         _ => {
             let failures = state.borrow().failures.clone();

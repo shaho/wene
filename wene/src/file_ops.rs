@@ -62,7 +62,9 @@ impl AppDelegate {
         std::thread::spawn(move || {
             let mut done: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(total);
             let mut renamed = 0usize;
-            let mut failed = 0usize;
+            // One reason per file that would not go; the first one
+            // reaches the status bar.
+            let mut failed: Vec<String> = Vec::new();
             for (index, source) in paths.iter().enumerate() {
                 if total > 1 {
                     let line = format!("{} {} of {total}…", kind.present(), index + 1);
@@ -82,7 +84,7 @@ impl AppDelegate {
                     }
                     Err(error) => {
                         eprintln!("{} failed: {}: {error}", kind.past(), source.display());
-                        failed += 1;
+                        failed.push(reason(&error.to_string()));
                     }
                 }
             }
@@ -108,7 +110,7 @@ impl AppDelegate {
         done: Vec<(PathBuf, PathBuf)>,
         folder: PathBuf,
         renamed: usize,
-        failed: usize,
+        failed: Vec<String>,
     ) {
         self.ivars().transfer_busy.set(false);
         let touched: Vec<PathBuf> = done
@@ -141,7 +143,7 @@ impl AppDelegate {
                 }
             }
         }
-        let message = transfer_message(kind, &done, &folder, renamed, failed);
+        let message = transfer_message(kind, &done, &folder, renamed, &failed);
         self.show_status_message(&message);
         self.flash_overlay(&message);
     }
@@ -216,7 +218,7 @@ impl AppDelegate {
 
         let mut arrived: Vec<PathBuf> = Vec::new();
         let mut left: Vec<PathBuf> = Vec::new();
-        let mut failed = 0usize;
+        let mut failed: Vec<String> = Vec::new();
         for (from, to) in &moves {
             if let Some(parent) = to.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -232,12 +234,12 @@ impl AppDelegate {
                         from.display(),
                         to.display()
                     );
-                    failed += 1;
+                    failed.push(reason(&error.to_string()));
                 }
             }
         }
-        if failed > 0 {
-            let message = format!("{failed} of {} could not be put back", moves.len());
+        if !failed.is_empty() {
+            let message = put_back_message(moves.len(), &failed);
             self.show_status_message(&message);
             self.flash_overlay(&message);
         }
@@ -546,7 +548,7 @@ impl AppDelegate {
         // listed and no row comes back.
         self.notice_files(&moved);
 
-        let message = trash_message(&moved, trashed.failed.len());
+        let message = trash_message(&moved, &trashed.failed);
         self.show_status_message(&message);
         self.flash_overlay(&message);
     }

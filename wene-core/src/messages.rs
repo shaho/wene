@@ -29,15 +29,35 @@ pub fn folder_label(folder: &Path) -> String {
         .unwrap_or_else(|| folder.to_string_lossy().into_owned())
 }
 
+/// An OS error, for people: "Permission denied (os error 13)" loses
+/// its number, and a sentence from the system loses its full stop.
+pub fn reason(error: &str) -> String {
+    let text = match error.find(" (os error") {
+        Some(at) => &error[..at],
+        None => error,
+    };
+    text.trim_end_matches('.').to_owned()
+}
+
+/// ", 2 failed: Permission denied". The first reason stands for the
+/// batch: one failure usually explains the rest.
+fn failed_suffix(failed: &[String]) -> String {
+    match failed {
+        [] => String::new(),
+        [first, ..] => format!(", {} failed: {first}", failed.len()),
+    }
+}
+
 /// What the status bar and the slide overlay say after a move or a
 /// copy. A single file is named by the name it has now, which is the
-/// only record of a rename.
+/// only record of a rename. `failed` holds one reason per file that
+/// would not go.
 pub fn transfer_message(
     kind: Transfer,
     done: &[(PathBuf, PathBuf)],
     folder: &Path,
     renamed: usize,
-    failed: usize,
+    failed: &[String],
 ) -> String {
     let verb = kind.past();
     let target = folder_label(folder);
@@ -54,17 +74,31 @@ pub fn transfer_message(
     if renamed > 0 {
         text.push_str(&format!(", {renamed} renamed"));
     }
-    if failed > 0 {
-        text.push_str(&format!(", {failed} failed"));
-    }
+    text.push_str(&failed_suffix(failed));
     text
 }
 
+/// What the status bar and the slide overlay say after an undo or a
+/// redo that could not put every file back.
+pub fn put_back_message(total: usize, failed: &[String]) -> String {
+    match failed {
+        [] => String::new(),
+        [first, ..] => format!("{} of {total} could not be put back: {first}", failed.len()),
+    }
+}
+
 /// What the status bar and the slide overlay say after a delete.
-pub fn trash_message(moved: &[PathBuf], failed: usize) -> String {
-    let total = moved.len() + failed;
+/// `failed` holds one reason per file the trash would not take.
+pub fn trash_message(moved: &[PathBuf], failed: &[String]) -> String {
+    let total = moved.len() + failed.len();
+    let refused = |first: &str| {
+        format!(
+            "{} of {total} could not be moved to trash: {first}",
+            failed.len()
+        )
+    };
     if moved.is_empty() {
-        return format!("{failed} of {total} could not be moved to trash");
+        return refused(failed.first().map(String::as_str).unwrap_or_default());
     }
     // The line is the only record of what went, so it names files,
     // not just a count.
@@ -81,10 +115,9 @@ pub fn trash_message(moved: &[PathBuf], failed: usize) -> String {
     if moved.len() > names.len() {
         moved_text.push_str(&format!(" and {} more", moved.len() - names.len()));
     }
-    if failed == 0 {
-        moved_text
-    } else {
-        format!("{moved_text} — {failed} of {total} could not be moved to trash")
+    match failed.first() {
+        None => moved_text,
+        Some(first) => format!("{moved_text} — {}", refused(first)),
     }
 }
 
@@ -122,37 +155,66 @@ mod tests {
             PathBuf::from("/x/Keep/a 2.heic"),
         )];
         assert_eq!(
-            transfer_message(Transfer::Move, &one, folder, 1, 0),
+            transfer_message(Transfer::Move, &one, folder, 1, &[]),
             "Moved a 2.heic to Keep, 1 renamed"
         );
         let two = vec![
             (PathBuf::from("/a/a.heic"), PathBuf::from("/x/Keep/a.heic")),
             (PathBuf::from("/a/b.heic"), PathBuf::from("/x/Keep/b.heic")),
         ];
+        let denied = ["Permission denied".to_owned()];
         assert_eq!(
-            transfer_message(Transfer::Copy, &two, folder, 0, 1),
-            "Copied 2 images to Keep, 1 failed"
+            transfer_message(Transfer::Copy, &two, folder, 0, &denied),
+            "Copied 2 images to Keep, 1 failed: Permission denied"
+        );
+        let two_reasons = ["Read-only file system".to_owned(), "No space".to_owned()];
+        assert_eq!(
+            transfer_message(Transfer::Move, &[], folder, 0, &two_reasons),
+            "Nothing moved to Keep, 2 failed: Read-only file system"
+        );
+    }
+
+    #[test]
+    fn a_reason_loses_the_error_number_and_the_full_stop() {
+        assert_eq!(
+            reason("Permission denied (os error 13)"),
+            "Permission denied"
         );
         assert_eq!(
-            transfer_message(Transfer::Move, &[], folder, 0, 2),
-            "Nothing moved to Keep, 2 failed"
+            reason("The file couldn’t be moved because you don’t have permission."),
+            "The file couldn’t be moved because you don’t have permission"
+        );
+        assert_eq!(reason("No space"), "No space");
+    }
+
+    #[test]
+    fn an_undo_that_falls_short_says_why() {
+        assert_eq!(put_back_message(3, &[]), "");
+        assert_eq!(
+            put_back_message(3, &["another file now has that name".to_owned()]),
+            "1 of 3 could not be put back: another file now has that name"
         );
     }
 
     #[test]
     fn a_delete_names_three_files_and_counts_the_rest() {
         assert_eq!(
-            trash_message(&paths(&["a.heic"]), 0),
+            trash_message(&paths(&["a.heic"]), &[]),
             "Moved to trash: a.heic"
         );
         assert_eq!(
-            trash_message(&paths(&["a", "b", "c", "d", "e"]), 0),
+            trash_message(&paths(&["a", "b", "c", "d", "e"]), &[]),
             "Moved to trash: a, b, c and 2 more"
         );
+        let locked = ["The file is locked".to_owned()];
         assert_eq!(
-            trash_message(&paths(&["a"]), 1),
-            "Moved to trash: a — 1 of 2 could not be moved to trash"
+            trash_message(&paths(&["a"]), &locked),
+            "Moved to trash: a — 1 of 2 could not be moved to trash: The file is locked"
         );
-        assert_eq!(trash_message(&[], 3), "3 of 3 could not be moved to trash");
+        let three = vec!["No trash on this volume".to_owned(); 3];
+        assert_eq!(
+            trash_message(&[], &three),
+            "3 of 3 could not be moved to trash: No trash on this volume"
+        );
     }
 }
