@@ -42,6 +42,9 @@ GIFs.
 - ⇧⌘M and ⇧⌘C move or copy images to a folder you pick. ⌃⌘M and ⌃⌘C repeat to
   the last folder, which the menu names. A name the target folder already holds
   keeps both files, Finder style.
+- ⌘C copies the selected images as files, for a paste in Finder. ⌘V pastes the
+  files on the clipboard into the folder on screen, as copies, one undo for the
+  batch.
 - Nothing is ever deleted for real, and nothing is ever replaced.
 
 ### Opening from Finder
@@ -81,7 +84,7 @@ To build the .app bundle in `target/wene.app`:
 ```
 
 To build a disk image, named after the version in `wene/Cargo.toml`
-(`target/wene-0.3.45.dmg` today):
+(`target/wene-0.3.46.dmg` today):
 
 ```bash
 ./scripts/make-dmg.sh

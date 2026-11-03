@@ -789,20 +789,9 @@ impl Sidebar {
     }
 }
 
-/// The images a drop carries, as paths. Anything that is not a file
-/// URL is ignored.
+/// The images a drop carries, as paths.
 fn dropped_paths(info: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
-    let pasteboard = info.draggingPasteboard();
-    let Some(items) = pasteboard.pasteboardItems() else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .filter_map(|item| unsafe { item.stringForType(NSPasteboardTypeFileURL) })
-        .filter_map(|text| NSURL::URLWithString(&text))
-        .filter_map(|url| url.path())
-        .map(|path| PathBuf::from(path.to_string()))
-        .collect()
+    crate::file_ops::pasteboard_paths(&info.draggingPasteboard())
 }
 
 /// Insert `path` at `at`, or move it there when the list already holds

@@ -60,6 +60,21 @@ impl AppDelegate {
         if action == Some(sel!(startSlideshow:)) || action == Some(sel!(startSlideshowWindowed:)) {
             return self.ivars().show.borrow().is_none();
         }
+        // Paste needs files on the clipboard and a folder to put them
+        // in. A text field being edited never gets here: it answers
+        // `paste:` itself.
+        if action == Some(sel!(paste:)) {
+            let has_files = unsafe {
+                objc2_app_kit::NSPasteboard::generalPasteboard()
+                    .canReadItemWithDataConformingToTypes(&NSArray::from_slice(&[
+                        objc2_app_kit::NSPasteboardTypeFileURL,
+                    ]))
+            };
+            return !prefs_key
+                && has_files
+                && self.current_scan().is_some()
+                && !self.ivars().transfer_busy.get();
+        }
         let acts_on_images = [
             sel!(moveToTrash:),
             sel!(revealInFinder:),
@@ -240,6 +255,10 @@ pub(crate) fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &
     // Plain cmd-C stays free for a copy of the image itself later.
     let copy_images = menu_item(mtm, ns_string!("Copy"), sel!(copyImages:), ns_string!("c"));
     edit_menu.addItem(&copy_images);
+    // The standard selector, with no target: a text field being
+    // edited takes cmd-V first, the delegate gets it otherwise.
+    let paste = menu_item(mtm, ns_string!("Paste"), sel!(paste:), ns_string!("v"));
+    edit_menu.addItem(&paste);
     let copy_path = menu_item(
         mtm,
         ns_string!("Copy path"),

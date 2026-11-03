@@ -1724,6 +1724,70 @@ pub fn run_step(delegate: &AppDelegate) {
                 "grid back to the fixture",
             );
         }
+        90 => {
+            // Paste copies the files on the clipboard into the folder
+            // on screen. The item fires through the menu, the way a
+            // click does, so the nil-target `paste:` is what is tested.
+            delegate.e2e_select(&[0, 1]);
+            delegate.e2e_copy_images();
+            check(
+                state,
+                perform_menu_item("Edit", "Paste"),
+                "the Edit menu has a Paste item",
+            );
+        }
+        91 => {
+            if wait_for_transfer(state, delegate) {
+                return;
+            }
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            check(
+                state,
+                delegate.e2e_file_count() == 6,
+                "two pasted copies joined the grid",
+            );
+            check(
+                state,
+                std::path::Path::new(&format!("{root}/apple 2.heic")).exists()
+                    && std::path::Path::new(&format!("{root}/img1 2.heic")).exists(),
+                "a taken name keeps both files, Finder style",
+            );
+            let folder = std::path::Path::new(&root)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            check(
+                state,
+                delegate.e2e_status_text() == format!("Copied 2 images to {folder}, 2 renamed"),
+                "the status bar counts the paste",
+            );
+            check(
+                state,
+                delegate.e2e_undo_title() == "Undo copy",
+                "the paste is one undo",
+            );
+            delegate.e2e_undo();
+        }
+        92 => {
+            if wait_for_count(state, delegate, 4) {
+                return;
+            }
+            let root = std::env::args().nth(1).expect("e2e runs with a folder arg");
+            check(
+                state,
+                delegate.e2e_file_count() == 4,
+                "undo took both copies back",
+            );
+            check(
+                state,
+                !std::path::Path::new(&format!("{root}/apple 2.heic")).exists()
+                    && !std::path::Path::new(&format!("{root}/img1 2.heic")).exists(),
+                "the copies left the folder",
+            );
+            empty_from_trash("apple 2.heic");
+            empty_from_trash("img1 2.heic");
+        }
         _ => {
             let failures = state.borrow().failures.clone();
             if failures.is_empty() {

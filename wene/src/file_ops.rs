@@ -141,9 +141,12 @@ impl AppDelegate {
     }
 
     /// Tell the engine about files the app itself moved, so its list
-    /// matches the disk before the watcher gets there. Only files the
-    /// grid is showing count: a file that landed in another folder is
-    /// none of this folder's business.
+    /// matches the disk before the watcher gets there, and apply what
+    /// it says now. The grid changes before the caller writes its
+    /// status line, so a paste into the folder on screen is not
+    /// overwritten by the arrival of its own copies a tick later.
+    /// Only files the grid is showing count: a file that landed in
+    /// another folder is none of this folder's business.
     fn notice_files(&self, paths: &[PathBuf]) {
         let Some(engine) = self.ivars().engine.get() else {
             return;
@@ -165,6 +168,7 @@ impl AppDelegate {
             .collect();
         if !ours.is_empty() {
             engine.notice(&ours);
+            drain_events(self.mtm());
         }
     }
 
@@ -360,6 +364,23 @@ impl AppDelegate {
         self.flash_overlay(&message);
     }
 
+    /// cmd-V: the files on the clipboard land in the folder on
+    /// screen, as copies. The originals stay where they are, a name
+    /// the folder already holds keeps both files, and the batch is
+    /// one undo. The menu item is a plain `paste:`, so a text field
+    /// being edited keeps cmd-V for itself.
+    pub(crate) fn paste_images(&self) {
+        let Some((folder, _)) = self.current_scan() else {
+            return;
+        };
+        let files: Vec<PathBuf> =
+            pasteboard_paths(&objc2_app_kit::NSPasteboard::generalPasteboard())
+                .into_iter()
+                .filter(|path| path.is_file())
+                .collect();
+        self.transfer_paths(files, folder, Transfer::Copy);
+    }
+
     /// Put the targets on the clipboard, as plain paths or as file
     /// URLs, one per line.
     pub(crate) fn copy_targets(&self, as_url: bool) {
@@ -523,4 +544,19 @@ impl AppDelegate {
         self.show_status_message(&message);
         self.flash_overlay(&message);
     }
+}
+
+/// The files a pasteboard carries, as paths: a drop's or the
+/// clipboard. Anything that is not a file URL is ignored.
+pub(crate) fn pasteboard_paths(pasteboard: &objc2_app_kit::NSPasteboard) -> Vec<PathBuf> {
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| unsafe { item.stringForType(objc2_app_kit::NSPasteboardTypeFileURL) })
+        .filter_map(|text| NSURL::URLWithString(&text))
+        .filter_map(|url| url.path())
+        .map(|path| PathBuf::from(path.to_string()))
+        .collect()
 }

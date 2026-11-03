@@ -522,6 +522,11 @@ define_class!(
             self.copy_images_to_clipboard();
         }
 
+        #[unsafe(method(paste:))]
+        fn paste_action(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.paste_images();
+        }
+
         #[unsafe(method(copyPath:))]
         fn copy_path(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.copy_targets(false);
