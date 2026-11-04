@@ -260,6 +260,15 @@ define_class!(
     }
 
     unsafe impl NSApplicationDelegate for AppDelegate {
+        /// The remembered folders must be readable before anything
+        /// asks: on a cold start Finder's open call arrives before
+        /// did-finish-launching, and it checks whether the image's
+        /// folder can be read.
+        #[unsafe(method(applicationWillFinishLaunching:))]
+        fn will_finish_launching(&self, _notification: &NSNotification) {
+            grants::restore();
+        }
+
         #[unsafe(method(application:openURLs:))]
         fn application_open_urls(
             &self,
